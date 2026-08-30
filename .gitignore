@@ -10,6 +10,9 @@ __pycache__/
 Thumbs.db
 .env
 .env.*
+# Local runtime configs hold real cookies / API keys
+config.local.json
+config.*.local.json
 *.log
 *.tmp
 *.exe

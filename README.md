@@ -166,9 +166,24 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 - 修改管理台前端后需执行 `npm --prefix ./frontend run build:static`
 - 调整会话延续与存储时，建议同步检查 `internal/app/sqlite_store.go` 的 schema 与迁移兼容性
 
+## 来源与关系
+
+本仓库基于 [GALIAIS/Notion2API](https://github.com/GALIAIS/Notion2API)，保留其完整提交历史与 MIT 版权声明。
+
+在上游基础上的主要改动：
+
+- 会话线程复用（关闭默认的每请求新建线程）与空闲回收，降低上游缓存读取开销
+- 修复 ephemeral TTL 覆盖外溢导致 SillyTavern 辅助会话寿命被压缩的问题
+- 主请求路径改用 surf/utls 浏览器指纹伪装，原生 `net/http` 作为传输层回退
+- 新增模型列表刷新接口，无需重新导入账号即可同步上游模型
+- 恢复默认的 TLS 证书校验，仅在显式域前置配置下跳过
+- 将 `internal/app` 的测试重新纳入版本控制，并在 CI 中执行
+
 ## 开源协议
 
 MIT License
+
+原始版权归 GALIAIS 所有（见 `LICENSE`），本仓库的修改同样以 MIT 发布。
 
 ## 致谢
 
