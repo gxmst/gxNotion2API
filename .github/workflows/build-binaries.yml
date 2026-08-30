@@ -82,7 +82,9 @@ jobs:
         run: |
           set -euo pipefail
           go vet ./internal/...
-          go test ./internal/...
+          # -race needs cgo, which Linux runners have and Windows dev boxes
+          # generally do not. This is the only place the race detector runs.
+          CGO_ENABLED=1 go test -race ./internal/...
 
       - name: Build archive
         shell: bash
