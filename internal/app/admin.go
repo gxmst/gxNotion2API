@@ -815,6 +815,8 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.handleAdminAccountsActivate(w, r)
 	case r.URL.Path == "/admin/accounts/test":
 		a.handleAdminAccountsTest(w, r)
+	case r.URL.Path == "/admin/accounts/refresh-models":
+		a.handleAdminAccountsRefreshModels(w, r)
 	case r.URL.Path == "/admin/accounts/login/start":
 		a.handleAdminAccountLoginStart(w, r)
 	case r.URL.Path == "/admin/accounts/login/verify":

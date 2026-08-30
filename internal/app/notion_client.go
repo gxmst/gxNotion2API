@@ -395,14 +395,19 @@ func (e *notionAPIError) Error() string {
 }
 
 type NotionAIClient struct {
-	Session                     SessionInfo
-	Config                      AppConfig
-	AccountEmail                string
-	ProxyResolver               *ProxyResolver
-	Timeout                     time.Duration
-	PollInterval                time.Duration
-	PollMaxRounds               int
-	HTTPClient                  *http.Client
+	Session       SessionInfo
+	Config        AppConfig
+	AccountEmail  string
+	ProxyResolver *ProxyResolver
+	Timeout       time.Duration
+	PollInterval  time.Duration
+	PollMaxRounds int
+	HTTPClient    *http.Client
+	// FallbackHTTPClient is the native net/http client, set only when
+	// HTTPClient is the surf impersonating one. Used to retry a request that
+	// failed at the transport layer, so a surf-side problem cannot take the
+	// whole proxy down.
+	FallbackHTTPClient          *http.Client
 	browserRunInferenceFallback func(context.Context, map[string]any) (string, error)
 }
 
@@ -682,9 +687,17 @@ func cachedNotionHTTPTransport(cfg AppConfig, accountEmail string, resolver *Pro
 		notionHTTPTransportCacheMetric.Add("hit_rlock", 1)
 		return cached
 	}
-	tlsConfig := &tls.Config{InsecureSkipVerify: true}
-	if strings.TrimSpace(upstream.TLSServerName) != "" {
-		tlsConfig.ServerName = strings.TrimSpace(upstream.TLSServerName)
+	// Certificate verification is only skipped when the operator has explicitly
+	// pointed requests somewhere other than the real host (domain fronting via
+	// upstream_tls_server_name / upstream_host), where the presented cert
+	// legitimately will not match. Skipping it unconditionally would hand any
+	// on-path attacker the session cookies.
+	tlsConfig := &tls.Config{}
+	if serverName := strings.TrimSpace(upstream.TLSServerName); serverName != "" {
+		tlsConfig.ServerName = serverName
+		tlsConfig.InsecureSkipVerify = true
+	} else if strings.TrimSpace(upstream.HostHeader) != "" {
+		tlsConfig.InsecureSkipVerify = true
 	}
 	proxyFunc := upstream.ProxyFunc()
 	transport := &http.Transport{
@@ -728,7 +741,11 @@ func newNotionAIClientWithMode(session SessionInfo, cfg AppConfig, accountEmail 
 		timeout = streamRequestTimeout(normalizedCfg)
 		clientTimeout = 0
 	}
-	return &NotionAIClient{
+	nativeClient := &http.Client{
+		Timeout:   clientTimeout,
+		Transport: transport,
+	}
+	client := &NotionAIClient{
 		Session:       session,
 		Config:        normalizedCfg,
 		AccountEmail:  strings.TrimSpace(accountEmail),
@@ -736,11 +753,19 @@ func newNotionAIClientWithMode(session SessionInfo, cfg AppConfig, accountEmail 
 		Timeout:       timeout,
 		PollInterval:  time.Duration(maxFloat(normalizedCfg.PollIntervalSec, 0.5) * float64(time.Second)),
 		PollMaxRounds: maxInt(normalizedCfg.PollMaxRounds, 1),
-		HTTPClient: &http.Client{
-			Timeout:   clientTimeout,
-			Transport: transport,
-		},
+		HTTPClient:    nativeClient,
 	}
+	// Prefer the impersonating transport; keep native as a retry path.
+	if surfMainTransportEnabled(normalizedCfg) {
+		proxy := resolveStaticProxyForUpstream(resolver, accountEmail, upstream)
+		if surfClient, err := surfMainClientWithTimeout(proxy, clientTimeout); err == nil {
+			client.HTTPClient = surfClient
+			client.FallbackHTTPClient = nativeClient
+		} else {
+			log.Printf("[transport] surf impersonation unavailable, using native net/http: %v", err)
+		}
+	}
+	return client
 }
 
 func (c *NotionAIClient) cookieHeader() string {
@@ -790,7 +815,18 @@ func (c *NotionAIClient) acceptLanguageHeader() string {
 			return locale
 		}
 	}
-	return "en-US,en;q=0.9"
+	if configured := strings.TrimSpace(c.Config.Features.AcceptLanguage); configured != "" {
+		return configured
+	}
+	return defaultAcceptLanguageForTimezone(c.upstreamTimezone())
+}
+
+// upstreamTimezone is the IANA zone reported in the inference payload.
+func (c *NotionAIClient) upstreamTimezone() string {
+	if configured := strings.TrimSpace(c.Config.Features.Timezone); configured != "" {
+		return configured
+	}
+	return defaultUpstreamTimezone
 }
 
 func (c *NotionAIClient) chatReferer(threadID string) string {
@@ -1044,6 +1080,30 @@ func (c *NotionAIClient) postJSONWithReferer(ctx context.Context, url string, pa
 	return respBody, nil
 }
 
+// cloneRequestWithFreshBody rebuilds a request so it can be replayed on the
+// fallback client; the original body reader is already consumed.
+func (c *NotionAIClient) cloneRequestWithFreshBody(original *http.Request, body []byte) (*http.Request, error) {
+	if original == nil {
+		return nil, fmt.Errorf("nil request")
+	}
+	retry, err := http.NewRequestWithContext(original.Context(), original.Method, original.URL.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	retry.Header = original.Header.Clone()
+	retry.Host = original.Host
+	return retry, nil
+}
+
+// isContextCanceledError reports whether an error came from the caller going
+// away rather than from the transport. Those must not be retried.
+func isContextCanceledError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 func (c *NotionAIClient) postJSONResponse(ctx context.Context, url string, payload map[string]any, contentType string) (*http.Response, error) {
 	return c.postJSONResponseWithReferer(ctx, url, payload, contentType, "")
 }
@@ -1089,6 +1149,18 @@ func (c *NotionAIClient) postJSONResponseWithReferer(ctx context.Context, url st
 	c.captureDebugUpstreamRequestFromHeader(url, req.Header, payload, body)
 	c.Config.NotionUpstream().ApplyHost(req)
 	resp, err := c.HTTPClient.Do(req)
+	if err != nil && c.FallbackHTTPClient != nil && !isContextCanceledError(err) {
+		// The impersonating transport failed before producing a response. An
+		// upstream HTTP error is not routed here (that arrives as a response
+		// with a status code), so this is a client/transport problem: retry once
+		// natively rather than failing the request outright.
+		log.Printf("[transport] surf request failed, retrying natively url=%s err=%v", url, err)
+		retryReq, retryErr := c.cloneRequestWithFreshBody(req, body)
+		if retryErr != nil {
+			return nil, err
+		}
+		resp, err = c.FallbackHTTPClient.Do(retryReq)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -3594,7 +3666,11 @@ func (c *NotionAIClient) streamRunInferenceTranscript(ctx context.Context, paylo
 
 func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID string, attachments []UploadedAttachment) (map[string]any, inferencePayloadMeta) {
 	now := isoNowMillis()
-	hiddenPrompt := strings.TrimSpace(req.HiddenPrompt)
+	// clientHidden is what the caller actually sent this turn. An empty value on a
+	// continuation turn means "reuse the instructions already carried by the draft",
+	// so the standing system prefix must never be mistaken for client content.
+	clientHidden := strings.TrimSpace(req.HiddenPrompt)
+	hiddenPrompt := applyPromptSystemPrefix(c.Config, clientHidden)
 	surface := firstNonEmpty(strings.TrimSpace(c.Config.Features.AISurface), "ai_module")
 	threadType := firstNonEmpty(strings.TrimSpace(c.Config.Features.ThreadType), "workflow")
 	if len(attachments) > 0 {
@@ -3622,7 +3698,7 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 		}
 	}
 	contextValue := map[string]any{
-		"timezone":        "Asia/Shanghai",
+		"timezone":        c.upstreamTimezone(),
 		"userName":        c.Session.UserName,
 		"userId":          c.Session.UserID,
 		"userEmail":       c.Session.UserEmail,
@@ -3637,7 +3713,7 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 			contextValue[key] = value
 		}
 	}
-	contextValue["timezone"] = firstNonEmpty(strings.TrimSpace(stringValue(contextValue["timezone"])), "Asia/Shanghai")
+	contextValue["timezone"] = firstNonEmpty(strings.TrimSpace(stringValue(contextValue["timezone"])), c.upstreamTimezone())
 	contextValue["userName"] = firstNonEmpty(strings.TrimSpace(c.Session.UserName), strings.TrimSpace(stringValue(contextValue["userName"])))
 	contextValue["userId"] = firstNonEmpty(strings.TrimSpace(c.Session.UserID), strings.TrimSpace(stringValue(contextValue["userId"])))
 	contextValue["userEmail"] = firstNonEmpty(strings.TrimSpace(c.Session.UserEmail), strings.TrimSpace(stringValue(contextValue["userEmail"])))
@@ -3650,9 +3726,21 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 	}
 	contextValue["currentDatetime"] = originalDatetime
 	contextValue["surface"] = surface
-	if req.continuationDraft != nil && hiddenPrompt != "" {
-		contextValue["instructions"] = hiddenPrompt
-		contextValue["runtimePromptHint"] = hiddenPrompt
+	if req.continuationDraft != nil {
+		if clientHidden != "" {
+			// The caller re-sent its instructions; they win.
+			contextValue["instructions"] = hiddenPrompt
+			contextValue["runtimePromptHint"] = hiddenPrompt
+		} else if carried := strings.TrimSpace(stringValue(contextValue["instructions"])); carried != "" {
+			// Keep the instructions the thread already carries (the client's card on
+			// a later turn) and only frame them with the standing prefix.
+			framed := applyPromptSystemPrefix(c.Config, carried)
+			contextValue["instructions"] = framed
+			contextValue["runtimePromptHint"] = framed
+		} else if hiddenPrompt != "" {
+			contextValue["instructions"] = hiddenPrompt
+			contextValue["runtimePromptHint"] = hiddenPrompt
+		}
 	}
 	transcript := []map[string]any{}
 	if req.continuationDraft != nil {

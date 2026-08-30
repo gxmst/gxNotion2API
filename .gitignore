@@ -35,6 +35,10 @@ frontend/out/
 
 # Local test sources stay out of git
 *_test.go
+# ...except the Go tests for internal/app, which are the only thing standing
+# between a refactor and a silent regression. CI runs `go build` only, so these
+# have to at least survive a clone.
+!internal/app/*_test.go
 *.test.ts
 *.test.tsx
 *.spec.ts

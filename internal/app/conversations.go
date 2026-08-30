@@ -6,6 +6,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -121,6 +122,31 @@ type ConversationStore struct {
 	order     []string
 	subs      map[int]chan ConversationEvent
 	nextSubID int
+	// ephemeralTTLNanos is read on the streaming hot path (every delta goes
+	// through conversations()), so it is atomic rather than guarded by mu.
+	ephemeralTTLNanos atomic.Int64
+}
+
+// SetEphemeralTTL overrides the lifetime granted to an ephemeral conversation
+// when a turn finishes. Zero or negative means "no override", which leaves each
+// path's own built-in lifetime in place.
+func (s *ConversationStore) SetEphemeralTTL(ttl time.Duration) {
+	if s == nil {
+		return
+	}
+	if ttl < 0 {
+		ttl = 0
+	}
+	s.ephemeralTTLNanos.Store(int64(ttl))
+}
+
+// ephemeralTTL is the lifetime to grant a finishing ephemeral conversation.
+// Safe to call with or without mu held.
+func (s *ConversationStore) ephemeralTTL() time.Duration {
+	if ttl := time.Duration(s.ephemeralTTLNanos.Load()); ttl > 0 {
+		return ttl
+	}
+	return sillyTavernQuietConversationTTL
 }
 
 func newConversationStore() *ConversationStore {
@@ -672,7 +698,7 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 		next.Status = "completed"
 		next.UpdatedAt = now
 		if next.Ephemeral {
-			next.AutoDeleteAt = timePointer(now.Add(sillyTavernQuietConversationTTL))
+			next.AutoDeleteAt = timePointer(now.Add(s.ephemeralTTL()))
 		}
 		next.ThreadID = strings.TrimSpace(result.ThreadID)
 		next.TraceID = strings.TrimSpace(result.TraceID)
@@ -726,7 +752,7 @@ func (s *ConversationStore) Fail(conversationID string, err error) {
 		next.Error = message
 		next.UpdatedAt = now
 		if next.Ephemeral {
-			next.AutoDeleteAt = timePointer(now.Add(sillyTavernQuietConversationTTL))
+			next.AutoDeleteAt = timePointer(now.Add(s.ephemeralTTL()))
 		}
 		if len(next.Messages) > 0 {
 			last := &next.Messages[len(next.Messages)-1]
@@ -816,6 +842,44 @@ func (s *ConversationStore) ListExpiredEphemeral(now time.Time, limit int) []Con
 	return items
 }
 
+// ListIdleConversations returns finished conversations whose last turn is older
+// than idleTTL, oldest first. Ephemeral entries are skipped because they are
+// swept by their own deadline, and running turns are never returned however
+// stale their timestamp looks.
+func (s *ConversationStore) ListIdleConversations(now time.Time, idleTTL time.Duration, limit int) []ConversationEntry {
+	if s == nil || idleTTL <= 0 {
+		return nil
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if limit <= 0 {
+		limit = len(s.order)
+	}
+	cutoff := now.Add(-idleTTL)
+	items := make([]ConversationEntry, 0, minInt(limit, len(s.order)))
+	for _, id := range s.order {
+		entry := s.items[id]
+		if entry == nil || entry.Ephemeral {
+			continue
+		}
+		if strings.EqualFold(strings.TrimSpace(entry.Status), "running") {
+			continue
+		}
+		last := entry.UpdatedAt
+		if last.IsZero() {
+			last = entry.CreatedAt
+		}
+		if last.IsZero() || !last.Before(cutoff) {
+			continue
+		}
+		items = append(items, copyConversationEntryValue(entry))
+		if len(items) >= limit {
+			break
+		}
+	}
+	return items
+}
+
 func (s *ConversationStore) Get(conversationID string) (ConversationEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -889,13 +953,19 @@ func (s *ConversationStore) Unsubscribe(id int) {
 	}
 }
 
+// conversations is on the streaming hot path (pushConversationDelta calls it for
+// every delta), so it must stay cheap: no store-level write lock, and the
+// ephemeral TTL is pushed in from applyEphemeralTTLFromConfig when config
+// changes rather than recomputed per call.
 func (s *ServerState) conversations() *ConversationStore {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.Conversations == nil {
 		s.Conversations = newConversationStore()
+		s.Conversations.SetEphemeralTTL(configuredEphemeralTTLOverride(s.Config))
 	}
-	return s.Conversations
+	store := s.Conversations
+	s.mu.Unlock()
+	return store
 }
 
 func (s *ServerState) persistConversationSnapshot(conversationID string) {

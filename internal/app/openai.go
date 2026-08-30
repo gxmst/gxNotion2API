@@ -106,6 +106,18 @@ func normalizeChatInput(payload map[string]any) (NormalizedInput, error) {
 	return normalizeChatInputFromParts(rawMessages, payload["attachments"])
 }
 
+// isInstructionRole reports whether a chat role carries operating instructions
+// rather than a visible conversation turn. These map to the upstream
+// instructions field so the model treats them as its own directives.
+func isInstructionRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "system", "developer":
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeChatInputFromParts(rawMessages []any, attachmentsRaw any) (NormalizedInput, error) {
 	if rawMessages == nil {
 		return NormalizedInput{}, fmt.Errorf("messages must be an array")
@@ -124,9 +136,17 @@ func normalizeChatInputFromParts(rawMessages []any, attachmentsRaw any) (Normali
 			return NormalizedInput{}, err
 		}
 		if segment != nil {
-			segments = append(segments, *segment)
-			if strings.TrimSpace(segment.Role) != "user" {
-				hasNonUserHistory = true
+			// The OpenAI roles that carry operating instructions belong upstream as
+			// instructions, not as another turn of the visible transcript. Flattening
+			// them into the prompt makes the model read its own directives as if the
+			// user had typed them.
+			if isInstructionRole(segment.Role) {
+				hiddenParts = append(hiddenParts, segment.Text)
+			} else {
+				segments = append(segments, *segment)
+				if strings.TrimSpace(segment.Role) != "user" {
+					hasNonUserHistory = true
+				}
 			}
 		}
 		hiddenParts = append(hiddenParts, hiddenSegments...)

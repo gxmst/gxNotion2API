@@ -52,6 +52,38 @@ var (
 
 type promptGuardExecutor func(context.Context, PromptRunRequest, func(string) error) (InferenceResult, error)
 
+// promptSystemPrefixEnabled reports whether the standing system prefix should be
+// prepended to the instructions sent upstream. Absent config means enabled.
+func promptSystemPrefixEnabled(cfg AppConfig) bool {
+	if cfg.Prompt.SystemPrefixEnabled == nil {
+		return true
+	}
+	return *cfg.Prompt.SystemPrefixEnabled
+}
+
+// applyPromptSystemPrefix prepends the standing system prefix to hiddenPrompt.
+// The upstream product applies its own assistant framing that treats anything
+// unrelated to workspace management as out of scope; this restores a plain
+// general-assistant framing ahead of whatever instructions the client sent.
+// It is idempotent, so a retry or continuation cannot stack duplicates.
+func applyPromptSystemPrefix(cfg AppConfig, hiddenPrompt string) string {
+	if !promptSystemPrefixEnabled(cfg) {
+		return hiddenPrompt
+	}
+	prefix := strings.TrimSpace(cfg.Prompt.SystemPrefix)
+	if prefix == "" {
+		prefix = defaultPromptSystemPrefix()
+	}
+	hiddenPrompt = strings.TrimSpace(hiddenPrompt)
+	if hiddenPrompt == "" {
+		return prefix
+	}
+	if strings.HasPrefix(hiddenPrompt, prefix) {
+		return hiddenPrompt
+	}
+	return prefix + "\n\n" + hiddenPrompt
+}
+
 type promptGuardStreamBuffer struct {
 	forward     func(string) error
 	rawText     strings.Builder

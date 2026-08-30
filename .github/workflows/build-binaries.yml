@@ -74,6 +74,16 @@ jobs:
           fi
           echo "value=${version}" >> "$GITHUB_OUTPUT"
 
+      # Run once natively (not per cross-compile target) so a regression fails
+      # the release instead of shipping.
+      - name: Test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./internal/...
+          go test ./internal/...
+
       - name: Build archive
         shell: bash
         env:

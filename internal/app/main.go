@@ -108,9 +108,15 @@ const (
 	ephemeralConversationCleanupInterval  = time.Minute
 	ephemeralConversationCleanupBatchSize = 24
 	sillyTavernQuietConversationTTL       = 10 * time.Minute
-	corsAllowOrigin                       = "*"
-	corsAllowHeaders                      = "Authorization, Content-Type, X-Admin-Token"
-	corsAllowMethods                      = "GET, POST, PUT, DELETE, OPTIONS"
+	defaultConfigEphemeralConversationTTL = 2 * time.Minute
+	// Conversations idle this long are swept along with their upstream thread.
+	// Long enough that a normal chat resumed the next day still reuses its
+	// thread (and so still hits the upstream prompt cache), short enough that
+	// finished conversations do not accumulate in the workspace indefinitely.
+	defaultConversationIdleTTLHours = 24
+	corsAllowOrigin                 = "*"
+	corsAllowHeaders                = "Authorization, Content-Type, X-Admin-Token"
+	corsAllowMethods                = "GET, POST, PUT, DELETE, OPTIONS"
 )
 
 var errRequestTooLarge = errors.New("request body too large")
@@ -491,6 +497,11 @@ func (s *ServerState) ApplyConfig(cfg AppConfig) error {
 	s.rebuildAccountSlotsLocked()
 	s.updateSnapshotBundleLocked()
 	s.rebuildStaticJSONCachesLocked()
+	// Push the ephemeral TTL override into the live store here rather than from
+	// conversations(), which sits on the streaming hot path.
+	if s.Conversations != nil {
+		s.Conversations.SetEphemeralTTL(configuredEphemeralTTLOverride(cfg))
+	}
 	return nil
 }
 
@@ -1467,6 +1478,9 @@ func (a *App) markEphemeralConversationRequest(request *PromptRunRequest) {
 	if request == nil {
 		return
 	}
+	if a.markConfigEphemeralConversationRequest(request) {
+		return
+	}
 	if request.ClientProfile != sillyTavernClientProfile {
 		return
 	}
@@ -1485,6 +1499,62 @@ func (a *App) markEphemeralConversationRequest(request *PromptRunRequest) {
 	}
 }
 
+// markConfigEphemeralConversationRequest applies features.ephemeral_all_conversations,
+// which makes every request's upstream thread disposable regardless of client profile.
+// It reports whether the request was marked here.
+func (a *App) markConfigEphemeralConversationRequest(request *PromptRunRequest) bool {
+	if a == nil || a.State == nil || request == nil {
+		return false
+	}
+	cfg, _, _ := a.State.Snapshot()
+	if !cfg.Features.EphemeralAllConversations {
+		return false
+	}
+	request.EphemeralConversation = true
+	request.EphemeralReason = firstNonEmpty(strings.TrimSpace(request.EphemeralReason), "config_ephemeral_all")
+	ttl := configuredEphemeralTTL(cfg)
+	deadline := time.Now().UTC().Add(ttl)
+	if request.EphemeralDeleteAfter.IsZero() || request.EphemeralDeleteAfter.After(deadline) {
+		request.EphemeralDeleteAfter = deadline
+	}
+	return true
+}
+
+// configuredEphemeralTTL is the lifetime granted to a conversation that
+// ephemeral_all_conversations marked. It is only consulted on that path.
+func configuredEphemeralTTL(cfg AppConfig) time.Duration {
+	if seconds := cfg.Features.EphemeralTTLSeconds; seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return defaultConfigEphemeralConversationTTL
+}
+
+// configuredEphemeralTTLOverride is what the conversation store applies to every
+// ephemeral conversation. Zero means "do not override", which leaves paths that
+// pick their own lifetime (SillyTavern quiet/impersonate side-requests, whose
+// built-in TTL is sillyTavernQuietConversationTTL) alone. Returning the
+// ephemeral_all default here instead would silently shorten those.
+func configuredEphemeralTTLOverride(cfg AppConfig) time.Duration {
+	if seconds := cfg.Features.EphemeralTTLSeconds; seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return 0
+}
+
+// configuredConversationIdleTTL is how long a conversation may sit without a new
+// turn before it is swept. Absent config means defaultConversationIdleTTLHours;
+// an explicit 0 disables idle sweeping.
+func configuredConversationIdleTTL(cfg AppConfig) time.Duration {
+	hours := defaultConversationIdleTTLHours
+	if cfg.Features.ConversationIdleTTLHours != nil {
+		hours = *cfg.Features.ConversationIdleTTLHours
+	}
+	if hours <= 0 {
+		return 0
+	}
+	return time.Duration(hours) * time.Hour
+}
+
 func (a *App) cleanupExpiredEphemeralConversations() {
 	if a == nil || a.State == nil {
 		return
@@ -1496,6 +1566,30 @@ func (a *App) cleanupExpiredEphemeralConversations() {
 			continue
 		}
 		log.Printf("[cleanup] deleted expired ephemeral conversation=%s thread=%s reason=%s", entry.ID, entry.ThreadID, entry.EphemeralReason)
+	}
+	a.cleanupIdleConversations()
+}
+
+// cleanupIdleConversations sweeps conversations that have gone untouched for
+// features.conversation_idle_ttl_hours, deleting the upstream thread with them.
+// Threads are deliberately kept until then so that resuming a conversation still
+// reuses its thread and hits the upstream prompt cache.
+func (a *App) cleanupIdleConversations() {
+	if a == nil || a.State == nil {
+		return
+	}
+	cfg, _, _ := a.State.Snapshot()
+	idleTTL := configuredConversationIdleTTL(cfg)
+	if idleTTL <= 0 {
+		return
+	}
+	idle := a.State.conversations().ListIdleConversations(time.Now().UTC(), idleTTL, ephemeralConversationCleanupBatchSize)
+	for _, entry := range idle {
+		if err := a.deleteConversation(entry.ID); err != nil {
+			log.Printf("[cleanup] delete idle conversation=%s thread=%s idle_ttl=%s failed: %v", entry.ID, entry.ThreadID, idleTTL, err)
+			continue
+		}
+		log.Printf("[cleanup] deleted idle conversation=%s thread=%s idle_ttl=%s", entry.ID, entry.ThreadID, idleTTL)
 	}
 }
 
@@ -1712,6 +1806,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		request.PinnedAccountEmail = requestedAccount
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
+	a.markEphemeralConversationRequest(&request)
 	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "chat_completions", resolveRequestPromptForContinuation(normalized), request)
 	setConversationIDHeader(w, conversationID)
 	stream := typed.Stream
@@ -1932,6 +2027,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		request.Prompt = buildFreshThreadReplayPromptFromStoredResponse(normalized.PreviousResponsePrompt, latestPrompt, normalized.Attachments, request.Prompt)
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
+	a.markEphemeralConversationRequest(&request)
 	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "responses", resolveRequestPromptForContinuation(normalized), request)
 	setConversationIDHeader(w, conversationID)
 	if stream {

@@ -368,6 +368,81 @@ func (a *App) handleAdminAccountDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.buildAccountsPayload())
 }
 
+// handleAdminAccountsRefreshModels re-reads the account's model list from
+// upstream. Unlike import-time discovery, the freshly fetched definitions win
+// over what is already in config, so a model whose upstream codename changed is
+// corrected instead of being shadowed by the stale entry.
+func (a *App) handleAdminAccountsRefreshModels(w http.ResponseWriter, r *http.Request) {
+	if !a.adminAuthOK(w, r) {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	payload, err := a.decodeBody(w, r)
+	if err != nil {
+		writeInvalidBodyError(w, err)
+		return
+	}
+	cfg, _, _ := a.State.Snapshot()
+	email := strings.TrimSpace(stringValue(payload["email"]))
+	if email == "" {
+		email = strings.TrimSpace(cfg.ActiveAccount)
+	}
+	if email == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "email is required (no active account)"})
+		return
+	}
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
+		return
+	}
+	account = ensureAccountPaths(cfg, account)
+	if !fileExists(account.ProbeJSON) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "probe_json not found for account"})
+		return
+	}
+	session, err := loadSessionInfo(account.ProbeJSON, account.UserName, account.SpaceName)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), helperTimeout(cfg))
+	defer cancel()
+	models, err := refreshAccountModels(ctx, cfg, account.Email, session.Cookies, session.ClientVersion, session.UserID, session.SpaceID)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error()})
+		return
+	}
+
+	// Discovered definitions are the incoming side here so they take precedence.
+	cfg.Models = mergeModelDefinitions(cfg.Models, models)
+	if err := a.State.SaveAndApply(cfg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	a.invalidateDispatchProbeCache()
+
+	_, _, registry := a.State.Snapshot()
+	ids := make([]string, 0, len(registry.Entries))
+	for _, entry := range registry.Entries {
+		if entry.Enabled {
+			ids = append(ids, entry.ID)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"success":          true,
+		"account":          account.Email,
+		"discovered_count": len(models),
+		"model_count":      len(ids),
+		"models":           ids,
+		"message":          "models refreshed from upstream",
+	})
+}
+
 func (a *App) handleAdminAccountsActivate(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthOK(w, r) {
 		return

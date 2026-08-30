@@ -162,6 +162,50 @@ func fetchAvailableModelsMetadata(ctx context.Context, session *loginHTTPSession
 	return parseProbeModelsBlob(string(raw)), nil
 }
 
+// refreshAccountModels re-asks upstream for the model list of an already-imported
+// account. Full discovery only runs at import time and is skipped entirely when
+// the pasted probe JSON is complete, so without this the model list can only be
+// updated by re-importing the account.
+func refreshAccountModels(ctx context.Context, cfg AppConfig, accountEmail string, cookies []ProbeCookie, clientVersion string, userID string, spaceID string) ([]ModelDefinition, error) {
+	cookies = normalizeProbeCookies(cookies)
+	if len(cookies) == 0 {
+		return nil, fmt.Errorf("cookies are required to refresh models")
+	}
+	if strings.TrimSpace(spaceID) == "" {
+		return nil, fmt.Errorf("space_id is required to refresh models")
+	}
+	upstream := cfg.NotionUpstream()
+	resolver := NewProxyResolver(cfg)
+	session, err := newNotionLoginSession(helperTimeout(cfg), upstream, resolver, accountEmail, cfg)
+	if err != nil {
+		return nil, err
+	}
+	restoreProbeCookies(session.Jar, upstream.HomeURL(), cookies)
+	restoreProbeCookies(session.Jar, upstream.LoginURL(), cookies)
+
+	clientVersion = strings.TrimSpace(clientVersion)
+	if clientVersion == "" {
+		bootstrap, bootErr := fetchLoginBootstrap(ctx, session, upstream)
+		if bootErr != nil {
+			return nil, bootErr
+		}
+		clientVersion = strings.TrimSpace(bootstrap.ClientVersion)
+	}
+	if clientVersion == "" {
+		return nil, fmt.Errorf("client_version unavailable")
+	}
+
+	lookupUserID := firstNonEmpty(strings.TrimSpace(userID), probeCookieValue(cookies, "notion_user_id"))
+	models, err := fetchAvailableModelsMetadata(ctx, session, upstream, clientVersion, lookupUserID, spaceID)
+	if err != nil {
+		return nil, err
+	}
+	if len(models) == 0 {
+		return nil, fmt.Errorf("upstream returned no models")
+	}
+	return models, nil
+}
+
 func discoverImportedAccountMetadata(ctx context.Context, cfg AppConfig, accountEmail string, cookies []ProbeCookie, fallback discoveredAccountMetadata) (discoveredAccountMetadata, error) {
 	meta := fallback
 	cookies = normalizeProbeCookies(cookies)

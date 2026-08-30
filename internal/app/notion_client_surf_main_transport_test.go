@@ -1,0 +1,150 @@
+package app
+
+import (
+	"crypto/tls"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestSurfMainTransportEnabledDefaults(t *testing.T) {
+	cfg := AppConfig{}
+	if !surfMainTransportEnabled(cfg) {
+		t.Error("absent use_surf_main_transport must default to enabled")
+	}
+	off := false
+	cfg.Features.UseSurfMainTransport = &off
+	if surfMainTransportEnabled(cfg) {
+		t.Error("explicit false must disable")
+	}
+	on := true
+	cfg.Features.UseSurfMainTransport = &on
+	if !surfMainTransportEnabled(cfg) {
+		t.Error("explicit true must enable")
+	}
+	// normalizeConfig must materialise the default so it round-trips.
+	normalized := normalizeConfig(defaultConfig())
+	if normalized.Features.UseSurfMainTransport == nil {
+		t.Fatal("normalizeConfig left use_surf_main_transport nil")
+	}
+	if !*normalized.Features.UseSurfMainTransport {
+		t.Error("normalizeConfig default must be enabled")
+	}
+}
+
+// The impersonating client must carry no cookie jar: the main path writes the
+// `cookie` header by hand, and a jar would append its own on later requests.
+func TestSurfImpersonatedClientHasNoJar(t *testing.T) {
+	client, err := newSurfImpersonatedClient("")
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if client.Jar != nil {
+		t.Error("impersonating main-path client must not carry a cookie jar")
+	}
+}
+
+func TestCachedSurfMainClientReusesTransport(t *testing.T) {
+	a, err := cachedSurfMainClient("")
+	if err != nil {
+		t.Fatalf("first build failed: %v", err)
+	}
+	b, err := cachedSurfMainClient("")
+	if err != nil {
+		t.Fatalf("second build failed: %v", err)
+	}
+	if a != b {
+		t.Error("same proxy key must return the cached client")
+	}
+	withTimeout, err := surfMainClientWithTimeout("", 5*time.Second)
+	if err != nil {
+		t.Fatalf("timeout wrapper failed: %v", err)
+	}
+	if withTimeout.Timeout != 5*time.Second {
+		t.Errorf("timeout = %v, want 5s", withTimeout.Timeout)
+	}
+	if withTimeout.Transport != a.Transport {
+		t.Error("wrapper must share the cached transport")
+	}
+	if withTimeout == a {
+		t.Error("wrapper must not mutate the cached client's timeout")
+	}
+}
+
+// A surf-side transport failure must fall back to native rather than failing the
+// request, and the retry must carry the same headers and body.
+func TestPostJSONFallsBackToNativeOnTransportError(t *testing.T) {
+	var gotBody string
+	var gotSpaceID string
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		buf := make([]byte, r.ContentLength)
+		_, _ = r.Body.Read(buf)
+		gotBody = string(buf)
+		gotSpaceID = r.Header.Get("x-notion-space-id")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := normalizeConfig(defaultConfig())
+	cfg.APIKey = "k"
+	client := &NotionAIClient{
+		Config:  cfg,
+		Session: SessionInfo{SpaceID: "space-42", UserID: "user-1"},
+		// Primary client always fails at the transport layer.
+		HTTPClient: &http.Client{Transport: alwaysFailingTransport{}},
+		FallbackHTTPClient: &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{}},
+			Timeout:   10 * time.Second,
+		},
+	}
+
+	resp, err := client.postJSONResponse(t.Context(), srv.URL, map[string]any{"hello": "world"}, "application/json")
+	if err != nil {
+		t.Fatalf("expected native fallback to succeed, got %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if hits != 1 {
+		t.Errorf("server saw %d requests, want 1 (only the retry)", hits)
+	}
+	if !strings.Contains(gotBody, "world") {
+		t.Errorf("retry lost the body: %q", gotBody)
+	}
+	if gotSpaceID != "space-42" {
+		t.Errorf("retry lost headers: x-notion-space-id = %q", gotSpaceID)
+	}
+}
+
+// Without a fallback client configured, a transport error must surface as-is.
+func TestPostJSONWithoutFallbackReturnsError(t *testing.T) {
+	cfg := normalizeConfig(defaultConfig())
+	client := &NotionAIClient{
+		Config:     cfg,
+		Session:    SessionInfo{SpaceID: "s", UserID: "u"},
+		HTTPClient: &http.Client{Transport: alwaysFailingTransport{}},
+	}
+	_, err := client.postJSONResponse(t.Context(), "https://example.invalid/api/v3/x", map[string]any{}, "application/json")
+	if err == nil {
+		t.Fatal("expected the transport error to surface")
+	}
+	if !strings.Contains(err.Error(), "simulated transport failure") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+var errSimulatedTransport = errors.New("simulated transport failure")
+
+type alwaysFailingTransport struct{}
+
+func (alwaysFailingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errSimulatedTransport
+}
