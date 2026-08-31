@@ -160,6 +160,33 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 
 省略 `email` 时使用当前活动账号。与导入时相反，这个接口让上游返回的定义**覆盖**配置里的同名条目，因此上游改过代号的模型会被纠正，而不是被旧值挡住。
 
+### 工作区选择（免费区会静默失败）
+
+`space_id` 决定推理落在哪个工作区，而 AI 额度是按工作区算的，不是按账号算的。一个账号有多个区时，probe 里记的往往是默认的个人区——如果那是免费区，试用额度用完之后的表现是：
+
+- 认证、模型列表、账号状态全部正常
+- 推理请求上游返回 200，消息也确实写进了 thread
+- 但永远等不到 AI 回复，最后超时报 `thread <id> did not produce any agent-inference message`
+
+没有 `quota-exhausted` 之类的明确错误，所以很容易误判成 cookie 失效或 IP 被风控。先确认账号有哪些区、各自什么档：
+
+```bash
+curl -X POST https://www.notion.so/api/v3/getSpaces \
+  -H "cookie: <你的 cookie>" -H "content-type: application/json" -d '{}' \
+  | jq -r 'to_entries[].value.space | to_entries[]
+           | "\(.key)  \(.value.value.name)  plan=\(.value.value.plan_type) tier=\(.value.value.subscription_tier)"'
+```
+
+挑 `tier` 不是 `free` 的那个区，导入时显式带上它的 `space_id` 和 `space_view_id`（显式字段优先于 probe 里记的值）：
+
+```bash
+curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
+  -H "X-Admin-Token: <token>" -H "Content-Type: application/json" \
+  -d '{"probe_json_text":"<probe json>","space_id":"<付费区>","space_view_id":"<对应 space_view>"}'
+```
+
+切区之后要清掉已存的会话记录：里面的 thread 属于旧区，复用它们会稳定失败。
+
 ## 使用建议
 
 - 首次启动后先访问 `/admin`，确认账号、配置和连通性是否正常
