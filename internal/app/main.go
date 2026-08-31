@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"expvar"
@@ -67,13 +68,18 @@ type accountSlot struct {
 	inflight atomic.Int32
 }
 
+// healthzStaticPayload is the cached part of /healthz that any caller may see.
+//
+// /healthz is answered before authOK so that a liveness probe needs no
+// credentials. That makes it the wrong place for account identity: user_email,
+// space_id and active_account used to live here, which handed the Notion account
+// address to anyone who could reach the port. serveHealthz now attaches those
+// three only for a caller holding the admin session or the API key, and because
+// they are caller-dependent they cannot be part of this shared cache.
 type healthzStaticPayload struct {
 	OK                   bool   `json:"ok"`
 	DefaultModel         string `json:"default_model"`
 	ModelCount           int    `json:"model_count"`
-	UserEmail            string `json:"user_email"`
-	SpaceID              string `json:"space_id"`
-	ActiveAccount        string `json:"active_account"`
 	SessionRefreshEnable bool   `json:"session_refresh_enabled"`
 }
 
@@ -840,9 +846,6 @@ func (s *ServerState) rebuildStaticJSONCachesLocked() {
 		OK:                   true,
 		DefaultModel:         s.Config.DefaultPublicModel(),
 		ModelCount:           len(s.ModelRegistry.Entries),
-		UserEmail:            s.Session.UserEmail,
-		SpaceID:              s.Session.SpaceID,
-		ActiveAccount:        s.Config.ActiveAccount,
 		SessionRefreshEnable: s.Config.ResolveSessionRefresh().Enabled,
 	}
 	healthBody, err := json.Marshal(healthPayload)
@@ -1046,31 +1049,57 @@ func (a *App) authOK(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
-func (a *App) serveHealthz(w http.ResponseWriter) {
+// healthzCallerIsOperator reports whether the caller has proved it is the
+// operator, and may therefore see the account identity fields. Either the admin
+// session or the API key counts; both are operator-held secrets.
+//
+// This deliberately does not write an error response: /healthz answers either
+// way, just with less detail.
+func (a *App) healthzCallerIsOperator(r *http.Request) bool {
+	if a.adminTokenValid(adminTokenFromRequest(r)) {
+		return true
+	}
+	cfg, _, _ := a.State.Snapshot()
+	expected := strings.TrimSpace(cfg.APIKey)
+	if expected == "" {
+		return false
+	}
+	provided := strings.TrimSpace(r.Header.Get("Authorization"))
+	return subtle.ConstantTimeCompare([]byte(provided), []byte("Bearer "+expected)) == 1
+}
+
+func (a *App) serveHealthz(w http.ResponseWriter, r *http.Request) {
 	a.State.mu.RLock()
 	sessionReady := a.State.Client != nil
 	lastRefresh := a.State.LastSessionRefresh
 	lastRefreshError := a.State.LastSessionRefreshError
 	cached := a.State.cachedHealthzStaticJSON.Load()
 	a.State.mu.RUnlock()
-	if cached != nil {
+
+	operator := a.healthzCallerIsOperator(r)
+
+	if cached != nil && !operator {
 		body := appendHealthzRuntimeFields(*cached, sessionReady, lastRefresh, lastRefreshError)
 		writeJSONBytes(w, http.StatusOK, body)
 		return
 	}
+
 	cfg, session, registry := a.State.Snapshot()
-	writeJSON(w, http.StatusOK, map[string]any{
+	payload := map[string]any{
 		"ok":                         true,
 		"default_model":              cfg.DefaultPublicModel(),
 		"model_count":                len(registry.Entries),
-		"user_email":                 session.UserEmail,
-		"space_id":                   session.SpaceID,
-		"active_account":             cfg.ActiveAccount,
 		"session_ready":              sessionReady,
 		"session_refresh_enabled":    cfg.ResolveSessionRefresh().Enabled,
 		"last_session_refresh":       formatTimeOrEmpty(lastRefresh),
 		"last_session_refresh_error": lastRefreshError,
-	})
+	}
+	if operator {
+		payload["user_email"] = session.UserEmail
+		payload["space_id"] = session.SpaceID
+		payload["active_account"] = cfg.ActiveAccount
+	}
+	writeJSON(w, http.StatusOK, payload)
 }
 
 func (a *App) serveModels(w http.ResponseWriter) {
@@ -2769,7 +2798,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		statusCode = safeWriter.status
 		return
 	case r.Method == http.MethodGet && path == "/healthz":
-		a.serveHealthz(safeWriter)
+		a.serveHealthz(safeWriter, r)
 		statusCode = safeWriter.status
 		return
 	}
