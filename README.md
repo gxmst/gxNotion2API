@@ -110,6 +110,7 @@ HTTP 请求优先顺序：
 
 - `api_key`：OpenAI 兼容接口密钥
 - `admin.password`：WebUI 登录密码
+- `admin.trusted_proxies`：仅在反代场景需要，见下方「把管理台放到公网」
 - `upstream_base_url` / `upstream_origin`
 - `proxy_mode` / `proxy_url` / `proxy_http_url` / `proxy_https_url`
 - `resin_enabled` / `resin_url` / `resin_platform` / `resin_mode`
@@ -188,6 +189,30 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
 切区之后要清掉已存的会话记录：里面的 thread 属于旧区，复用它们会稳定失败。
 
 选定的区会被保留：会话刷新只在账号还没有 `space_id` 时才采纳自动发现的结果。上游 `getSpacesInitial` 只返回 `space_view_pointers` 的顺序（不含 plan/tier 字段），而多区账号的第一个指针通常就是免费个人区，所以早期版本每次刷新都会把推理悄悄挪回免费区——症状和上面完全一样，但发生在已经切好区之后。首次导入走 `loadUserContent` 时按 `subscription_tier` 优选付费区；注意免费个人区的 `plan_type` 是 `personal` 而不是 `free`，只看 `plan_type` 区分不出来。
+
+### 把管理台放到公网（反代）
+
+默认只监听回环，管理台靠 SSH 端口转发访问。要长期免隧道访问就得反代进来，此时**必须**设 `admin.trusted_proxies`：
+
+```json
+{
+  "admin": {
+    "enabled": true,
+    "password": "<强密码>",
+    "token_ttl_hours": 24,
+    "trusted_proxies": ["127.0.0.1"]
+  }
+}
+```
+
+登录锁定（15 分钟内失败 5 次）是管理密码唯一的暴力破解防线，而它按客户端 IP 计数。`X-Forwarded-For` 是客户端可控的，所以：
+
+- **不设** `trusted_proxies`：一律用连接对端地址。直接暴露监听时这是正确答案；反代场景下所有人会挤在反代的那个 IP 上，一个人被锁全体被锁——失败方向是保守的
+- **设了**：只有来自这些地址的请求才认转发头，且取 `X-Forwarded-For` **最右**一段（左边的是调用方自己塞的，可伪造）
+
+反代那边要传 `X-Forwarded-Proto: https`，否则 Go 侧看到的是 HTTP，会话 cookie 不会带 `Secure`。
+
+只反代 `/admin`，别把整个端口代出去——同一个监听上还有 `/v1/*`，代出去等于把推理接口也放到公网，API key 一旦泄露就是拿你的 Notion 额度。
 
 ## 使用建议
 

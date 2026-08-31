@@ -15,6 +15,18 @@ type AdminConfig struct {
 	Password      string `json:"password"`
 	TokenTTLHours int    `json:"token_ttl_hours"`
 	StaticDir     string `json:"static_dir"`
+
+	// TrustedProxies lists the addresses (or CIDR blocks) whose X-Forwarded-For
+	// and X-Real-IP headers may be believed when identifying the client for
+	// login lockout.
+	//
+	// Those headers are client-controlled, so trusting them unconditionally lets
+	// an attacker send a fresh value on every attempt: each guess lands under a
+	// different lockout key and the 5-failures-per-15-minutes limit -- the only
+	// brute-force defence on the admin password -- never trips. Empty means
+	// trust nothing and always use the peer address, which is the right answer
+	// for a directly-exposed listener.
+	TrustedProxies []string `json:"trusted_proxies,omitempty"`
 }
 
 type FeatureConfig struct {

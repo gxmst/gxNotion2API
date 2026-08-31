@@ -133,23 +133,71 @@ func (a *App) serveIndex(w http.ResponseWriter) {
 	_, _ = w.Write([]byte(welcomeHTML))
 }
 
-func adminClientIP(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		if len(parts) > 0 {
-			if ip := strings.TrimSpace(parts[0]); ip != "" {
-				return ip
-			}
-		}
-	}
-	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
-		return realIP
-	}
+// peerIP returns the address the connection actually came from, ignoring any
+// header the client may have supplied.
+func peerIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
 	if err == nil && host != "" {
 		return host
 	}
 	return strings.TrimSpace(r.RemoteAddr)
+}
+
+// proxyIsTrusted reports whether forwarding headers from this peer may be
+// believed. Entries are matched as either a CIDR block or a literal address.
+func proxyIsTrusted(peer string, trusted []string) bool {
+	addr := net.ParseIP(strings.TrimSpace(peer))
+	if addr == nil {
+		return false
+	}
+	for _, entry := range trusted {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			if _, block, err := net.ParseCIDR(entry); err == nil && block.Contains(addr) {
+				return true
+			}
+			continue
+		}
+		if candidate := net.ParseIP(entry); candidate != nil && candidate.Equal(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+// adminClientIP identifies the client for login-lockout purposes.
+//
+// Forwarding headers are only honoured when the request arrives from a
+// configured trusted proxy. Believing them unconditionally would make the
+// lockout bypassable: the headers are attacker-controlled, so rotating the
+// value on each attempt spreads the guesses across distinct lockout keys and
+// the limit never trips. Falling back to the peer address is always safe --
+// behind an untrusted proxy it merely lumps clients together, which fails
+// closed rather than open.
+func adminClientIP(r *http.Request, trusted []string) string {
+	peer := peerIP(r)
+	if !proxyIsTrusted(peer, trusted) {
+		return peer
+	}
+	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
+		// The right-most entry is the one the trusted proxy itself observed;
+		// everything to its left was supplied by the caller and is forgeable.
+		parts := strings.Split(forwarded, ",")
+		for i := len(parts) - 1; i >= 0; i-- {
+			if ip := strings.TrimSpace(parts[i]); ip != "" && net.ParseIP(ip) != nil {
+				return ip
+			}
+		}
+	}
+	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
+		if net.ParseIP(realIP) != nil {
+			return realIP
+		}
+	}
+	return peer
 }
 
 func securePasswordEqual(expected string, candidate string) bool {
@@ -418,7 +466,7 @@ func (a *App) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "admin password is not configured"})
 		return
 	}
-	clientIP := adminClientIP(r)
+	clientIP := adminClientIP(r, cfg.Admin.TrustedProxies)
 	if lockedUntil, locked := a.adminLoginLocked(clientIP); locked {
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
 			"detail":       "too many failed login attempts",
