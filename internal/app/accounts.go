@@ -251,6 +251,57 @@ func ensureAccountPaths(cfg AppConfig, account NotionAccount) NotionAccount {
 	return account
 }
 
+// UpsertAccountRuntimeState stores an account whose runtime bookkeeping is
+// authoritative, then restores the caller's values for the fields where a zero
+// legitimately means "cleared".
+//
+// UpsertAccount treats every zero value as "not supplied" and copies the stored
+// value back, which is right for partial edits from the admin API but wrong for
+// the dispatch path: a success sets ConsecutiveFailures to 0 and LastError to
+// "", and the merge promptly restored the stale failure. The counter therefore
+// never dropped once it had risen, and computeAccountCooldown scales its wait
+// with it, so a healthy account accumulated ever longer cooldowns and sorted
+// worse in the pool forever.
+func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAccount, int) {
+	runtime := struct {
+		status              string
+		lastError           string
+		cooldownUntil       string
+		windowStartedAt     string
+		windowRequestCount  int
+		consecutiveFailures int
+		totalSuccesses      int
+		totalFailures       int
+	}{
+		status:              account.Status,
+		lastError:           account.LastError,
+		cooldownUntil:       account.CooldownUntil,
+		windowStartedAt:     account.WindowStartedAt,
+		windowRequestCount:  account.WindowRequestCount,
+		consecutiveFailures: account.ConsecutiveFailures,
+		totalSuccesses:      account.TotalSuccesses,
+		totalFailures:       account.TotalFailures,
+	}
+	stored, index := cfg.UpsertAccount(account)
+	stored.Status = runtime.status
+	stored.LastError = runtime.lastError
+	stored.CooldownUntil = runtime.cooldownUntil
+	stored.WindowStartedAt = runtime.windowStartedAt
+	stored.WindowRequestCount = runtime.windowRequestCount
+	stored.ConsecutiveFailures = runtime.consecutiveFailures
+	// Cumulative totals only ever grow, so never let a merge walk them back.
+	if stored.TotalSuccesses < runtime.totalSuccesses {
+		stored.TotalSuccesses = runtime.totalSuccesses
+	}
+	if stored.TotalFailures < runtime.totalFailures {
+		stored.TotalFailures = runtime.totalFailures
+	}
+	if index >= 0 && index < len(cfg.Accounts) {
+		cfg.Accounts[index] = stored
+	}
+	return stored, index
+}
+
 func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) {
 	account = ensureAccountPaths(*cfg, account)
 	if existing, index, ok := cfg.FindAccount(account.Email); ok {

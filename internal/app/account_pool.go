@@ -213,7 +213,9 @@ func pickDispatchCandidatesFromSnapshot(bundle *snapshotBundle, now time.Time) [
 
 func applyAccountUpdate(cfg AppConfig, account NotionAccount, makeActive bool) AppConfig {
 	account = ensureAccountPaths(cfg, account)
-	cfg.UpsertAccount(account)
+	// Callers here hand over a full record they just updated, so its runtime
+	// counters are authoritative -- including the zeros a success writes.
+	cfg.UpsertAccountRuntimeState(account)
 	if makeActive {
 		cfg.ActiveAccount = account.Email
 		cfg.ProbeJSON = account.ProbeJSON

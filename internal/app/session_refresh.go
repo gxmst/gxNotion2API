@@ -263,7 +263,9 @@ func (s *ServerState) tryRefreshAccount(ctx context.Context, cfg AppConfig, acco
 	account.LastRefreshAt = sessionRefreshNowISO()
 	account.CooldownUntil = ""
 	account.ConsecutiveFailures = 0
-	cfg.UpsertAccount(account)
+	// A completed refresh means the account is healthy again, so the cleared
+	// counters must survive persistence rather than being merged back.
+	cfg.UpsertAccountRuntimeState(account)
 	cfg.ActiveAccount = account.Email
 	cfg.ProbeJSON = account.ProbeJSON
 	return cfg, nil
