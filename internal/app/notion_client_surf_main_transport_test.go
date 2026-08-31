@@ -141,10 +141,94 @@ func TestPostJSONWithoutFallbackReturnsError(t *testing.T) {
 	}
 }
 
+// The impersonating transport writes its ordering hints into the outgoing
+// header before it fails, using field names that end in a colon. Copying those
+// into the native retry makes net/http reject the request outright, so the
+// fallback has to drop them.
+func TestPostJSONFallbackDropsImpersonationOrderingHeaders(t *testing.T) {
+	var gotKeys []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for key := range r.Header {
+			gotKeys = append(gotKeys, key)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer srv.Close()
+
+	cfg := normalizeConfig(defaultConfig())
+	client := &NotionAIClient{
+		Config:     cfg,
+		Session:    SessionInfo{SpaceID: "space-42", UserID: "user-1"},
+		HTTPClient: &http.Client{Transport: orderingHeaderInjectingTransport{}},
+		FallbackHTTPClient: &http.Client{
+			Transport: &http.Transport{TLSClientConfig: &tls.Config{}},
+			Timeout:   10 * time.Second,
+		},
+	}
+
+	resp, err := client.postJSONResponse(t.Context(), srv.URL, map[string]any{"hello": "world"}, "application/json")
+	if err != nil {
+		t.Fatalf("native fallback rejected the retry: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	for _, key := range gotKeys {
+		if strings.Contains(key, ":") {
+			t.Errorf("ordering pseudo-header reached the wire: %q", key)
+		}
+	}
+}
+
+func TestSanitizedHeaderForNativeTransportKeepsRealHeaders(t *testing.T) {
+	src := http.Header{
+		"Header-Order:":       []string{"a,b"},
+		"PHeader-Order:":      []string{":method,:authority"},
+		"X-Notion-Space-Id":   []string{"space-42"},
+		"Accept-Language":     []string{"zh-CN"},
+		"Sec-Ch-Ua-Mobile":    []string{"?0"},
+		"bad space":           []string{"x"},
+		"weird(paren)":        []string{"x"},
+		"Fine!#$%&'*+-.^_`|~": []string{"x"},
+	}
+	got := sanitizedHeaderForNativeTransport(src)
+
+	for _, dropped := range []string{"Header-Order:", "PHeader-Order:", "bad space", "weird(paren)"} {
+		if _, ok := got[dropped]; ok {
+			t.Errorf("kept invalid field name %q", dropped)
+		}
+	}
+	for _, kept := range []string{"X-Notion-Space-Id", "Accept-Language", "Sec-Ch-Ua-Mobile", "Fine!#$%&'*+-.^_`|~"} {
+		if _, ok := got[kept]; !ok {
+			t.Errorf("dropped valid field name %q", kept)
+		}
+	}
+	if got.Get("X-Notion-Space-Id") != "space-42" {
+		t.Errorf("value lost: %q", got.Get("X-Notion-Space-Id"))
+	}
+	// The copy must not alias the source slices.
+	got["X-Notion-Space-Id"][0] = "mutated"
+	if src.Get("X-Notion-Space-Id") != "space-42" {
+		t.Error("sanitized header aliases the source values")
+	}
+}
+
 var errSimulatedTransport = errors.New("simulated transport failure")
 
 type alwaysFailingTransport struct{}
 
 func (alwaysFailingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errSimulatedTransport
+}
+
+// orderingHeaderInjectingTransport mimics surf: it stamps ordering hints onto
+// the request it was handed, then fails.
+type orderingHeaderInjectingTransport struct{}
+
+func (orderingHeaderInjectingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header["Header-Order:"] = []string{"accept,user-agent,cookie"}
+	req.Header["PHeader-Order:"] = []string{":method,:authority,:scheme,:path"}
 	return nil, errSimulatedTransport
 }

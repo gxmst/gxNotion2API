@@ -1090,9 +1090,45 @@ func (c *NotionAIClient) cloneRequestWithFreshBody(original *http.Request, body 
 	if err != nil {
 		return nil, err
 	}
-	retry.Header = original.Header.Clone()
+	retry.Header = sanitizedHeaderForNativeTransport(original.Header)
 	retry.Host = original.Host
 	return retry, nil
+}
+
+// sanitizedHeaderForNativeTransport copies headers that net/http will accept.
+// The impersonating transport records its ordering hints as pseudo-headers whose
+// names end in a colon ("Header-Order:", "PHeader-Order:"). Those are not valid
+// field names, so carrying them into a native retry makes every retry fail with
+// `invalid header field name` before it reaches the network.
+func sanitizedHeaderForNativeTransport(src http.Header) http.Header {
+	dst := make(http.Header, len(src))
+	for key, values := range src {
+		if !isValidHTTPHeaderFieldName(key) {
+			continue
+		}
+		dst[key] = append([]string(nil), values...)
+	}
+	return dst
+}
+
+// isValidHTTPHeaderFieldName reports whether name is an RFC 7230 token.
+func isValidHTTPHeaderFieldName(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		ch := name[i]
+		switch {
+		case ch >= 'a' && ch <= 'z',
+			ch >= 'A' && ch <= 'Z',
+			ch >= '0' && ch <= '9':
+			continue
+		}
+		if !strings.ContainsRune("!#$%&'*+-.^_`|~", rune(ch)) {
+			return false
+		}
+	}
+	return true
 }
 
 // isContextCanceledError reports whether an error came from the caller going
