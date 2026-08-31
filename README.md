@@ -187,6 +187,8 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
 
 切区之后要清掉已存的会话记录：里面的 thread 属于旧区，复用它们会稳定失败。
 
+选定的区会被保留：会话刷新只在账号还没有 `space_id` 时才采纳自动发现的结果。上游 `getSpacesInitial` 只返回 `space_view_pointers` 的顺序（不含 plan/tier 字段），而多区账号的第一个指针通常就是免费个人区，所以早期版本每次刷新都会把推理悄悄挪回免费区——症状和上面完全一样，但发生在已经切好区之后。首次导入走 `loadUserContent` 时按 `subscription_tier` 优选付费区；注意免费个人区的 `plan_type` 是 `personal` 而不是 `free`，只看 `plan_type` 区分不出来。
+
 ## 使用建议
 
 - 首次启动后先访问 `/admin`，确认账号、配置和连通性是否正常
@@ -205,6 +207,7 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
 - 新增模型列表刷新接口，无需重新导入账号即可同步上游模型
 - 恢复默认的 TLS 证书校验，仅在显式域前置配置下跳过
 - 将 `internal/app` 的测试重新纳入版本控制，并在 CI 中执行
+- 修复会话刷新把账号挪回免费工作区、以及成功后清不掉失败计数两处状态回退
 
 ## 开源协议
 

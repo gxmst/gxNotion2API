@@ -20,11 +20,28 @@ type discoveredAccountMetadata struct {
 }
 
 type discoveredSpaceCandidate struct {
-	ID        string
-	ViewID    string
-	Name      string
-	PlanType  string
-	AIEnabled bool
+	ID               string
+	ViewID           string
+	Name             string
+	PlanType         string
+	SubscriptionTier string
+	AIEnabled        bool
+}
+
+// paidSubscriptionTier reports whether a workspace carries a subscription that
+// comes with AI credit.
+//
+// plan_type is the wrong field to judge this by: a free personal workspace
+// reports plan_type "personal", not "free", so a "plan is not free" test scores
+// it exactly as high as a paid team workspace. subscription_tier is the field
+// that actually separates them ("free" vs "business"/"enterprise"/"plus").
+func paidSubscriptionTier(tier string) bool {
+	switch strings.ToLower(strings.TrimSpace(tier)) {
+	case "", "free", "trial":
+		return false
+	default:
+		return true
+	}
 }
 
 func unwrapRecordValue(raw any) map[string]any {
@@ -84,17 +101,25 @@ func chooseBestSpace(recordMap map[string]any, userID string) discoveredSpaceCan
 		disabledAI := boolValue(settings["disable_ai_feature"])
 		enabledAI := boolValue(settings["enable_ai_feature"])
 		candidate := discoveredSpaceCandidate{
-			ID:        firstNonEmpty(strings.TrimSpace(stringValue(value["id"])), spaceID),
-			ViewID:    strings.TrimSpace(stringValue(pointer["id"])),
-			Name:      strings.TrimSpace(stringValue(value["name"])),
-			PlanType:  strings.TrimSpace(stringValue(value["plan_type"])),
-			AIEnabled: enabledAI || !disabledAI,
+			ID:               firstNonEmpty(strings.TrimSpace(stringValue(value["id"])), spaceID),
+			ViewID:           strings.TrimSpace(stringValue(pointer["id"])),
+			Name:             strings.TrimSpace(stringValue(value["name"])),
+			PlanType:         strings.TrimSpace(stringValue(value["plan_type"])),
+			SubscriptionTier: strings.TrimSpace(stringValue(value["subscription_tier"])),
+			AIEnabled:        enabledAI || !disabledAI,
 		}
+		// A paid subscription outweighs everything else: AI quota is billed per
+		// workspace, and a free workspace accepts messages then silently never
+		// answers once its trial allowance is gone. Weight it above AIEnabled,
+		// which is true for free workspaces too.
 		score := 0
+		if paidSubscriptionTier(candidate.SubscriptionTier) {
+			score += 4
+		}
 		if candidate.AIEnabled {
 			score += 2
 		}
-		if plan := strings.ToLower(candidate.PlanType); plan != "" && plan != "free" {
+		if plan := strings.ToLower(candidate.PlanType); plan != "" && plan != "personal" {
 			score++
 		}
 		if candidate.Name != "" {
@@ -243,8 +268,12 @@ func discoverImportedAccountMetadata(ctx context.Context, cfg AppConfig, account
 			meta.Email = firstNonEmpty(meta.Email, discovered.Email)
 			meta.UserID = firstNonEmpty(meta.UserID, discovered.UserID)
 			meta.UserName = firstNonEmpty(meta.UserName, discovered.UserName)
-			meta.SpaceID = firstNonEmpty(meta.SpaceID, discovered.SpaceID)
-			meta.SpaceViewID = firstNonEmpty(meta.SpaceViewID, discovered.SpaceViewID)
+			// The view id has to come from the same space as the id it accompanies,
+			// so adopt the pair together or not at all.
+			if strings.TrimSpace(meta.SpaceID) == "" {
+				meta.SpaceID = discovered.SpaceID
+				meta.SpaceViewID = discovered.SpaceViewID
+			}
 			meta.SpaceName = firstNonEmpty(meta.SpaceName, discovered.SpaceName)
 			meta.PlanType = firstNonEmpty(meta.PlanType, discovered.PlanType)
 			lookupUserID = firstNonEmpty(meta.UserID, lookupUserID)
@@ -260,8 +289,10 @@ func discoverImportedAccountMetadata(ctx context.Context, cfg AppConfig, account
 				meta.UserID = firstNonEmpty(meta.UserID, lookupUserID)
 				meta.Email = firstNonEmpty(meta.Email, bootstrap.Email)
 				meta.UserName = firstNonEmpty(meta.UserName, bootstrap.UserName)
-				meta.SpaceID = firstNonEmpty(meta.SpaceID, bootstrap.SpaceID)
-				meta.SpaceViewID = firstNonEmpty(meta.SpaceViewID, bootstrap.SpaceViewID)
+				if strings.TrimSpace(meta.SpaceID) == "" {
+					meta.SpaceID = bootstrap.SpaceID
+					meta.SpaceViewID = bootstrap.SpaceViewID
+				}
 			} else if primaryErr == nil {
 				primaryErr = err
 			}

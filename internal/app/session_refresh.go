@@ -126,17 +126,43 @@ func buildRefreshedSession(ctx context.Context, cfg AppConfig, account NotionAcc
 	if spaceName == "" {
 		spaceName = userName + "'s Space"
 	}
+	spaceID, spaceViewID := resolveRefreshedSpace(account, prior, spaces)
 	return SessionInfo{
 		ProbePath:     account.ProbeJSON,
 		ClientVersion: clientVersion,
 		UserID:        userID,
 		UserEmail:     firstNonEmpty(spaces.Email, prior.UserEmail, account.Email),
 		UserName:      userName,
-		SpaceID:       firstNonEmpty(spaces.SpaceID, prior.SpaceID, account.SpaceID),
-		SpaceViewID:   firstNonEmpty(spaces.SpaceViewID, prior.SpaceViewID, account.SpaceViewID),
+		SpaceID:       spaceID,
+		SpaceViewID:   spaceViewID,
 		SpaceName:     spaceName,
 		Cookies:       cookies,
 	}, nil
+}
+
+// resolveRefreshedSpace picks the workspace a refreshed session should keep using.
+//
+// The workspace is an operator decision: Notion bills AI per workspace, so an
+// account deliberately pointed at a paid space must stay there. getSpacesInitial
+// reports whichever space happens to sit first in space_view_pointers, which for
+// a multi-workspace account is usually the free personal one, so preferring the
+// freshly reported space silently moved inference into a space with no AI credit
+// on every refresh. Only fall back to discovery when nothing has been chosen yet.
+//
+// The view id travels with the space id it belongs to instead of being resolved
+// independently: pairing a space with another space's view id would be worse
+// than having no view id at all.
+func resolveRefreshedSpace(account NotionAccount, prior SessionInfo, spaces loginSpaceBootstrap) (string, string) {
+	for _, candidate := range []struct{ id, viewID string }{
+		{account.SpaceID, account.SpaceViewID},
+		{prior.SpaceID, prior.SpaceViewID},
+		{spaces.SpaceID, spaces.SpaceViewID},
+	} {
+		if id := strings.TrimSpace(candidate.id); id != "" {
+			return id, strings.TrimSpace(candidate.viewID)
+		}
+	}
+	return "", ""
 }
 
 func writeSessionArtifacts(account NotionAccount, session SessionInfo) error {
