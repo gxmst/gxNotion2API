@@ -238,7 +238,7 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
 
 MIT License
 
-原始版权归 GALIAIS 所有（见 `LICENSE`），本仓库的修改同样以 MIT 发布。
+原始版权归 GALIAIS 所有，本仓库的修改版权归 gxmst 所有，两者都以 MIT 发布（见 `LICENSE`）。
 
 ## 致谢
 
