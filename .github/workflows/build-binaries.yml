@@ -108,6 +108,18 @@ jobs:
           cp config.example.json "${staging_dir}/"
           cp config.docker.json "${staging_dir}/"
 
+          # The admin UI is read from static/admin on disk at request time --
+          # it is not embedded in the binary. Leaving it out of the archive gave
+          # a release that serves /v1/* fine but 404s on /admin, and an upgrade
+          # that only swaps the binary silently loses the panel.
+          if [[ -d static/admin ]]; then
+            mkdir -p "${staging_dir}/static"
+            cp -r static/admin "${staging_dir}/static/"
+          else
+            echo "::error::static/admin is missing; the release would ship without the admin UI" >&2
+            exit 1
+          fi
+
           if [[ "${ARCHIVE_KIND}" == "zip" ]]; then
             (
               cd dist

@@ -551,7 +551,7 @@ func (c *NotionAIClient) persistSessionProbe() error {
 	if probePath == "" {
 		return nil
 	}
-	return writePrettyJSONFile(probePath, probePayload{
+	return writePrivatePrettyJSONFile(probePath, probePayload{
 		Email:         c.Session.UserEmail,
 		UserID:        c.Session.UserID,
 		UserName:      c.Session.UserName,

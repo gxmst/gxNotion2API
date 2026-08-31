@@ -176,7 +176,7 @@ func writeSessionArtifacts(account NotionAccount, session SessionInfo) error {
 		}
 	}
 	if strings.TrimSpace(account.ProbeJSON) != "" {
-		if err := writePrettyJSONFile(account.ProbeJSON, probePayload{
+		if err := writePrivatePrettyJSONFile(account.ProbeJSON, probePayload{
 			Email:         session.UserEmail,
 			UserID:        session.UserID,
 			UserName:      session.UserName,

@@ -113,6 +113,14 @@ func ensureParentDir(path string) error {
 }
 
 func writePrettyJSONFile(path string, payload any) error {
+	return writePrettyJSONFileMode(path, payload, 0o644)
+}
+
+func writePrivatePrettyJSONFile(path string, payload any) error {
+	return writePrettyJSONFileMode(path, payload, 0o600)
+}
+
+func writePrettyJSONFileMode(path string, payload any, mode os.FileMode) error {
 	clean := strings.TrimSpace(path)
 	if clean == "" {
 		return fmt.Errorf("empty path")
@@ -124,7 +132,10 @@ func writePrettyJSONFile(path string, payload any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(clean, append(body, '\n'), 0o644)
+	if err := os.WriteFile(clean, append(body, '\n'), mode); err != nil {
+		return err
+	}
+	return os.Chmod(clean, mode)
 }
 
 func readLoginPendingState(path string) (loginPendingState, error) {
@@ -142,7 +153,7 @@ func readLoginPendingState(path string) (loginPendingState, error) {
 func writeLoginPendingState(path string, payload loginPendingState) error {
 	payload.PendingStatePath = firstNonEmpty(payload.PendingStatePath, path)
 	payload.UpdatedAt = helperNowISO()
-	return writePrettyJSONFile(path, payload)
+	return writePrivatePrettyJSONFile(path, payload)
 }
 
 func readLoginStorageState(path string) (loginStorageState, error) {
@@ -159,7 +170,7 @@ func readLoginStorageState(path string) (loginStorageState, error) {
 
 func writeLoginStorageState(path string, payload loginStorageState) error {
 	payload.UpdatedAt = helperNowISO()
-	return writePrettyJSONFile(path, payload)
+	return writePrivatePrettyJSONFile(path, payload)
 }
 
 func newNotionLoginSession(timeout time.Duration, upstream NotionUpstream, resolver *ProxyResolver, accountEmail string, cfg AppConfig) (*loginHTTPSession, error) {
@@ -739,7 +750,7 @@ func VerifyEmailLogin(ctx context.Context, cfg AppConfig, req LoginVerifyRequest
 		"client_version": clientVersion,
 		"cookies":        cookies,
 	}
-	if err := writePrettyJSONFile(req.ProbePath, probePayload); err != nil {
+	if err := writePrivatePrettyJSONFile(req.ProbePath, probePayload); err != nil {
 		return failLoginState(req.PendingPath, pending, err)
 	}
 

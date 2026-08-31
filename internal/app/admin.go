@@ -599,7 +599,7 @@ func (a *App) handleAdminConfigSnapshot(w http.ResponseWriter, r *http.Request) 
 	case http.MethodPost:
 		cfg, _, _ := a.State.Snapshot()
 		dir := configSnapshotDir(cfg)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 			return
 		}
@@ -607,7 +607,12 @@ func (a *App) handleAdminConfigSnapshot(w http.ResponseWriter, r *http.Request) 
 		fullPath := filepath.Join(dir, name)
 		exported := normalizeConfig(cfg)
 		exported.ConfigPath = ""
-		if err := writePrettyJSONFile(fullPath, exported); err != nil {
+		// A snapshot is a plain file left on disk indefinitely, so it must not
+		// carry the API key or the admin password: anyone who can read the
+		// snapshot directory would otherwise own the service. 0600 for the same
+		// reason the probe and storage-state files are.
+		exported = redactConfigSecrets(exported)
+		if err := writePrivatePrettyJSONFile(fullPath, exported); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 			return
 		}

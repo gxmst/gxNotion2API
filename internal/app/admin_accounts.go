@@ -793,7 +793,7 @@ func (a *App) handleAdminAccountManualImport(w http.ResponseWriter, r *http.Requ
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
-	if err := writePrettyJSONFile(account.ProbeJSON, probe); err != nil {
+	if err := writePrivatePrettyJSONFile(account.ProbeJSON, probe); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
 	}
