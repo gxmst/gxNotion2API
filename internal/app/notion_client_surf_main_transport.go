@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -101,17 +102,32 @@ func surfMainClientWithTimeout(proxy string, timeout time.Duration) (*http.Clien
 // resolveStaticProxyForUpstream resolves the account's proxy once at client
 // build time. surf bakes the proxy into the client, unlike net/http's
 // per-request Proxy func, so account-scoped routing is applied here instead.
-func resolveStaticProxyForUpstream(resolver *ProxyResolver, accountEmail string, upstream NotionUpstream) string {
+// A resolution error is reported, not swallowed: callers must fail closed on a
+// broken proxy rather than silently bypassing it and exposing the real address.
+func resolveStaticProxyForUpstream(resolver *ProxyResolver, accountEmail string, upstream NotionUpstream) (string, error) {
 	if resolver == nil {
-		return ""
+		return "", nil
 	}
 	target := upstream.CookieURL()
 	if target == nil {
-		return ""
+		return "", nil
 	}
 	proxyURL, _, err := resolver.ResolveProxyForRequest(accountEmail, target)
-	if err != nil || proxyURL == nil {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return proxyURL.String()
+	if proxyURL == nil {
+		return "", nil
+	}
+	return proxyURL.String(), nil
+}
+
+// failingRoundTripper fails every request. It is installed when the account's
+// upstream proxy cannot be resolved, so a broken proxy configuration fails
+// closed instead of silently going direct and handing the session cookies to
+// Notion from the operator's real address.
+type failingRoundTripper struct{}
+
+func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("upstream proxy resolution failed; refusing to send requests without it")
 }

@@ -182,11 +182,8 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 		return nil, fmt.Errorf("account %s not found", pinnedEmail)
 	}
 	account = ensureAccountPaths(cfg, account)
-	if account.Disabled {
-		return nil, fmt.Errorf("account %s is disabled", account.Email)
-	}
-	if !accountHasUsableArtifacts(cfg, account) {
-		return nil, fmt.Errorf("account %s has no usable probe/storage artifacts", account.Email)
+	if eligible, reason := accountDispatchEligible(cfg, account, now); !eligible {
+		return nil, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
 	}
 	return []NotionAccount{account}, nil
 }
@@ -340,6 +337,7 @@ func (a *App) loadPrimarySession(ctx context.Context, cfg AppConfig, snapshot Se
 
 func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
 	cfg, snapshotSession, _ := a.State.Snapshot()
+	_, _, _, activeEmail := cfg.ResolveSessionTarget()
 	timeout := requestTimeout(cfg)
 	if onDelta != nil {
 		timeout = streamRequestTimeout(cfg)
@@ -366,8 +364,10 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 		return onDelta(delta)
 	}
 
-	result, err := a.runPromptWithSession(ctx, cfg, session, "", request, wrappedDelta)
+	a.preparePromptExecutionTarget(&request, activeEmail)
+	result, err := a.runPromptWithSession(ctx, cfg, session, activeEmail, request, wrappedDelta)
 	if err == nil {
+		result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
 		return result, nil
 	}
 	if cfg.ResolveSessionRefresh().RetryOnAuthError && isSessionRetryableError(err) && !emittedAny {
@@ -378,7 +378,9 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, ""); probeErr != nil {
 					return InferenceResult{}, probeErr
 				}
-				return a.runPromptWithSession(ctx, cfg, refreshed, "", request, wrappedDelta)
+				result, retryErr := a.runPromptWithSession(ctx, cfg, refreshed, activeEmail, request, wrappedDelta)
+				result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
+				return result, retryErr
 			}
 		}
 	}
@@ -387,6 +389,7 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 
 func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
 	cfg, snapshotSession, _ := a.State.Snapshot()
+	_, _, _, activeEmail := cfg.ResolveSessionTarget()
 	timeout := streamRequestTimeout(cfg)
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
@@ -419,13 +422,15 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 		return sink.EmitKeepAlive()
 	}
 
-	result, err := a.runPromptWithSessionWithSink(ctx, cfg, session, "", request, InferenceStreamSink{
+	a.preparePromptExecutionTarget(&request, activeEmail)
+	result, err := a.runPromptWithSessionWithSink(ctx, cfg, session, activeEmail, request, InferenceStreamSink{
 		Text:            wrappedText,
 		Reasoning:       wrappedReasoning,
 		ReasoningWarmup: wrappedReasoningWarmup,
 		KeepAlive:       wrappedKeepAlive,
 	})
 	if err == nil {
+		result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
 		return result, nil
 	}
 	if cfg.ResolveSessionRefresh().RetryOnAuthError && isSessionRetryableError(err) && !emittedAny {
@@ -436,12 +441,14 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, ""); probeErr != nil {
 					return InferenceResult{}, probeErr
 				}
-				return a.runPromptWithSessionWithSink(ctx, cfg, refreshed, "", request, InferenceStreamSink{
+				result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshed, activeEmail, request, InferenceStreamSink{
 					Text:            wrappedText,
 					Reasoning:       wrappedReasoning,
 					ReasoningWarmup: wrappedReasoningWarmup,
 					KeepAlive:       wrappedKeepAlive,
 				})
+				result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
+				return result, retryErr
 			}
 		}
 	}
@@ -501,9 +508,18 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			continue
 		}
 		slotAcquired := true
-		account := markAccountDispatchStart(original, time.Now())
+		account, started, startErr := a.State.beginAccountDispatch(original.Email, time.Now())
+		if startErr != nil {
+			a.State.ReleaseAccountDispatchSlot(original.Email)
+			return InferenceResult{}, startErr
+		}
+		if !started {
+			a.State.ReleaseAccountDispatchSlot(original.Email)
+			continue
+		}
 		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
+			a.preparePromptExecutionTarget(&request, account.Email)
 			result, runErr := a.runPromptWithSession(ctx, cfg, session, account.Email, request, wrappedDelta)
 			if runErr == nil {
 				if slotAcquired {
@@ -511,15 +527,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 					slotAcquired = false
 				}
 				result.AccountEmail = account.Email
-				account.UserID = firstNonEmpty(session.UserID, account.UserID)
-				account.UserName = firstNonEmpty(session.UserName, account.UserName)
-				account.SpaceID = firstNonEmpty(session.SpaceID, account.SpaceID)
-				account.SpaceViewID = firstNonEmpty(session.SpaceViewID, account.SpaceViewID)
-				account.SpaceName = firstNonEmpty(session.SpaceName, account.SpaceName)
-				account.ClientVersion = firstNonEmpty(session.ClientVersion, account.ClientVersion)
-				account = markAccountDispatchSuccess(account, time.Now())
-				nextCfg := applyAccountUpdate(cfg, account, shouldPersistDispatchedAccountAsActive(cfg, request, account.Email))
-				if saveErr := a.State.SaveAndApply(nextCfg); saveErr != nil {
+				if saveErr := a.State.finishAccountDispatchSuccess(account.Email, session, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, account.Email)); saveErr != nil {
 					return InferenceResult{}, saveErr
 				}
 				return result, nil
@@ -538,9 +546,9 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
 			refreshedCfg, refreshErr := a.State.tryRefreshAccount(ctx, cfg, account)
 			if refreshErr == nil {
-				if saveErr := a.State.SaveAndApply(refreshedCfg); saveErr == nil {
+				if committedCfg, saveErr := a.State.commitAccountRefresh(cfg, account, refreshedCfg); saveErr == nil {
 					a.invalidateDispatchProbeCache()
-					cfg = refreshedCfg
+					cfg = committedCfg
 					refreshedAccount, _, ok := cfg.FindAccount(account.Email)
 					if ok {
 						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
@@ -557,15 +565,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 										retrySlotAcquired = false
 									}
 									result.AccountEmail = refreshedAccount.Email
-									refreshedAccount.UserID = firstNonEmpty(refreshedSession.UserID, refreshedAccount.UserID)
-									refreshedAccount.UserName = firstNonEmpty(refreshedSession.UserName, refreshedAccount.UserName)
-									refreshedAccount.SpaceID = firstNonEmpty(refreshedSession.SpaceID, refreshedAccount.SpaceID)
-									refreshedAccount.SpaceViewID = firstNonEmpty(refreshedSession.SpaceViewID, refreshedAccount.SpaceViewID)
-									refreshedAccount.SpaceName = firstNonEmpty(refreshedSession.SpaceName, refreshedAccount.SpaceName)
-									refreshedAccount.ClientVersion = firstNonEmpty(refreshedSession.ClientVersion, refreshedAccount.ClientVersion)
-									refreshedAccount = markAccountDispatchSuccess(refreshedAccount, time.Now())
-									nextCfg := applyAccountUpdate(cfg, refreshedAccount, shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email))
-									if saveErr := a.State.SaveAndApply(nextCfg); saveErr != nil {
+									if saveErr := a.State.finishAccountDispatchSuccess(refreshedAccount.Email, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
 										return InferenceResult{}, saveErr
 									}
 									return result, nil
@@ -594,15 +594,17 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 
 		if retryable {
 			reloginCfg, _ := a.State.startAutoRelogin(ctx, cfg, account, "request_auth_failed")
-			cfg = reloginCfg
+			if committedCfg, commitErr := a.State.commitAccountRefresh(cfg, account, reloginCfg); commitErr == nil {
+				cfg = committedCfg
+			} else {
+				cfg = reloginCfg
+			}
 			if updated, _, ok := cfg.FindAccount(account.Email); ok {
 				account = updated
 			}
 		}
 
-		account = markAccountDispatchFailure(account, time.Now(), err, retryable)
-		cfg = applyAccountUpdate(cfg, account, false)
-		_ = a.State.SaveAndApply(cfg)
+		_ = a.State.finishAccountDispatchFailure(account.Email, time.Now(), err, retryable)
 		lastErr = fmt.Errorf("%s: %w", account.Email, err)
 		if emittedAny {
 			return InferenceResult{}, lastErr
@@ -674,9 +676,18 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			continue
 		}
 		slotAcquired := true
-		account := markAccountDispatchStart(original, time.Now())
+		account, started, startErr := a.State.beginAccountDispatch(original.Email, time.Now())
+		if startErr != nil {
+			a.State.ReleaseAccountDispatchSlot(original.Email)
+			return InferenceResult{}, startErr
+		}
+		if !started {
+			a.State.ReleaseAccountDispatchSlot(original.Email)
+			continue
+		}
 		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
+			a.preparePromptExecutionTarget(&request, account.Email)
 			result, runErr := a.runPromptWithSessionWithSink(ctx, cfg, session, account.Email, request, InferenceStreamSink{
 				Text:            wrappedText,
 				Reasoning:       wrappedReasoning,
@@ -689,15 +700,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 					slotAcquired = false
 				}
 				result.AccountEmail = account.Email
-				account.UserID = firstNonEmpty(session.UserID, account.UserID)
-				account.UserName = firstNonEmpty(session.UserName, account.UserName)
-				account.SpaceID = firstNonEmpty(session.SpaceID, account.SpaceID)
-				account.SpaceViewID = firstNonEmpty(session.SpaceViewID, account.SpaceViewID)
-				account.SpaceName = firstNonEmpty(session.SpaceName, account.SpaceName)
-				account.ClientVersion = firstNonEmpty(session.ClientVersion, account.ClientVersion)
-				account = markAccountDispatchSuccess(account, time.Now())
-				nextCfg := applyAccountUpdate(cfg, account, shouldPersistDispatchedAccountAsActive(cfg, request, account.Email))
-				if saveErr := a.State.SaveAndApply(nextCfg); saveErr != nil {
+				if saveErr := a.State.finishAccountDispatchSuccess(account.Email, session, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, account.Email)); saveErr != nil {
 					return InferenceResult{}, saveErr
 				}
 				return result, nil
@@ -716,9 +719,9 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
 			refreshedCfg, refreshErr := a.State.tryRefreshAccount(ctx, cfg, account)
 			if refreshErr == nil {
-				if saveErr := a.State.SaveAndApply(refreshedCfg); saveErr == nil {
+				if committedCfg, saveErr := a.State.commitAccountRefresh(cfg, account, refreshedCfg); saveErr == nil {
 					a.invalidateDispatchProbeCache()
-					cfg = refreshedCfg
+					cfg = committedCfg
 					if refreshedAccount, _, ok := cfg.FindAccount(account.Email); ok {
 						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
 						if loadErr == nil {
@@ -739,15 +742,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 										retrySlotAcquired = false
 									}
 									result.AccountEmail = refreshedAccount.Email
-									refreshedAccount.UserID = firstNonEmpty(refreshedSession.UserID, refreshedAccount.UserID)
-									refreshedAccount.UserName = firstNonEmpty(refreshedSession.UserName, refreshedAccount.UserName)
-									refreshedAccount.SpaceID = firstNonEmpty(refreshedSession.SpaceID, refreshedAccount.SpaceID)
-									refreshedAccount.SpaceViewID = firstNonEmpty(refreshedSession.SpaceViewID, refreshedAccount.SpaceViewID)
-									refreshedAccount.SpaceName = firstNonEmpty(refreshedSession.SpaceName, refreshedAccount.SpaceName)
-									refreshedAccount.ClientVersion = firstNonEmpty(refreshedSession.ClientVersion, refreshedAccount.ClientVersion)
-									refreshedAccount = markAccountDispatchSuccess(refreshedAccount, time.Now())
-									nextCfg := applyAccountUpdate(cfg, refreshedAccount, shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email))
-									if saveErr := a.State.SaveAndApply(nextCfg); saveErr != nil {
+									if saveErr := a.State.finishAccountDispatchSuccess(refreshedAccount.Email, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
 										return InferenceResult{}, saveErr
 									}
 									return result, nil
@@ -776,15 +771,17 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 
 		if retryable {
 			reloginCfg, _ := a.State.startAutoRelogin(ctx, cfg, account, "request_auth_failed")
-			cfg = reloginCfg
+			if committedCfg, commitErr := a.State.commitAccountRefresh(cfg, account, reloginCfg); commitErr == nil {
+				cfg = committedCfg
+			} else {
+				cfg = reloginCfg
+			}
 			if updated, _, ok := cfg.FindAccount(account.Email); ok {
 				account = updated
 			}
 		}
 
-		account = markAccountDispatchFailure(account, time.Now(), err, retryable)
-		cfg = applyAccountUpdate(cfg, account, false)
-		_ = a.State.SaveAndApply(cfg)
+		_ = a.State.finishAccountDispatchFailure(account.Email, time.Now(), err, retryable)
 		lastErr = fmt.Errorf("%s: %w", account.Email, err)
 		if emittedAny {
 			return InferenceResult{}, lastErr

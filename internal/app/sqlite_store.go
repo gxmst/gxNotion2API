@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -372,7 +373,12 @@ func (s *SQLiteStore) LoadConversations() ([]ConversationEntry, error) {
 		}
 		var entry ConversationEntry
 		if err := json.Unmarshal([]byte(body), &entry); err != nil {
-			return nil, err
+			log.Printf("[sqlite] skipping corrupt conversation row: %v", err)
+			continue
+		}
+		if strings.TrimSpace(entry.ID) == "" {
+			log.Printf("[sqlite] skipping conversation row with empty id")
+			continue
 		}
 		items = append(items, entry)
 	}
@@ -450,11 +456,13 @@ func (s *SQLiteStore) LoadResponses(ttl time.Duration) (map[string]StoredRespons
 		}
 		createdAt, err := time.Parse(time.RFC3339Nano, createdAtText)
 		if err != nil {
-			return nil, err
+			log.Printf("[sqlite] skipping response %s with invalid timestamp: %v", responseID, err)
+			continue
 		}
 		payload := map[string]any{}
 		if err := json.Unmarshal([]byte(body), &payload); err != nil {
-			return nil, err
+			log.Printf("[sqlite] skipping corrupt response %s: %v", responseID, err)
+			continue
 		}
 		out[responseID] = StoredResponse{
 			Payload:        payload,

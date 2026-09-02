@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -9,6 +10,10 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+// errConversationInProgress reports a second turn arriving on a conversation
+// that already has one executing. Callers can match it with errors.Is.
+var errConversationInProgress = errors.New("conversation already has a turn in progress")
 
 const maxConversationEntries = 1000
 
@@ -524,6 +529,16 @@ func (s *ConversationStore) Continue(conversationID string, req ConversationCrea
 	s.mu.Lock()
 	current := s.items[conversationID]
 	if current != nil {
+		// Two turns racing on one conversation would interleave upstream
+		// thread operations, so only a terminal status may start a new turn.
+		if conversationStatusBusy(current.Status) {
+			s.mu.Unlock()
+			return ConversationEntry{}, fmt.Errorf("%w: %s", errConversationInProgress, conversationID)
+		}
+		if strings.EqualFold(strings.TrimSpace(current.Status), "deleting") {
+			s.mu.Unlock()
+			return ConversationEntry{}, fmt.Errorf("conversation %s is being deleted", conversationID)
+		}
 		next := cloneConversationEntry(current)
 		next.Source = firstNonEmpty(req.Source, next.Source)
 		next.Transport = firstNonEmpty(req.Transport, next.Transport)
@@ -828,7 +843,7 @@ func (s *ConversationStore) ListExpiredEphemeral(now time.Time, limit int) []Con
 		if entry == nil || !entry.Ephemeral {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(entry.Status), "running") {
+		if conversationStatusBusy(entry.Status) {
 			continue
 		}
 		if entry.AutoDeleteAt == nil || entry.AutoDeleteAt.After(now) {
@@ -862,7 +877,7 @@ func (s *ConversationStore) ListIdleConversations(now time.Time, idleTTL time.Du
 		if entry == nil || entry.Ephemeral {
 			continue
 		}
-		if strings.EqualFold(strings.TrimSpace(entry.Status), "running") {
+		if conversationStatusBusy(entry.Status) {
 			continue
 		}
 		last := entry.UpdatedAt
@@ -880,6 +895,12 @@ func (s *ConversationStore) ListIdleConversations(now time.Time, idleTTL time.Du
 	return items
 }
 
+// conversationStatusBusy reports whether a conversation has a turn in flight.
+// A busy entry must not be swept, retargeted, or reconciled as finished.
+func conversationStatusBusy(status string) bool {
+	return strings.EqualFold(strings.TrimSpace(status), "running")
+}
+
 func (s *ConversationStore) Get(conversationID string) (ConversationEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -888,6 +909,108 @@ func (s *ConversationStore) Get(conversationID string) (ConversationEntry, bool)
 		return ConversationEntry{}, false
 	}
 	return copyConversationEntryValue(entry), true
+}
+
+// SetExecutionTarget pins the upstream thread and account a running turn is
+// executing against onto the conversation entry. It is written before the turn
+// starts and refreshed with the thread the upload path actually returned, so if
+// the process dies mid-request the entry still records what was in flight and
+// startup reconciliation can fail the turn cleanly without orphaning the thread.
+// Only running turns carry an execution target; finished entries are untouched.
+func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID string, accountEmail string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	threadID = strings.TrimSpace(threadID)
+	accountEmail = strings.TrimSpace(accountEmail)
+	if conversationID == "" || threadID == "" {
+		return false
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	entry := s.items[conversationID]
+	if entry == nil || !conversationStatusBusy(entry.Status) {
+		s.mu.Unlock()
+		return false
+	}
+	next := cloneConversationEntry(entry)
+	next.ThreadID = threadID
+	next.AccountEmail = accountEmail
+	next.UpdatedAt = now
+	s.items[conversationID] = &next
+	summary := buildConversationSummary(&next)
+	s.mu.Unlock()
+	s.broadcast(ConversationEvent{
+		Type:           "conversation.updated",
+		ConversationID: conversationID,
+		At:             now,
+		Summary:        &summary,
+	})
+	return true
+}
+
+// ClaimForDeletion marks a conversation as being deleted upstream. While the
+// claim holds, continuations are rejected so no new turn can start against a
+// thread that is about to disappear. If the upstream delete fails, the claim is
+// released again with RestoreDeletionClaim.
+func (s *ConversationStore) ClaimForDeletion(conversationID string) (ConversationEntry, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return ConversationEntry{}, fmt.Errorf("conversation id is required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	entry := s.items[conversationID]
+	if entry == nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("conversation not found")
+	}
+	if conversationStatusBusy(entry.Status) {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("%w: %s", errConversationInProgress, conversationID)
+	}
+	next := cloneConversationEntry(entry)
+	next.Status = "deleting"
+	next.UpdatedAt = now
+	s.items[conversationID] = &next
+	summary := buildConversationSummary(&next)
+	s.mu.Unlock()
+	s.broadcast(ConversationEvent{
+		Type:           "conversation.updated",
+		ConversationID: conversationID,
+		At:             now,
+		Summary:        &summary,
+	})
+	return copyConversationEntryValue(&next), nil
+}
+
+// RestoreDeletionClaim releases a deletion claim after the upstream delete
+// failed, putting the conversation back into the status the caller recorded
+// before claiming (typically "completed" or "failed") so it can be used again.
+func (s *ConversationStore) RestoreDeletionClaim(conversationID string, restoredStatus string) error {
+	conversationID = strings.TrimSpace(conversationID)
+	restoredStatus = strings.TrimSpace(restoredStatus)
+	if conversationID == "" || restoredStatus == "" {
+		return fmt.Errorf("conversation id and status are required")
+	}
+	now := time.Now().UTC()
+	s.mu.Lock()
+	entry := s.items[conversationID]
+	if entry == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("conversation not found")
+	}
+	next := cloneConversationEntry(entry)
+	next.Status = restoredStatus
+	next.UpdatedAt = now
+	s.items[conversationID] = &next
+	summary := buildConversationSummary(&next)
+	s.mu.Unlock()
+	s.broadcast(ConversationEvent{
+		Type:           "conversation.updated",
+		ConversationID: conversationID,
+		At:             now,
+		Summary:        &summary,
+	})
+	return nil
 }
 
 func (s *ConversationStore) FindByThreadID(threadID string) (ConversationEntry, bool) {
@@ -1230,8 +1353,15 @@ func (a *App) deleteConversation(conversationID string) error {
 	if !ok {
 		return fmt.Errorf("conversation not found")
 	}
-	if strings.EqualFold(strings.TrimSpace(entry.Status), "running") {
+	if conversationStatusBusy(entry.Status) {
 		return fmt.Errorf("conversation is still running")
+	}
+	// Claim the entry before touching the upstream thread so continuations are
+	// blocked while the delete is in flight; on failure the claim is released
+	// and the conversation keeps its old status.
+	previousStatus := entry.Status
+	if _, err := a.State.conversations().ClaimForDeletion(conversationID); err != nil {
+		return err
 	}
 	if threadID := strings.TrimSpace(entry.ThreadID); threadID != "" {
 		cfg, _, _ := a.State.Snapshot()
@@ -1240,9 +1370,11 @@ func (a *App) deleteConversation(conversationID string) error {
 		defer cancel()
 		client, err := a.notionClientForAccount(ctx, entry.AccountEmail)
 		if err != nil {
+			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 			return err
 		}
 		if err := client.deleteThread(ctx, threadID); err != nil {
+			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 			return err
 		}
 	}
@@ -1261,4 +1393,36 @@ func (a *App) deleteConversation(conversationID string) error {
 	}
 	a.State.deleteSillyTavernBinding(conversationID)
 	return nil
+}
+
+// preparePromptExecutionTarget pins an execution target onto a request before
+// dispatch: a thread ID, allocated up front when the request does not already
+// carry one, and the account about to serve the turn. Both are persisted on the
+// conversation entry through the request's onThreadPrepared callback, so a
+// crash mid-turn leaves a reconcilable record instead of a silently orphaned
+// upstream thread, and a retry reuses the same thread rather than spawning a
+// new one. Continuation turns carry their own scaffold and requests with an
+// upstream thread are already pinned, so neither gets a new target.
+func (a *App) preparePromptExecutionTarget(request *PromptRunRequest, accountEmail string) {
+	if a == nil || a.State == nil || request == nil {
+		return
+	}
+	if request.continuationScaffold != nil {
+		return
+	}
+	if strings.TrimSpace(request.UpstreamThreadID) != "" {
+		return
+	}
+	if strings.TrimSpace(request.preparedThreadID) == "" {
+		request.preparedThreadID = randomUUID()
+	}
+	conversationID := strings.TrimSpace(request.ConversationID)
+	if conversationID == "" {
+		return
+	}
+	request.onThreadPrepared = func(threadID string) {
+		a.State.conversations().SetExecutionTarget(conversationID, threadID, accountEmail)
+		a.State.persistConversationSnapshot(conversationID)
+	}
+	request.onThreadPrepared(request.preparedThreadID)
 }

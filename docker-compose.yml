@@ -9,7 +9,7 @@ services:
     ports:
       - "${N2A_PORT:-8787}:8787"
     volumes:
-      - ${N2A_CONFIG_FILE:-./config.docker.json}:/app/config/config.json:ro
+      - ${N2A_CONFIG_FILE:-./config.docker.json}:/app/config/config.json
       - ${N2A_DATA_DIR:-./data}:/app/data
     environment:
       TZ: ${TZ:-Asia/Shanghai}

@@ -233,13 +233,7 @@ func normalizeMetricsPathLabel(path string) string {
 	case strings.HasPrefix(clean, "/admin"):
 		return "/admin/*"
 	}
-	if strings.Count(clean, "/") >= 2 {
-		parts := strings.Split(clean, "/")
-		if len(parts) >= 3 {
-			return "/" + parts[1] + "/" + parts[2] + "/*"
-		}
-	}
-	return clean
+	return "/other"
 }
 
 func writePrometheusMetrics(w http.ResponseWriter) {

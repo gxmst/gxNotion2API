@@ -1,5 +1,12 @@
 notion2api.local {
-    reverse_proxy 127.0.0.1:8787
+    @admin path /admin /admin/*
+    handle @admin {
+        reverse_proxy 127.0.0.1:8787
+    }
+
+    handle {
+        respond "Not Found" 404
+    }
 
     request_body {
         max_size 25MB

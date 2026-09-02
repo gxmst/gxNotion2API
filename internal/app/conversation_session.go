@@ -47,7 +47,16 @@ type conversationContinuationState struct {
 }
 
 func canonicalConversationFingerprint(hiddenPrompt string, segments []conversationPromptSegment) string {
+	return canonicalConversationFingerprintScoped("", hiddenPrompt, segments)
+}
+
+func canonicalConversationFingerprintScoped(scope string, hiddenPrompt string, segments []conversationPromptSegment) string {
 	h := sha256.New()
+	if cleanScope := collapseWhitespace(scope); cleanScope != "" {
+		h.Write([]byte("scope:"))
+		h.Write([]byte(cleanScope))
+		h.Write([]byte{'\n'})
+	}
 	if hidden := collapseWhitespace(hiddenPrompt); hidden != "" {
 		if len(hidden) > 800 {
 			hidden = truncateRunes(hidden, 800)

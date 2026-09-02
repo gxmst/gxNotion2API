@@ -299,3 +299,167 @@ func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, s
 	}
 	return execute(ctx, request, sink.Text)
 }
+
+// cloneAccounts copies an account slice before mutation. Config snapshots share
+// their backing arrays, so writing an entry into a snapshot's slice in place
+// would leak the change into every other reader of that snapshot.
+func cloneAccounts(accounts []NotionAccount) []NotionAccount {
+	return append([]NotionAccount(nil), accounts...)
+}
+
+// mergeSessionMetadataWithoutOverwritingConfig folds session-reported metadata
+// into an account record without clobbering what is already configured. The
+// workspace an operator picked must survive every dispatch, so only blanks are
+// backfilled here; authoritative fresh session data reaches the account through
+// the explicit session-refresh path, which owns that decision.
+func mergeSessionMetadataWithoutOverwritingConfig(account NotionAccount, session SessionInfo) NotionAccount {
+	account.UserID = firstNonEmpty(account.UserID, session.UserID)
+	account.UserName = firstNonEmpty(account.UserName, session.UserName)
+	account.SpaceID = firstNonEmpty(account.SpaceID, session.SpaceID)
+	account.SpaceViewID = firstNonEmpty(account.SpaceViewID, session.SpaceViewID)
+	account.SpaceName = firstNonEmpty(account.SpaceName, session.SpaceName)
+	account.ClientVersion = firstNonEmpty(account.ClientVersion, session.ClientVersion)
+	return account
+}
+
+// accountIdentityUnchanged reports whether an account kept the same identity and
+// configuration between two snapshots. Runtime bookkeeping (windows, cooldowns,
+// counters) is deliberately excluded: it changes on every dispatch, and only a
+// concurrent edit to who the account is or where it points must block a commit.
+func accountIdentityUnchanged(started NotionAccount, current NotionAccount) bool {
+	return strings.TrimSpace(started.ProbeJSON) == strings.TrimSpace(current.ProbeJSON) &&
+		strings.TrimSpace(started.ProfileDir) == strings.TrimSpace(current.ProfileDir) &&
+		strings.TrimSpace(started.StorageStatePath) == strings.TrimSpace(current.StorageStatePath) &&
+		strings.TrimSpace(started.UserID) == strings.TrimSpace(current.UserID) &&
+		strings.TrimSpace(started.UserName) == strings.TrimSpace(current.UserName) &&
+		strings.TrimSpace(started.SpaceID) == strings.TrimSpace(current.SpaceID) &&
+		strings.TrimSpace(started.SpaceViewID) == strings.TrimSpace(current.SpaceViewID) &&
+		strings.TrimSpace(started.SpaceName) == strings.TrimSpace(current.SpaceName) &&
+		strings.TrimSpace(started.ClientVersion) == strings.TrimSpace(current.ClientVersion) &&
+		strings.TrimSpace(started.PlanType) == strings.TrimSpace(current.PlanType)
+}
+
+// saveAndApplyCommitted is the persistence step shared by the dispatch state
+// helpers below. It expects refreshMu to be held and routes through the
+// test hook so tests can intercept saves.
+func (s *ServerState) saveAndApplyCommitted(cfg AppConfig) error {
+	save := s.saveAndApplyLocked
+	if testHookSaveAndApply != nil {
+		save = func(cfg AppConfig) error {
+			return testHookSaveAndApply(s, cfg)
+		}
+	}
+	return save(cfg)
+}
+
+// beginAccountDispatch re-checks dispatch eligibility against the live state and
+// records the dispatch start on the account record before any upstream work
+// happens. The read-modify-write is serialised on refreshMu so two concurrent
+// dispatches cannot both start from the same stale snapshot and silently drop
+// each other's window bookkeeping. A false `started` means "not dispatchable
+// right now, try the next candidate"; an error means the account is gone
+// entirely and the request cannot proceed.
+func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionAccount, bool, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	cfg, _, _ := s.Snapshot()
+	account, index, ok := cfg.FindAccount(email)
+	if !ok {
+		return NotionAccount{}, false, fmt.Errorf("account %s not found", email)
+	}
+	if eligible, reason := accountDispatchEligible(cfg, account, now); !eligible {
+		return account, false, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
+	}
+	account = markAccountDispatchStart(account, now)
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
+	cfg.Accounts[index] = account
+	s.mu.Lock()
+	s.Config = cfg
+	s.updateSnapshotBundleLocked()
+	s.rebuildStaticJSONCachesLocked()
+	s.mu.Unlock()
+	return account, true, nil
+}
+
+// finishAccountDispatchSuccess records a completed dispatch: session metadata is
+// merged without clobbering the configured workspace, runtime counters clear,
+// and the probe pointer follows the account when it is (or becomes) the active
+// one. A vanished account is not an error — the request itself already
+// succeeded, there is simply nothing left to update.
+func (s *ServerState) finishAccountDispatchSuccess(email string, session SessionInfo, now time.Time, makeActive bool) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	cfg, _, _ := s.Snapshot()
+	account, index, ok := cfg.FindAccount(email)
+	if !ok {
+		return nil
+	}
+	account = mergeSessionMetadataWithoutOverwritingConfig(account, session)
+	account = markAccountDispatchSuccess(account, now)
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
+	cfg.Accounts[index] = account
+	wasActive := false
+	if active, _, activeOK := cfg.ResolveActiveAccount(); activeOK {
+		wasActive = canonicalEmailKey(active.Email) == canonicalEmailKey(account.Email)
+	}
+	if makeActive || wasActive {
+		cfg.ActiveAccount = account.Email
+		cfg.ProbeJSON = account.ProbeJSON
+	}
+	return s.saveAndApplyCommitted(cfg)
+}
+
+// finishAccountDispatchFailure records a failed dispatch so cooldowns and
+// failure counters actually persist. A vanished account is likewise not an
+// error; there is nothing left to cool down.
+func (s *ServerState) finishAccountDispatchFailure(email string, now time.Time, dispatchErr error, retryable bool) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	cfg, _, _ := s.Snapshot()
+	account, index, ok := cfg.FindAccount(email)
+	if !ok {
+		return nil
+	}
+	account = markAccountDispatchFailure(account, now, dispatchErr, retryable)
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
+	cfg.Accounts[index] = account
+	return s.saveAndApplyCommitted(cfg)
+}
+
+// commitAccountRefresh merges a refreshed account record into the live state,
+// but only when the account kept the same identity since the dispatch snapshot
+// was taken: an admin edit or another refresh that landed in between must not be
+// silently clobbered by this commit. On divergence the live configuration is
+// returned with an error so the caller falls back instead of persisting.
+func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount, refreshedCfg AppConfig) (AppConfig, error) {
+	started, _, ok := cfg.FindAccount(account.Email)
+	if !ok {
+		return cfg, fmt.Errorf("account %s not found in dispatch snapshot", account.Email)
+	}
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	live, _, _ := s.Snapshot()
+	current, index, ok := live.FindAccount(account.Email)
+	if !ok {
+		return live, fmt.Errorf("account %s not found", account.Email)
+	}
+	if !accountIdentityUnchanged(started, current) {
+		return live, fmt.Errorf("account %s changed concurrently; refresh not committed", account.Email)
+	}
+	refreshed, _, ok := refreshedCfg.FindAccount(account.Email)
+	if !ok {
+		return live, fmt.Errorf("account %s missing from refreshed configuration", account.Email)
+	}
+	live.Accounts = cloneAccounts(live.Accounts)
+	live.Accounts[index] = refreshed
+	wasActive := canonicalEmailKey(live.ActiveAccount) == canonicalEmailKey(refreshed.Email)
+	makeActive := canonicalEmailKey(refreshedCfg.ActiveAccount) == canonicalEmailKey(refreshed.Email)
+	if wasActive || makeActive {
+		live.ActiveAccount = refreshed.Email
+		live.ProbeJSON = refreshed.ProbeJSON
+	}
+	if err := s.saveAndApplyCommitted(live); err != nil {
+		return live, err
+	}
+	return live, nil
+}

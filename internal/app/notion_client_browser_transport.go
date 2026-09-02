@@ -72,18 +72,22 @@ func buildBrowserTransportRequest(client *NotionAIClient, payload map[string]any
 
 	proxyValue := ""
 	if client.ProxyResolver != nil {
-		if parsedRunURL, err := url.Parse(runURL); err == nil {
-			if proxyURL, extraHeaders, resolveErr := client.ProxyResolver.ResolveProxyForRequest(client.AccountEmail, parsedRunURL); resolveErr == nil {
-				if proxyURL != nil {
-					proxyValue = proxyURL.String()
-				}
-				for key, value := range extraHeaders {
-					if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
-						continue
-					}
-					headers[key] = value
-				}
+		parsedRunURL, err := url.Parse(runURL)
+		if err != nil {
+			return browserTransportRequest{}, fmt.Errorf("invalid upstream run URL: %w", err)
+		}
+		proxyURL, extraHeaders, resolveErr := client.ProxyResolver.ResolveProxyForRequest(client.AccountEmail, parsedRunURL)
+		if resolveErr != nil {
+			return browserTransportRequest{}, resolveErr
+		}
+		if proxyURL != nil {
+			proxyValue = proxyURL.String()
+		}
+		for key, value := range extraHeaders {
+			if strings.TrimSpace(key) == "" || strings.TrimSpace(value) == "" {
+				continue
 			}
+			headers[key] = value
 		}
 	}
 

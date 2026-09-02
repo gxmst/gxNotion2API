@@ -118,6 +118,14 @@ func isInstructionRole(role string) bool {
 	}
 }
 
+func toolResultPrompt(item map[string]any, text string) string {
+	label := "tool result"
+	if name := firstNonEmptyString(item["name"], item["tool_call_id"], item["call_id"]); name != "" {
+		label += " " + name
+	}
+	return formatPromptSection(label, text)
+}
+
 func normalizeChatInputFromParts(rawMessages []any, attachmentsRaw any) (NormalizedInput, error) {
 	if rawMessages == nil {
 		return NormalizedInput{}, fmt.Errorf("messages must be an array")
@@ -196,8 +204,12 @@ func extractChatConversationPromptSegment(message map[string]any) (*conversation
 	if visibleText == "" && len(atts) > 0 && strings.EqualFold(role, "user") {
 		visibleText = defaultUploadedAttachmentPrompt
 	}
-	if role == "tool" || visibleText == "" {
+	if visibleText == "" {
 		return nil, hiddenParts, atts, nil
+	}
+	if strings.EqualFold(role, "tool") {
+		role = "user"
+		visibleText = toolResultPrompt(message, visibleText)
 	}
 	return &conversationPromptSegment{
 		Role: role,
@@ -439,6 +451,10 @@ func extractResponsesConversationPromptSegment(item map[string]any) (*conversati
 		if visibleText == "" {
 			return nil, hiddenParts, atts, nil
 		}
+		if strings.EqualFold(role, "tool") {
+			role = "user"
+			visibleText = toolResultPrompt(item, visibleText)
+		}
 		return &conversationPromptSegment{
 			Role: strings.ToLower(role),
 			Text: visibleText,
@@ -464,10 +480,20 @@ func extractResponsesConversationPromptSegment(item map[string]any) (*conversati
 		if visibleText == "" {
 			return nil, hiddenParts, atts, nil
 		}
+		if strings.EqualFold(role, "tool") {
+			role = "user"
+			visibleText = toolResultPrompt(item, visibleText)
+		}
 		return &conversationPromptSegment{
 			Role: strings.ToLower(role),
 			Text: visibleText,
 		}, hiddenParts, atts, nil
+	case "function_call_output":
+		text := strings.TrimSpace(flattenContent(item["output"]))
+		if text == "" {
+			return nil, nil, nil, nil
+		}
+		return &conversationPromptSegment{Role: "user", Text: toolResultPrompt(item, text)}, nil, nil, nil
 	case "text", "input_text", "output_text":
 		text, hiddenMeta := splitHiddenMetaBlocks(extractTextField(item))
 		text = strings.TrimSpace(text)
@@ -566,7 +592,11 @@ func renderChatMessagePromptParts(message map[string]any) ([]string, []string, [
 	if hiddenMeta != "" {
 		hiddenParts = append(hiddenParts, hiddenMeta)
 	}
-	if role != "tool" && strings.TrimSpace(visibleText) != "" {
+	if strings.TrimSpace(visibleText) != "" {
+		if strings.EqualFold(role, "tool") {
+			visibleText = toolResultPrompt(message, visibleText)
+			role = "user"
+		}
 		if isVisibleConversationRole(role) {
 			visibleParts = append(visibleParts, formatConversationPromptSection(role, visibleText))
 		} else {
@@ -590,6 +620,10 @@ func renderResponsesInputItemPromptParts(item map[string]any) ([]string, []strin
 		if strings.TrimSpace(visibleText) == "" {
 			return nil, hiddenParts, atts, nil
 		}
+		if strings.EqualFold(role, "tool") {
+			visibleText = toolResultPrompt(item, visibleText)
+			role = "user"
+		}
 		if isVisibleConversationRole(role) {
 			return []string{formatConversationPromptSection(role, visibleText)}, hiddenParts, atts, nil
 		}
@@ -612,11 +646,21 @@ func renderResponsesInputItemPromptParts(item map[string]any) ([]string, []strin
 		if strings.TrimSpace(visibleText) == "" {
 			return nil, hiddenParts, atts, nil
 		}
+		if strings.EqualFold(role, "tool") {
+			visibleText = toolResultPrompt(item, visibleText)
+			role = "user"
+		}
 		if isVisibleConversationRole(role) {
 			return []string{formatConversationPromptSection(role, visibleText)}, hiddenParts, atts, nil
 		}
 		hiddenParts = append(hiddenParts, formatConversationPromptSection(role, visibleText))
 		return nil, hiddenParts, atts, nil
+	case "function_call_output":
+		text := strings.TrimSpace(flattenContent(item["output"]))
+		if text == "" {
+			return nil, nil, nil, nil
+		}
+		return []string{toolResultPrompt(item, text)}, nil, nil, nil
 	case "text", "input_text", "output_text":
 		text, hiddenMeta := splitHiddenMetaBlocks(extractTextField(item))
 		text = strings.TrimSpace(text)
@@ -889,6 +933,9 @@ func buildAttachmentFromInlineData(raw string, name string, contentType string) 
 	if err != nil {
 		return InputAttachment{}, false, err
 	}
+	if len(decoded) > maxAttachmentBytes {
+		return InputAttachment{}, false, fmt.Errorf("attachment too large: inline data exceeds %d bytes", maxAttachmentBytes)
+	}
 	if contentType == "" {
 		contentType = detectedType
 	}
@@ -945,12 +992,9 @@ func decodeInlineAttachment(raw string) ([]byte, string, error) {
 		mimeType, data, err := decodeDataURL(trimmed)
 		return data, mimeType, err
 	}
-	decoded, err := base64.StdEncoding.DecodeString(trimmed)
+	decoded, err := decodeBase64Bytes(trimmed)
 	if err != nil {
-		decoded, err = base64.RawStdEncoding.DecodeString(trimmed)
-		if err != nil {
-			return nil, "", fmt.Errorf("invalid base64 attachment payload")
-		}
+		return nil, "", fmt.Errorf("invalid base64 attachment payload")
 	}
 	return decoded, "", nil
 }
@@ -968,14 +1012,28 @@ func decodeDataURL(raw string) (string, []byte, error) {
 		mimeType = strings.TrimSuffix(mimeType, ";base64")
 		mimeType = normalizeContentType(mimeType)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(body)
+	decoded, err := decodeBase64Bytes(body)
 	if err != nil {
-		decoded, err = base64.RawStdEncoding.DecodeString(body)
-		if err != nil {
-			return "", nil, fmt.Errorf("invalid data url payload")
-		}
+		return "", nil, fmt.Errorf("invalid data url payload")
 	}
 	return mimeType, decoded, nil
+}
+
+func decodeBase64Bytes(value string) ([]byte, error) {
+	var lastErr error
+	for _, encoding := range []*base64.Encoding{
+		base64.StdEncoding,
+		base64.RawStdEncoding,
+		base64.URLEncoding,
+		base64.RawURLEncoding,
+	} {
+		decoded, err := encoding.DecodeString(value)
+		if err == nil {
+			return decoded, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
 }
 
 func firstNonEmptyString(values ...any) string {

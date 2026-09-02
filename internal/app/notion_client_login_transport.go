@@ -46,11 +46,11 @@ func loginTransportDoRequest(ctx context.Context, session *loginHTTPSession, met
 	if session == nil {
 		return 0, nil, nil, fmt.Errorf("login session is nil")
 	}
-	request := buildLoginTransportRequest(session, method, targetURL, headers, body)
-	var (
-		resp *loginTransportResponse
-		err  error
-	)
+	request, err := buildLoginTransportRequest(session, method, targetURL, headers, body)
+	if err != nil {
+		return 0, nil, nil, err
+	}
+	var resp *loginTransportResponse
 	resp, err = loginTransportRunSurfRequest(ctx, request)
 	if err != nil {
 		return 0, nil, nil, err
@@ -61,17 +61,23 @@ func loginTransportDoRequest(ctx context.Context, session *loginHTTPSession, met
 	return resp.Status, loginTransportHTTPHeader(resp.Headers), []byte(resp.Body), nil
 }
 
-func buildLoginTransportRequest(session *loginHTTPSession, method string, targetURL string, headers map[string]string, body []byte) loginTransportRequest {
+func buildLoginTransportRequest(session *loginHTTPSession, method string, targetURL string, headers map[string]string, body []byte) (loginTransportRequest, error) {
 	cookies := []ProbeCookie{}
 	if session != nil && session.Client != nil {
 		cookies = probeCookiesFromJar(session.Jar, targetURL)
 	}
 	proxyValue := ""
 	if session != nil && session.ProxyResolver != nil {
-		if parsed, parseErr := url.Parse(targetURL); parseErr == nil {
-			if proxyURL, _, resolveErr := session.ProxyResolver.ResolveProxyForRequest(session.AccountEmail, parsed); resolveErr == nil && proxyURL != nil {
-				proxyValue = proxyURL.String()
-			}
+		parsed, parseErr := url.Parse(targetURL)
+		if parseErr != nil {
+			return loginTransportRequest{}, fmt.Errorf("invalid login target URL: %w", parseErr)
+		}
+		proxyURL, _, resolveErr := session.ProxyResolver.ResolveProxyForRequest(session.AccountEmail, parsed)
+		if resolveErr != nil {
+			return loginTransportRequest{}, resolveErr
+		}
+		if proxyURL != nil {
+			proxyValue = proxyURL.String()
 		}
 	}
 	timeoutMS := 60000
@@ -97,7 +103,7 @@ func buildLoginTransportRequest(session *loginHTTPSession, method string, target
 		BrowserProfile:   notionTransportDefaultBrowserProfile,
 		Proxy:            proxyValue,
 		RequestTimeoutMS: timeoutMS,
-	}
+	}, nil
 }
 
 func applyLoginTransportSetCookies(jar http.CookieJar, targetURL string, setCookies []ProbeCookie) {

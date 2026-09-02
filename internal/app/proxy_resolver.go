@@ -64,7 +64,7 @@ func parseProxyURL(raw string) (*url.URL, error) {
 	}
 	parsed, err := url.Parse(clean)
 	if err != nil {
-		return nil, fmt.Errorf("parse proxy url %q: %w", clean, err)
+		return nil, fmt.Errorf("invalid proxy URL")
 	}
 	scheme := strings.ToLower(strings.TrimSpace(parsed.Scheme))
 	switch scheme {
@@ -103,6 +103,9 @@ func splitResinURL(raw string) (*url.URL, string, error) {
 	parsed, err := parseProxyURL(raw)
 	if err != nil {
 		return nil, "", err
+	}
+	if parsed == nil {
+		return nil, "", fmt.Errorf("resin proxy URL is required")
 	}
 	token := strings.Trim(strings.TrimSpace(parsed.Path), "/")
 	if token == "" && parsed.User != nil {

@@ -13,6 +13,7 @@ import (
 	"io"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -316,6 +317,16 @@ type PromptRunRequest struct {
 	attachmentThreadReady             bool
 	continuationDraft                 *continuationTurnDraft
 	continuationScaffold              *continuationTurnScaffold
+	// preparedThreadID is the thread this turn will run in, assigned before
+	// dispatch so the conversation entry can record the execution target and a
+	// retry reuses the same thread instead of spawning a new one.
+	preparedThreadID string
+	// onThreadPrepared persists the thread the turn actually runs in — it may
+	// differ from preparedThreadID when the upload path reassigns the thread.
+	onThreadPrepared func(string)
+	// replayResult, when armed, short-circuits dispatch with the cached answer
+	// of a completed conversation for a repeated final turn (no upstream call).
+	replayResult *InferenceResult
 }
 
 type agentMessage struct {
@@ -551,7 +562,7 @@ func (c *NotionAIClient) persistSessionProbe() error {
 	if probePath == "" {
 		return nil
 	}
-	return writePrivatePrettyJSONFile(probePath, probePayload{
+	payload := probePayload{
 		Email:         c.Session.UserEmail,
 		UserID:        c.Session.UserID,
 		UserName:      c.Session.UserName,
@@ -560,7 +571,37 @@ func (c *NotionAIClient) persistSessionProbe() error {
 		SpaceName:     c.Session.SpaceName,
 		ClientVersion: c.Session.ClientVersion,
 		Cookies:       c.Session.Cookies,
-	})
+	}
+	// The probe on disk can be newer than the in-memory session: it carries the
+	// operator's chosen workspace and whatever the last explicit refresh wrote.
+	// Merge instead of overwriting so a routine persist never walks those back.
+	if rawBytes, err := os.ReadFile(probePath); err == nil {
+		var existing probePayload
+		if json.Unmarshal(rawBytes, &existing) == nil {
+			payload = mergeProbePayloadForBackfill(existing, payload)
+		}
+	}
+	return writePrivatePrettyJSONFile(probePath, payload)
+}
+
+// mergeProbePayloadForBackfill folds a freshly built probe payload into the one
+// already on disk. Values already present on disk win: they were written by the
+// operator or a newer refresh, and the in-memory session is routinely rebuilt
+// from discovery output that must not overwrite them. Blank disk fields are
+// backfilled from the session.
+func mergeProbePayloadForBackfill(existing probePayload, incoming probePayload) probePayload {
+	merged := existing
+	merged.Email = firstNonEmpty(existing.Email, incoming.Email)
+	merged.UserID = firstNonEmpty(existing.UserID, incoming.UserID)
+	merged.UserName = firstNonEmpty(existing.UserName, incoming.UserName)
+	merged.SpaceID = firstNonEmpty(existing.SpaceID, incoming.SpaceID)
+	merged.SpaceViewID = firstNonEmpty(existing.SpaceViewID, incoming.SpaceViewID)
+	merged.SpaceName = firstNonEmpty(existing.SpaceName, incoming.SpaceName)
+	merged.ClientVersion = firstNonEmpty(existing.ClientVersion, incoming.ClientVersion)
+	if len(merged.Cookies) == 0 {
+		merged.Cookies = incoming.Cookies
+	}
+	return merged
 }
 
 func (c *NotionAIClient) probeMetadataNeedsBackfill() bool {
@@ -755,9 +796,19 @@ func newNotionAIClientWithMode(session SessionInfo, cfg AppConfig, accountEmail 
 		PollMaxRounds: maxInt(normalizedCfg.PollMaxRounds, 1),
 		HTTPClient:    nativeClient,
 	}
+	// A broken proxy must fail closed: silently going direct would hand the
+	// session cookies to Notion from the operator's real address.
+	proxy, proxyErr := resolveStaticProxyForUpstream(resolver, accountEmail, upstream)
+	if proxyErr != nil {
+		log.Printf("[transport] upstream proxy unavailable, failing closed: %v", proxyErr)
+		client.HTTPClient = &http.Client{
+			Timeout:   clientTimeout,
+			Transport: failingRoundTripper{},
+		}
+		return client
+	}
 	// Prefer the impersonating transport; keep native as a retry path.
 	if surfMainTransportEnabled(normalizedCfg) {
-		proxy := resolveStaticProxyForUpstream(resolver, accountEmail, upstream)
 		if surfClient, err := surfMainClientWithTimeout(proxy, clientTimeout); err == nil {
 			client.HTTPClient = surfClient
 			client.FallbackHTTPClient = nativeClient
@@ -3065,6 +3116,29 @@ func (c *NotionAIClient) deleteThread(ctx context.Context, threadID string) erro
 	return err
 }
 
+// isTransientPollingError reports whether a polling failure is worth another
+// round: timeouts, rate limits and 5xx-class upstream hiccups are, while caller
+// cancellation and permanent rejections are not.
+func isTransientPollingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var apiErr *notionAPIError
+	if errors.As(err, &apiErr) {
+		return apiErr.StatusCode == http.StatusRequestTimeout ||
+			apiErr.StatusCode == http.StatusTooManyRequests ||
+			apiErr.StatusCode >= http.StatusInternalServerError
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
+}
+
 func (c *NotionAIClient) pollFinalAnswer(ctx context.Context, threadID string) ([]string, agentMessage, error) {
 	var lastAgent agentMessage
 	var haveAgent bool
@@ -3912,7 +3986,7 @@ func (c *NotionAIClient) preparePromptRequest(ctx context.Context, req PromptRun
 		cleanPrompt = defaultUploadedAttachmentPrompt
 	}
 	continuation := strings.TrimSpace(req.UpstreamThreadID) != ""
-	threadID := firstNonEmpty(strings.TrimSpace(req.UpstreamThreadID), randomUUID())
+	threadID := firstNonEmpty(strings.TrimSpace(req.UpstreamThreadID), strings.TrimSpace(req.preparedThreadID), randomUUID())
 	uploadedAttachments, actualThreadID, err := c.uploadAttachments(ctx, threadID, req.Attachments, !continuation)
 	if err != nil {
 		return "", nil, "", nil, inferencePayloadMeta{}, err
@@ -4036,6 +4110,9 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 	if err != nil {
 		return InferenceResult{}, err
 	}
+	if req.onThreadPrepared != nil && strings.TrimSpace(actualThreadID) != "" {
+		req.onThreadPrepared(strings.TrimSpace(actualThreadID))
+	}
 	traceID := stringValue(payload["traceId"])
 	parsed, parseErr := c.runInferenceTranscriptWithFallback(ctx, payload, actualThreadID, InferenceStreamSink{})
 	messageIDs := parsed.MessageIDs
@@ -4099,6 +4176,9 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 	cleanPrompt, uploadedAttachments, actualThreadID, payload, meta, err := c.preparePromptRequest(ctx, req)
 	if err != nil {
 		return InferenceResult{}, err
+	}
+	if req.onThreadPrepared != nil && strings.TrimSpace(actualThreadID) != "" {
+		req.onThreadPrepared(strings.TrimSpace(actualThreadID))
 	}
 	traceID := stringValue(payload["traceId"])
 

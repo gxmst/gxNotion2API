@@ -185,11 +185,15 @@ func adminClientIP(r *http.Request, trusted []string) string {
 	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
 		// The right-most entry is the one the trusted proxy itself observed;
 		// everything to its left was supplied by the caller and is forgeable.
-		parts := strings.Split(forwarded, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			if ip := strings.TrimSpace(parts[i]); ip != "" && net.ParseIP(ip) != nil {
-				return ip
-			}
+		// A malformed right-most entry (e.g. a proxy that appends "unknown")
+		// falls back to the peer address rather than walking left into
+		// caller-controlled values, which would reopen the lockout bypass.
+		last := ""
+		if parts := strings.Split(forwarded, ","); len(parts) > 0 {
+			last = strings.TrimSpace(parts[len(parts)-1])
+		}
+		if last != "" && net.ParseIP(last) != nil {
+			return last
 		}
 	}
 	if realIP := strings.TrimSpace(r.Header.Get("X-Real-IP")); realIP != "" {
@@ -570,6 +574,27 @@ func configSnapshotDir(cfg AppConfig) string {
 	return filepath.Clean("config_snapshots")
 }
 
+// configExportPayload builds the JSON payload served by /admin/config/export:
+// the normalized configuration with secret fields removed entirely. Blanketing
+// them to "" would still advertise their shape and, worse, would overwrite the
+// live secrets when the export is imported back; absent keys merge as "keep
+// current value".
+func configExportPayload(cfg AppConfig) map[string]any {
+	body, err := json.Marshal(redactConfigSecrets(normalizeConfig(cfg)))
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if err := json.Unmarshal(body, &out); err != nil {
+		return map[string]any{}
+	}
+	delete(out, "api_key")
+	if admin, ok := out["admin"].(map[string]any); ok {
+		delete(admin, "password")
+	}
+	return out
+}
+
 func (a *App) handleAdminConfigExport(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthOK(w, r) {
 		return
@@ -582,7 +607,7 @@ func (a *App) handleAdminConfigExport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"success":     true,
 		"exported_at": time.Now().Format(time.RFC3339),
-		"config":      normalizeConfig(cfg),
+		"config":      configExportPayload(cfg),
 	})
 }
 

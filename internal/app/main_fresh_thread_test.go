@@ -1700,6 +1700,32 @@ func TestHandleChatCompletionsStreamWritesErrorAfterHeadersSent(t *testing.T) {
 	}
 }
 
+func TestHandleChatCompletionsPartialStreamReportsError(t *testing.T) {
+	app := newFreshThreadTestApp(t)
+	app.runPromptStreamSinkOverride = func(_ *http.Request, _ PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
+		if err := sink.EmitText("partial answer"); err != nil {
+			t.Fatal(err)
+		}
+		return InferenceResult{}, fmt.Errorf("upstream truncated")
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", mustJSONBody(t, map[string]any{
+		"model":    "gpt-5.4",
+		"stream":   true,
+		"messages": []map[string]any{{"role": "user", "content": "hello"}},
+	}))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer test-api-key")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	body := rec.Body.String()
+	if !strings.Contains(body, "partial answer") || !strings.Contains(body, "upstream truncated") {
+		t.Fatalf("partial stream did not carry text and error: %s", body)
+	}
+	if strings.Contains(body, `"finish_reason":"stop"`) {
+		t.Fatalf("truncated standard stream was reported as a clean stop: %s", body)
+	}
+}
+
 func TestHandleChatCompletionsStreamIncludeUsageFromTypedMessages(t *testing.T) {
 	app := newFreshThreadTestApp(t)
 	app.runPromptStreamSinkOverride = func(_ *http.Request, _ PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {

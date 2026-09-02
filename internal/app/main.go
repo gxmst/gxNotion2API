@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"runtime/debug"
@@ -457,6 +458,17 @@ func newServerState(cfg AppConfig) (*ServerState, error) {
 				return nil, loadErr
 			}
 			state.Conversations = newConversationStoreFromEntries(conversations)
+			// A turn that was mid-flight when the process died would look
+			// "running" forever. Fail those entries on startup, keeping the
+			// thread and account pointers so the next request can resume from
+			// the same thread instead of orphaning it.
+			for _, entry := range conversations {
+				if !conversationStatusBusy(entry.Status) {
+					continue
+				}
+				state.Conversations.Fail(entry.ID, errors.New("turn was interrupted by a restart"))
+				state.persistConversationSnapshot(entry.ID)
+			}
 		}
 		if !persistedAccountsLoaded && (len(state.Config.Accounts) > 0 || strings.TrimSpace(state.Config.ActiveAccount) != "") {
 			if saveErr := store.SaveAccounts(state.Config); saveErr != nil {
@@ -538,7 +550,19 @@ func (s *ServerState) updateSnapshotBundleLocked() {
 	s.snap.Store(bundle)
 }
 
+// SaveAndApply normalizes and persists cfg, then swaps the live state to it.
+// refreshMu is the same lock the dispatch state helpers hold across their
+// read-modify-write cycles, so an admin save and a concurrent dispatch cannot
+// interleave their account bookkeeping and lose an update.
 func (s *ServerState) SaveAndApply(cfg AppConfig) error {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	return s.saveAndApplyLocked(cfg)
+}
+
+// saveAndApplyLocked is SaveAndApply's body for callers that already hold
+// refreshMu (the dispatch state helpers in account_pool.go).
+func (s *ServerState) saveAndApplyLocked(cfg AppConfig) error {
 	cfg = normalizeConfig(cfg)
 	if err := validateConfiguredAPIKey(cfg); err != nil {
 		return err
@@ -881,7 +905,6 @@ func (s *ServerState) rebuildStaticJSONCachesLocked() {
 }
 
 func writeJSONBytes(w http.ResponseWriter, status int, body []byte) {
-	applyCORSHeaders(w)
 	w.Header().Set("X-Notion2API", "1")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -913,6 +936,18 @@ func appendHealthzRuntimeFields(body []byte, sessionReady bool, lastRefresh time
 	return out
 }
 
+// applyCORSHeadersForPath applies the wildcard CORS policy everywhere except
+// the admin surface: admin auth is cookie-based and same-origin by design, and
+// advertising wildcard CORS there would let any web page fire admin requests
+// from an operator's browser. Applied once at the ServeHTTP entry so every
+// writer below inherits the same decision.
+func applyCORSHeadersForPath(w http.ResponseWriter, path string) {
+	if strings.HasPrefix(path, "/admin") {
+		return
+	}
+	applyCORSHeaders(w)
+}
+
 func applyCORSHeaders(w http.ResponseWriter) {
 	w.Header().Set("Access-Control-Allow-Origin", corsAllowOrigin)
 	w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
@@ -925,7 +960,6 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyCORSHeaders(w)
 	w.Header().Set("X-Notion2API", "1")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
@@ -1196,6 +1230,34 @@ func firstRequestValue(r *http.Request, keys ...string) string {
 	return ""
 }
 
+// requestClientFingerprintScope builds the client-identity scope a conversation
+// fingerprint is computed under. Two clients that send byte-identical prompts
+// must not continue each other's threads, so the scope carries who is asking
+// (profile, session key, client headers, peer address) and what they are asking
+// with (transport surface, model, account). Parts are labeled and newline
+// joined; the fingerprint hashes the collapsed whole.
+func requestClientFingerprintScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
+	parts := []string{
+		"profile=" + strings.TrimSpace(profile),
+		"session=" + strings.TrimSpace(session),
+		"transport=" + strings.TrimSpace(transport),
+		"model=" + strings.TrimSpace(model),
+		"account=" + canonicalEmailKey(account),
+	}
+	if r != nil {
+		parts = append(parts,
+			"client="+firstRequestValue(r, "X-Client-ID", "X-Session-ID", "OpenAI-Organization"),
+			"ua="+strings.TrimSpace(r.Header.Get("User-Agent")),
+		)
+		peer := strings.TrimSpace(r.RemoteAddr)
+		if host, _, err := net.SplitHostPort(peer); err == nil {
+			peer = host
+		}
+		parts = append(parts, "remote="+peer)
+	}
+	return strings.Join(parts, "\n")
+}
+
 func requestedConversationID(r *http.Request, payload map[string]any) string {
 	if conversationID := firstRequestValue(r, "X-Conversation-ID", "X-Notion-Conversation-ID"); conversationID != "" {
 		return conversationID
@@ -1365,6 +1427,62 @@ func (a *App) resolveContinuationConversation(r *http.Request, payload map[strin
 	explicitConversationID := requestedConversationID(r, payload)
 	explicitThreadID := requestedThreadID(r, payload)
 	return a.resolveContinuationConversationWithExplicit(previousResponseID, hiddenPrompt, segments, explicitConversationID, explicitThreadID)
+}
+
+// resolveContinuationAccount decides which account may serve a continuation.
+// A conversation that knows its owner keeps it: another account must not take
+// over its thread and its billing. When the owner is unknown (an old entry, or
+// a bare thread id), an explicit request account is honoured, and in
+// multi-account mode its absence is an error — guessing would silently spend
+// the wrong workspace's AI credit.
+func resolveContinuationAccount(cfg AppConfig, threadID string, requestedAccount string, entry ConversationEntry) (string, error) {
+	owner := strings.TrimSpace(entry.AccountEmail)
+	requested := strings.TrimSpace(requestedAccount)
+	threadID = strings.TrimSpace(threadID)
+	if owner != "" {
+		if requested != "" && canonicalEmailKey(owner) != canonicalEmailKey(requested) {
+			return "", fmt.Errorf("conversation %s belongs to %s, not %s", threadID, owner, requested)
+		}
+		return owner, nil
+	}
+	if requested != "" {
+		return requested, nil
+	}
+	if len(cfg.Accounts) > 1 {
+		return "", fmt.Errorf("conversation %s has no recorded account; pass an explicit account to continue it", threadID)
+	}
+	if len(cfg.Accounts) == 1 {
+		return cfg.Accounts[0].Email, nil
+	}
+	return strings.TrimSpace(cfg.ActiveAccount), nil
+}
+
+// replayResultFromConversation builds the cached-answer replay for a repeated
+// final turn from a completed conversation. It returns nil when the
+// conversation holds no completed assistant answer, leaving the turn to run
+// upstream as usual.
+func replayResultFromConversation(conversation ConversationEntry) *InferenceResult {
+	if !strings.EqualFold(strings.TrimSpace(conversation.Status), "completed") {
+		return nil
+	}
+	for i := len(conversation.Messages) - 1; i >= 0; i-- {
+		message := &conversation.Messages[i]
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "assistant") {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(message.Status), "completed") {
+			continue
+		}
+		if strings.TrimSpace(message.Content) == "" {
+			continue
+		}
+		return &InferenceResult{
+			Text:         message.Content,
+			ThreadID:     strings.TrimSpace(conversation.ThreadID),
+			AccountEmail: strings.TrimSpace(conversation.AccountEmail),
+		}
+	}
+	return nil
 }
 
 func (a *App) resolveContinuationConversationWithExplicit(previousResponseID string, hiddenPrompt string, segments []conversationPromptSegment, explicitConversationID string, explicitThreadID string) (continuationTarget, bool) {
@@ -1729,6 +1847,9 @@ func applyInferenceResultOutputPolicy(result InferenceResult, request PromptRunR
 }
 
 func (a *App) runPrompt(r *http.Request, request PromptRunRequest) (InferenceResult, error) {
+	if request.replayResult != nil {
+		return *request.replayResult, nil
+	}
 	if a.runPromptOverride != nil {
 		return a.runPromptOverride(r, request)
 	}
@@ -1802,7 +1923,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
-	originalFingerprint := canonicalConversationFingerprint(hiddenPrompt, normalized.Segments)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
@@ -1817,9 +1938,14 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveContinuationConversationWithExplicit("", hiddenPrompt, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+	if matched, ok := a.resolveContinuationConversationWithExplicit("", originalFingerprint, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
-		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccount)
+		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
+		if accountErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, accountErr.Error(), "invalid_request_error", "conversation_account_mismatch")
+			return
+		}
+		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccount, account)
 		if freshThreadMode {
 			request.ForceLocalConversationContinue = strings.TrimSpace(conversation.ID) != ""
 			request.Prompt = buildFreshThreadReplayPromptFromConversation(conversation, latestPrompt, normalized.Attachments, promptText)
@@ -1828,6 +1954,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			request.continuationDraft = buildContinuationDraft(matched.Session)
 			if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
 				request.SessionRepeatTurn = true
+				request.replayResult = replayResultFromConversation(conversation)
 			}
 			request.Prompt = latestPrompt
 		}
@@ -1890,7 +2017,8 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 		return
 	}
 
-	originalFingerprint := canonicalConversationFingerprint(ctx.StableHidden, ctx.RequestSegments)
+	requestedAccount := requestedAccountEmail(r, payload)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount), ctx.StableHidden, ctx.RequestSegments)
 	originalRawMessageCount := sessionRawMessageCount(ctx.RequestSegments)
 	request := PromptRunRequest{
 		Prompt:             ctx.Normalized.Prompt,
@@ -1915,10 +2043,15 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 
 	preferredConversationID := requestedConversationID(r, payload)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx); ok {
+	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx, originalFingerprint); ok {
 		request.SuppressUpstreamThreadPersistence = matched.SuppressPersist
 		conversation = matched.Target.Conversation
-		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccountEmail(r, payload))
+		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
+		if accountErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, accountErr.Error(), "invalid_request_error", "conversation_account_mismatch")
+			return
+		}
+		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccount, account)
 		if freshThreadMode {
 			request.ForceLocalConversationContinue = strings.TrimSpace(conversation.ID) != ""
 			request.Prompt = buildFreshThreadReplayPromptFromConversation(conversation, ctx.LatestPrompt, ctx.Normalized.Attachments, request.Prompt)
@@ -1944,6 +2077,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 
 	if request.continuationDraft != nil && (request.RawMessageCount == request.continuationDraft.RawMessageCount || request.ForceSessionRepeatTurn) {
 		request.SessionRepeatTurn = true
+		request.replayResult = replayResultFromConversation(conversation)
 	}
 
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
@@ -2020,7 +2154,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
-	originalFingerprint := canonicalConversationFingerprint(hiddenPrompt, normalized.Segments)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "responses", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
@@ -2035,9 +2169,14 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, hiddenPrompt, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, originalFingerprint, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
-		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccount)
+		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
+		if accountErr != nil {
+			writeOpenAIError(w, http.StatusBadRequest, accountErr.Error(), "invalid_request_error", "conversation_account_mismatch")
+			return
+		}
+		request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), requestedAccount, account)
 		if freshThreadMode {
 			request.ForceLocalConversationContinue = strings.TrimSpace(conversation.ID) != ""
 			request.Prompt = buildFreshThreadReplayPromptFromConversation(conversation, latestPrompt, normalized.Attachments, promptText)
@@ -2046,6 +2185,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			request.continuationDraft = buildContinuationDraft(matched.Session)
 			if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
 				request.SessionRepeatTurn = true
+				request.replayResult = replayResultFromConversation(conversation)
 			}
 			request.Prompt = latestPrompt
 		}
@@ -2105,7 +2245,6 @@ func (a *App) writeUpstreamError(w http.ResponseWriter, err error) {
 }
 
 func prepareOpenAISSEHeaders(w http.ResponseWriter) {
-	applyCORSHeaders(w)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
@@ -2297,34 +2436,14 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 		KeepAlive:       emitKeepAlive,
 	})
 	if err != nil {
-		partialText := sanitizeAssistantVisibleText(emittedVisibleText.String())
+		// A stream that died mid-flight must never be reported as a clean
+		// stop: the client already saw partial text, so the error event is the
+		// only way to tell it the answer was truncated.
+		a.failConversation(conversationID, err)
 		if !headersSent {
-			a.failConversation(conversationID, err)
 			a.writeUpstreamError(w, err)
 			return
 		}
-		if strings.TrimSpace(partialText) != "" {
-			partialResult := InferenceResult{
-				Prompt: request.Prompt,
-				Text:   partialText,
-			}
-			partialResult = applyInferenceResultOutputPolicy(partialResult, request)
-			a.completeConversation(conversationID, partialResult)
-			a.persistConversationSession(conversationID, request, partialResult)
-			if request.ClientProfile == sillyTavernClientProfile && !request.SuppressUpstreamThreadPersistence {
-				a.persistSillyTavernBinding(conversationID, request.ClientSessionKey, request.ClientMode)
-			}
-			finalUsage := map[string]any{}
-			if includeUsage {
-				finalUsage = buildUsage(request.Prompt, partialText, emittedReasoning.String())
-			}
-			_ = safeWriteData(buildChatStreamChunk(completionID, created, modelID, []map[string]any{
-				buildChatStreamFinishChoice(0, "stop"),
-			}, finalUsage))
-			safeWriteDone()
-			return
-		}
-		a.failConversation(conversationID, err)
 		_ = safeWriteData(map[string]any{
 			"error": map[string]any{
 				"message": err.Error(),
@@ -2749,7 +2868,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		observeRequestDuration(r.URL.Path, r.Method, statusCode, time.Since(startedAt))
 	}()
 	safeWriter := &panicSafeResponseWriter{ResponseWriter: w}
-	applyCORSHeaders(safeWriter)
+	applyCORSHeadersForPath(safeWriter, r.URL.Path)
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			stack := strings.TrimSpace(string(debug.Stack()))

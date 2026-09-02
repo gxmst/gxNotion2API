@@ -28,10 +28,13 @@ func isSessionRetryableError(err error) bool {
 			return true
 		}
 		message := strings.ToLower(strings.TrimSpace(apiErr.Message))
+		// A stale client version is an explicit, actionable upstream signal at
+		// any status. Bare "session"/"login" mentions are not: operational 5xx
+		// bodies often contain them in unrelated text, and replaying an
+		// inference request on that basis re-sends a turn that may already have
+		// landed upstream.
 		return strings.Contains(message, "client version") ||
-			strings.Contains(message, "notion-client-version") ||
-			strings.Contains(message, "session") ||
-			strings.Contains(message, "login")
+			strings.Contains(message, "notion-client-version")
 	}
 	var loginErr *notionLoginAPIError
 	if errors.As(err, &loginErr) {

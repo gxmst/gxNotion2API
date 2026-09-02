@@ -125,17 +125,11 @@ func writePrettyJSONFileMode(path string, payload any, mode os.FileMode) error {
 	if clean == "" {
 		return fmt.Errorf("empty path")
 	}
-	if err := ensureParentDir(clean); err != nil {
-		return err
-	}
 	body, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(clean, append(body, '\n'), mode); err != nil {
-		return err
-	}
-	return os.Chmod(clean, mode)
+	return writeFileAtomically(clean, append(body, '\n'), mode)
 }
 
 func readLoginPendingState(path string) (loginPendingState, error) {
@@ -769,6 +763,9 @@ func VerifyEmailLogin(ctx context.Context, cfg AppConfig, req LoginVerifyRequest
 	pending.Message = "login verified"
 	pending.Error = ""
 	pending.LastLoginAt = helperNowISO()
+	pending.LoginOptionsToken = ""
+	pending.CSRFState = ""
+	pending.DeviceID = ""
 	if err := writeLoginPendingState(req.PendingPath, pending); err != nil {
 		return failLoginState(req.PendingPath, pending, err)
 	}
