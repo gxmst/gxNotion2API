@@ -5,6 +5,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -108,8 +109,14 @@ func streamRequestTimeout(cfg AppConfig) time.Duration {
 	return time.Duration(maxInt(cfg.TimeoutSec, defaultStreamingRequestTimeoutSec)) * time.Second
 }
 
+var errNoEligibleAccounts = errors.New("no usable accounts available")
+
 func noEligibleAccountsError() error {
-	return fmt.Errorf("no usable accounts available; check disabled state, local artifacts, or login status")
+	return fmt.Errorf("%w; check disabled state, local artifacts, or login status", errNoEligibleAccounts)
+}
+
+func isNoEligibleAccountsError(err error) bool {
+	return errors.Is(err, errNoEligibleAccounts)
 }
 
 func noDispatchCapacityError() error {
@@ -186,6 +193,59 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 		return nil, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
 	}
 	return []NotionAccount{account}, nil
+}
+
+// buildContinuationFailoverRequest rebuilds a pinned continuation as a
+// fresh-thread turn. The original upstream thread belongs to the exhausted
+// account's workspace, where no other account can write, so continuing the
+// conversation means replaying its history into a new thread. The caller runs
+// the returned request through the account pool again; the flag on the request
+// keeps that retry from fanning out into a second failover.
+func (a *App) buildContinuationFailoverRequest(request PromptRunRequest) (PromptRunRequest, bool) {
+	if request.continuationFailoverAttempted {
+		return PromptRunRequest{}, false
+	}
+	if strings.TrimSpace(request.UpstreamThreadID) == "" || strings.TrimSpace(request.ConversationID) == "" {
+		return PromptRunRequest{}, false
+	}
+	conversation, ok := a.State.conversations().Get(strings.TrimSpace(request.ConversationID))
+	if !ok {
+		return PromptRunRequest{}, false
+	}
+	failover := request
+	failover.UpstreamThreadID = ""
+	failover.continuationDraft = nil
+	failover.continuationScaffold = nil
+	failover.PinnedAccountEmail = ""
+	failover.AllowPinnedAccountFallback = false
+	failover.preparedThreadID = ""
+	failover.onThreadPrepared = nil
+	failover.SessionRepeatTurn = false
+	failover.replayResult = nil
+	failover.attachmentThreadReady = false
+	failover.Prompt = buildFreshThreadReplayPromptFromConversation(conversation, request.LatestUserPrompt, request.Attachments, request.Prompt)
+	failover.continuationFailoverAttempted = true
+	return failover, true
+}
+
+// retryContinuationOnAnotherAccount runs the fresh-thread continuation through
+// the account pool. When no other account can take the turn either, the
+// original quota error is preserved: a capacity error would only obscure what
+// actually went wrong.
+func (a *App) retryContinuationOnAnotherAccount(r *http.Request, request PromptRunRequest, run func(PromptRunRequest) (InferenceResult, error), originalErr error) (InferenceResult, error) {
+	failoverRequest, ok := a.buildContinuationFailoverRequest(request)
+	if !ok {
+		return InferenceResult{}, originalErr
+	}
+	log.Printf("[dispatch] upstream AI quota exhausted on the pinned account; retrying conversation %s on another account in a fresh thread", strings.TrimSpace(request.ConversationID))
+	result, err := run(failoverRequest)
+	// When no other account can take the turn either (all cooling down, gone,
+	// or out of capacity), the original quota error is preserved: a pool-level
+	// availability error would only obscure what actually went wrong.
+	if err != nil && (isDispatchCapacityExceededError(err) || isNoEligibleAccountsError(err)) {
+		return InferenceResult{}, originalErr
+	}
+	return result, err
 }
 
 func shouldPersistDispatchedAccountAsActive(cfg AppConfig, request PromptRunRequest, accountEmail string) bool {
@@ -612,6 +672,11 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 	}
 
 	if lastErr != nil {
+		if !emittedAny && isQuotaExhaustedError(lastErr) && cfg.ResolveContinuationFailover() {
+			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
+				return a.runPromptWithAccountPool(r, next, onDelta)
+			}, lastErr)
+		}
 		return InferenceResult{}, lastErr
 	}
 	return InferenceResult{}, noDispatchCapacityError()
@@ -789,6 +854,11 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 	}
 
 	if lastErr != nil {
+		if !emittedAny && isQuotaExhaustedError(lastErr) && cfg.ResolveContinuationFailover() {
+			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
+				return a.runPromptWithAccountPoolWithSink(r, next, sink)
+			}, lastErr)
+		}
 		return InferenceResult{}, lastErr
 	}
 	return InferenceResult{}, noDispatchCapacityError()

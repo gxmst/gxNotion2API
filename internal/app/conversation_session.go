@@ -46,10 +46,6 @@ type conversationContinuationState struct {
 	UpdatedConfigIDs []string
 }
 
-func canonicalConversationFingerprint(hiddenPrompt string, segments []conversationPromptSegment) string {
-	return canonicalConversationFingerprintScoped("", hiddenPrompt, segments)
-}
-
 func canonicalConversationFingerprintScoped(scope string, hiddenPrompt string, segments []conversationPromptSegment) string {
 	h := sha256.New()
 	if cleanScope := collapseWhitespace(scope); cleanScope != "" {

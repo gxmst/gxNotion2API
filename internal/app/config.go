@@ -47,6 +47,13 @@ type FeatureConfig struct {
 	// Absent means defaultConversationIdleTTLHours; an explicit 0 disables
 	// idle sweeping and keeps conversations indefinitely.
 	ConversationIdleTTLHours *int `json:"conversation_idle_ttl_hours,omitempty"`
+	// ContinuationFailover keeps a conversation alive when the account it is
+	// pinned to has its workspace AI allowance exhausted upstream: the turn is
+	// retried on another eligible account in a fresh upstream thread seeded
+	// with the conversation history. The original thread lives in the exhausted
+	// workspace where no other account can write, so replaying the history is
+	// the only way to continue. Absent means true.
+	ContinuationFailover *bool `json:"continuation_failover,omitempty"`
 	// Timezone is the IANA zone reported to upstream in the inference payload.
 	// AcceptLanguage is the matching Accept-Language header. They are one knob
 	// because a Windows/en-US browser claiming Asia/Shanghai is an odd pairing;
@@ -126,45 +133,46 @@ type PromptConfig struct {
 }
 
 type NotionAccount struct {
-	Email               string `json:"email"`
-	emailKey            string `json:"-"`
-	ProbeJSON           string `json:"probe_json,omitempty"`
-	ProfileDir          string `json:"profile_dir,omitempty"`
-	StorageStatePath    string `json:"storage_state_path,omitempty"`
-	PendingStatePath    string `json:"pending_state_path,omitempty"`
-	UserID              string `json:"user_id,omitempty"`
-	UserName            string `json:"user_name,omitempty"`
-	SpaceID             string `json:"space_id,omitempty"`
-	SpaceViewID         string `json:"space_view_id,omitempty"`
-	SpaceName           string `json:"space_name,omitempty"`
-	PlanType            string `json:"plan_type,omitempty"`
-	ClientVersion       string `json:"client_version,omitempty"`
-	Status              string `json:"status,omitempty"`
-	LastError           string `json:"last_error,omitempty"`
-	LastLoginAt         string `json:"last_login_at,omitempty"`
-	Disabled            bool   `json:"disabled,omitempty"`
-	Priority            int    `json:"priority,omitempty"`
-	HourlyQuota         int    `json:"hourly_quota,omitempty"`
-	MaxConcurrency      int    `json:"max_concurrency,omitempty"`
-	WindowStartedAt     string `json:"window_started_at,omitempty"`
-	WindowRequestCount  int    `json:"window_request_count,omitempty"`
-	CooldownUntil       string `json:"cooldown_until,omitempty"`
-	LastUsedAt          string `json:"last_used_at,omitempty"`
-	LastSuccessAt       string `json:"last_success_at,omitempty"`
-	LastRefreshAt       string `json:"last_refresh_at,omitempty"`
-	LastReloginAt       string `json:"last_relogin_at,omitempty"`
-	ProxyMode           string `json:"proxy_mode,omitempty"`
-	ProxyURL            string `json:"proxy_url,omitempty"`
-	ProxyHTTPURL        string `json:"proxy_http_url,omitempty"`
-	ProxyHTTPSURL       string `json:"proxy_https_url,omitempty"`
-	StickyProxyAccount  string `json:"sticky_proxy_account,omitempty"`
-	ResinEnabled        bool   `json:"resin_enabled,omitempty"`
-	ResinURL            string `json:"resin_url,omitempty"`
-	ResinPlatform       string `json:"resin_platform,omitempty"`
-	ResinMode           string `json:"resin_mode,omitempty"`
-	ConsecutiveFailures int    `json:"consecutive_failures,omitempty"`
-	TotalSuccesses      int    `json:"total_successes,omitempty"`
-	TotalFailures       int    `json:"total_failures,omitempty"`
+	Email                string `json:"email"`
+	emailKey             string `json:"-"`
+	ProbeJSON            string `json:"probe_json,omitempty"`
+	ProfileDir           string `json:"profile_dir,omitempty"`
+	StorageStatePath     string `json:"storage_state_path,omitempty"`
+	PendingStatePath     string `json:"pending_state_path,omitempty"`
+	UserID               string `json:"user_id,omitempty"`
+	UserName             string `json:"user_name,omitempty"`
+	SpaceID              string `json:"space_id,omitempty"`
+	SpaceViewID          string `json:"space_view_id,omitempty"`
+	SpaceName            string `json:"space_name,omitempty"`
+	PlanType             string `json:"plan_type,omitempty"`
+	ClientVersion        string `json:"client_version,omitempty"`
+	Status               string `json:"status,omitempty"`
+	LastError            string `json:"last_error,omitempty"`
+	LastLoginAt          string `json:"last_login_at,omitempty"`
+	Disabled             bool   `json:"disabled,omitempty"`
+	Priority             int    `json:"priority,omitempty"`
+	HourlyQuota          int    `json:"hourly_quota,omitempty"`
+	MaxConcurrency       int    `json:"max_concurrency,omitempty"`
+	WindowStartedAt      string `json:"window_started_at,omitempty"`
+	WindowRequestCount   int    `json:"window_request_count,omitempty"`
+	CooldownUntil        string `json:"cooldown_until,omitempty"`
+	LastUsedAt           string `json:"last_used_at,omitempty"`
+	LastSuccessAt        string `json:"last_success_at,omitempty"`
+	LastRefreshAt        string `json:"last_refresh_at,omitempty"`
+	LastReloginAt        string `json:"last_relogin_at,omitempty"`
+	LastQuotaExhaustedAt string `json:"last_quota_exhausted_at,omitempty"`
+	ProxyMode            string `json:"proxy_mode,omitempty"`
+	ProxyURL             string `json:"proxy_url,omitempty"`
+	ProxyHTTPURL         string `json:"proxy_http_url,omitempty"`
+	ProxyHTTPSURL        string `json:"proxy_https_url,omitempty"`
+	StickyProxyAccount   string `json:"sticky_proxy_account,omitempty"`
+	ResinEnabled         bool   `json:"resin_enabled,omitempty"`
+	ResinURL             string `json:"resin_url,omitempty"`
+	ResinPlatform        string `json:"resin_platform,omitempty"`
+	ResinMode            string `json:"resin_mode,omitempty"`
+	ConsecutiveFailures  int    `json:"consecutive_failures,omitempty"`
+	TotalSuccesses       int    `json:"total_successes,omitempty"`
+	TotalFailures        int    `json:"total_failures,omitempty"`
 }
 
 type ModelDefinition struct {
@@ -817,6 +825,16 @@ func (cfg AppConfig) DefaultPublicModel() string {
 
 func (cfg AppConfig) ResolveSQLitePath() string {
 	return resolveConfigRelativePath(cfg.ConfigPath, cfg.Storage.SQLitePath, "")
+}
+
+// ResolveContinuationFailover reports whether a pinned continuation may be
+// rebuilt as a fresh-thread turn on another account after the pinned account's
+// workspace ran out of AI quota. Absent means true.
+func (cfg AppConfig) ResolveContinuationFailover() bool {
+	if cfg.Features.ContinuationFailover != nil {
+		return *cfg.Features.ContinuationFailover
+	}
+	return true
 }
 
 func loadConfigFile(path string) (AppConfig, error) {

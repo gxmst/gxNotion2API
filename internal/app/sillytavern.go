@@ -446,7 +446,7 @@ func conversationSegmentsEqual(a []conversationPromptSegment, b []conversationPr
 	return true
 }
 
-func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string]any, ctx sillyTavernContext, fingerprint string) (sillyTavernContinuationMatch, bool) {
+func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string]any, ctx sillyTavernContext, fingerprint string, clientScope string) (sillyTavernContinuationMatch, bool) {
 	if ctx.Mode == sillyTavernModeQuiet || ctx.Mode == sillyTavernModeImpersona {
 		return sillyTavernContinuationMatch{SuppressPersist: true}, true
 	}
@@ -502,7 +502,7 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 		}
 	}
 
-	general, ok := a.resolveContinuationConversationWithExplicit("", fingerprint, ctx.RequestSegments, requestedConversationID(r, payload), requestedThreadID(r, payload))
+	general, ok := a.resolveContinuationConversationWithExplicit("", fingerprint, clientScope, ctx.RequestSegments, requestedConversationID(r, payload), requestedThreadID(r, payload))
 	if ok {
 		match := sillyTavernContinuationMatch{Target: general}
 		if ctx.Mode == sillyTavernModeContinue {

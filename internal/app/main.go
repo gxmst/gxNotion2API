@@ -57,6 +57,8 @@ type ServerState struct {
 	cachedHealthzStaticJSON    atomic.Pointer[[]byte]
 	cachedModelsListJSON       atomic.Pointer[[]byte]
 	cachedModelByIDJSON        atomic.Pointer[map[string][]byte]
+	aiUsageMu                  sync.Mutex
+	aiUsageCache               map[string]workspaceAIUsageReport
 }
 
 type accountDispatchState struct {
@@ -109,6 +111,7 @@ type App struct {
 	runPromptWithSessionOverride     func(context.Context, AppConfig, SessionInfo, PromptRunRequest, func(string) error) (InferenceResult, error)
 	runPromptWithSessionSinkOverride func(context.Context, AppConfig, SessionInfo, PromptRunRequest, InferenceStreamSink) (InferenceResult, error)
 	accountProtocolProbeOverride     func(context.Context, AppConfig, SessionInfo) error
+	workspaceAIUsageFetchOverride    func(context.Context, AppConfig, NotionAccount) (workspaceAIUsage, error)
 }
 
 const (
@@ -1236,7 +1239,11 @@ func firstRequestValue(r *http.Request, keys ...string) string {
 // (profile, session key, client headers, peer address) and what they are asking
 // with (transport surface, model, account). Parts are labeled and newline
 // joined; the fingerprint hashes the collapsed whole.
-func requestClientFingerprintScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
+// requestClientContinuationScope labels the stable parts of a request's client
+// identity. Conversations persist this scope, and the suffix-matching
+// continuation fallback only bridges conversations created under the exact
+// same scope.
+func requestClientContinuationScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
 	parts := []string{
 		"profile=" + strings.TrimSpace(profile),
 		"session=" + strings.TrimSpace(session),
@@ -1245,16 +1252,29 @@ func requestClientFingerprintScope(r *http.Request, profile string, session stri
 		"account=" + canonicalEmailKey(account),
 	}
 	if r != nil {
-		parts = append(parts,
-			"client="+firstRequestValue(r, "X-Client-ID", "X-Session-ID", "OpenAI-Organization"),
-			"ua="+strings.TrimSpace(r.Header.Get("User-Agent")),
-		)
-		peer := strings.TrimSpace(r.RemoteAddr)
-		if host, _, err := net.SplitHostPort(peer); err == nil {
-			peer = host
-		}
-		parts = append(parts, "remote="+peer)
+		parts = append(parts, "client="+firstRequestValue(r, "X-Client-ID", "X-Session-ID", "OpenAI-Organization"))
 	}
+	return strings.Join(parts, "\n")
+}
+
+// requestClientFingerprintScope extends the continuation scope with volatile
+// connection traits. They must split conversation fingerprints (a changed IP
+// or user agent is a different client as far as fingerprint matching goes) but
+// must not split the suffix-matching fallback, which exists to rescue
+// continuations across exactly that kind of drift.
+func requestClientFingerprintScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
+	scope := requestClientContinuationScope(r, profile, session, transport, model, account)
+	if r == nil {
+		return scope
+	}
+	parts := []string{scope,
+		"ua=" + strings.TrimSpace(r.Header.Get("User-Agent")),
+	}
+	peer := strings.TrimSpace(r.RemoteAddr)
+	if host, _, err := net.SplitHostPort(peer); err == nil {
+		peer = host
+	}
+	parts = append(parts, "remote="+peer)
 	return strings.Join(parts, "\n")
 }
 
@@ -1423,10 +1443,61 @@ func attachConversationResponseMetadata(payload map[string]any, conversationID s
 	}
 }
 
-func (a *App) resolveContinuationConversation(r *http.Request, payload map[string]any, previousResponseID string, hiddenPrompt string, segments []conversationPromptSegment) (continuationTarget, bool) {
+// latestUserSegmentText returns the trailing user message of a normalized
+// request history.
+func latestUserSegmentText(segments []conversationPromptSegment) string {
+	normalized := normalizeConversationHistorySegments(segments)
+	for i := len(normalized) - 1; i >= 0; i-- {
+		if normalized[i].Role == "user" {
+			return strings.TrimSpace(normalized[i].Text)
+		}
+	}
+	return ""
+}
+
+func conversationFinalUserTurn(conversation ConversationEntry) (ConversationMessage, bool) {
+	for i := len(conversation.Messages) - 1; i >= 0; i-- {
+		if strings.EqualFold(strings.TrimSpace(conversation.Messages[i].Role), "user") {
+			return conversation.Messages[i], true
+		}
+	}
+	return ConversationMessage{}, false
+}
+
+// requestMatchesConversationFinalTurn reports whether the request re-sends the
+// exact final user turn that produced the conversation's latest completed
+// answer. Message counts alone cannot tell a repeated request from an edited
+// final message ("explain A" -> "explain B"), and only the former may replay
+// the cached answer.
+func requestMatchesConversationFinalTurn(request PromptRunRequest, segments []conversationPromptSegment, conversation ConversationEntry) bool {
+	turn, ok := conversationFinalUserTurn(conversation)
+	if !ok {
+		return false
+	}
+	if latestUserSegmentText(segments) != strings.TrimSpace(turn.Content) {
+		return false
+	}
+	requestAttachments := summarizeInputAttachments(request.Attachments)
+	if len(requestAttachments) != len(turn.Attachments) {
+		return false
+	}
+	for i := range requestAttachments {
+		if strings.TrimSpace(requestAttachments[i].Name) != strings.TrimSpace(turn.Attachments[i].Name) ||
+			strings.TrimSpace(requestAttachments[i].ContentType) != strings.TrimSpace(turn.Attachments[i].ContentType) {
+			return false
+		}
+	}
+	return true
+}
+
+func isConversationTurnConflict(err error) bool {
+	return errors.Is(err, errConversationInProgress) || errors.Is(err, errConversationDeleting)
+}
+
+func (a *App) resolveContinuationConversation(r *http.Request, payload map[string]any, previousResponseID string, fingerprint string, segments []conversationPromptSegment) (continuationTarget, bool) {
 	explicitConversationID := requestedConversationID(r, payload)
 	explicitThreadID := requestedThreadID(r, payload)
-	return a.resolveContinuationConversationWithExplicit(previousResponseID, hiddenPrompt, segments, explicitConversationID, explicitThreadID)
+	return a.resolveContinuationConversationWithExplicit(previousResponseID, fingerprint, "", segments, explicitConversationID, explicitThreadID)
 }
 
 // resolveContinuationAccount decides which account may serve a continuation.
@@ -1485,7 +1556,12 @@ func replayResultFromConversation(conversation ConversationEntry) *InferenceResu
 	return nil
 }
 
-func (a *App) resolveContinuationConversationWithExplicit(previousResponseID string, hiddenPrompt string, segments []conversationPromptSegment, explicitConversationID string, explicitThreadID string) (continuationTarget, bool) {
+// resolveContinuationConversationWithExplicit resolves the conversation a
+// request continues. `fingerprint` must be the already-computed scoped
+// fingerprint the caller will also persist on the session; recomputing it here
+// from a hidden prompt would produce a different key and silently kill the
+// fingerprint hit path.
+func (a *App) resolveContinuationConversationWithExplicit(previousResponseID string, fingerprint string, clientScope string, segments []conversationPromptSegment, explicitConversationID string, explicitThreadID string) (continuationTarget, bool) {
 	rawCount := sessionRawMessageCount(segments)
 	validateState := func(state *conversationContinuationState) bool {
 		if state == nil {
@@ -1580,25 +1656,27 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 		}
 		return target, true
 	}
-	fingerprint := canonicalConversationFingerprint(hiddenPrompt, segments)
-	if state, err := a.State.loadConversationContinuationStateByFingerprint(fingerprint); err == nil && state != nil {
-		if !validateState(state) {
-			return continuationTarget{}, false
-		}
-		if rawCount >= state.Session.RawMessageCount && strings.TrimSpace(state.Session.ThreadID) != "" {
-			entry := ConversationEntry{
-				ID:           strings.TrimSpace(state.Session.ConversationID),
-				ThreadID:     strings.TrimSpace(state.Session.ThreadID),
-				AccountEmail: strings.TrimSpace(state.Session.AccountEmail),
+	fingerprint = strings.TrimSpace(fingerprint)
+	if fingerprint != "" {
+		if state, err := a.State.loadConversationContinuationStateByFingerprint(fingerprint); err == nil && state != nil {
+			if !validateState(state) {
+				return continuationTarget{}, false
 			}
-			if existing, ok := a.State.conversations().Get(entry.ID); ok {
-				entry = existing
+			if rawCount >= state.Session.RawMessageCount && strings.TrimSpace(state.Session.ThreadID) != "" {
+				entry := ConversationEntry{
+					ID:           strings.TrimSpace(state.Session.ConversationID),
+					ThreadID:     strings.TrimSpace(state.Session.ThreadID),
+					AccountEmail: strings.TrimSpace(state.Session.AccountEmail),
+				}
+				if existing, ok := a.State.conversations().Get(entry.ID); ok {
+					entry = existing
+				}
+				return continuationTarget{Conversation: entry, Session: state}, true
 			}
-			return continuationTarget{Conversation: entry, Session: state}, true
 		}
 	}
 	if history := continuationHistorySegments(segments); len(history) > 0 {
-		if entry, ok := a.State.conversations().FindContinuationBySegments(history); ok {
+		if entry, ok := a.State.conversations().FindContinuationBySegments(history, clientScope); ok {
 			state, err := a.State.loadConversationContinuationStateByConversationID(entry.ID)
 			if err == nil && !validateState(state) {
 				return continuationTarget{}, false
@@ -1612,13 +1690,22 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 	return continuationTarget{}, false
 }
 
-func (a *App) startConversationTurn(existingConversationID string, preferredConversationID string, source string, transport string, displayPrompt string, request PromptRunRequest) string {
+// startConversationTurn starts (or continues) the local conversation record for
+// a turn. A busy or deleting conversation is reported as an error instead of
+// being silently re-created: the request already carries the upstream thread of
+// the existing record, so a fresh local entry would run a second turn against
+// the same thread in parallel.
+func (a *App) startConversationTurn(existingConversationID string, preferredConversationID string, source string, transport string, displayPrompt string, request PromptRunRequest) (string, error) {
 	if existingConversationID != "" && (strings.TrimSpace(request.UpstreamThreadID) != "" || request.ForceLocalConversationContinue) {
-		if conversationID, err := a.continueConversation(existingConversationID, source, transport, displayPrompt, request); err == nil {
-			return conversationID
+		conversationID, err := a.continueConversation(existingConversationID, source, transport, displayPrompt, request)
+		if err == nil {
+			return conversationID, nil
+		}
+		if isConversationTurnConflict(err) {
+			return "", err
 		}
 	}
-	return a.beginConversation(preferredConversationID, source, transport, displayPrompt, request)
+	return a.beginConversation(preferredConversationID, source, transport, displayPrompt, request), nil
 }
 
 func (a *App) markEphemeralConversationRequest(request *PromptRunRequest) {
@@ -1856,7 +1943,21 @@ func (a *App) runPrompt(r *http.Request, request PromptRunRequest) (InferenceRes
 	return a.runPromptWithAccountPool(r, request, nil)
 }
 
+// emitReplayStream delivers a cached answer through a streaming sink without
+// touching the account pool, so a repeated streamed request behaves like its
+// non-streamed counterpart.
+func emitReplayStream(request PromptRunRequest, emit func(string) error) (InferenceResult, error) {
+	result := *request.replayResult
+	if err := emit(result.Text); err != nil {
+		return InferenceResult{}, err
+	}
+	return result, nil
+}
+
 func (a *App) runPromptStream(r *http.Request, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
+	if request.replayResult != nil {
+		return emitReplayStream(request, onDelta)
+	}
 	if a.runPromptStreamOverride != nil {
 		return a.runPromptStreamOverride(r, request, onDelta)
 	}
@@ -1864,6 +1965,9 @@ func (a *App) runPromptStream(r *http.Request, request PromptRunRequest, onDelta
 }
 
 func (a *App) runPromptStreamWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
+	if request.replayResult != nil {
+		return emitReplayStream(request, sink.Text)
+	}
 	if a.runPromptStreamSinkOverride != nil {
 		return a.runPromptStreamSinkOverride(r, request, sink)
 	}
@@ -1923,6 +2027,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
+	continuationScope := requestClientContinuationScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount)
 	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
@@ -1935,10 +2040,11 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		Attachments:        normalized.Attachments,
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
+		ClientScope:        continuationScope,
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveContinuationConversationWithExplicit("", originalFingerprint, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+	if matched, ok := a.resolveContinuationConversationWithExplicit("", originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
 		if accountErr != nil {
@@ -1952,7 +2058,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		} else {
 			request.UpstreamThreadID = strings.TrimSpace(conversation.ThreadID)
 			request.continuationDraft = buildContinuationDraft(matched.Session)
-			if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
+			if matched.Session != nil && (request.ForceSessionRepeatTurn || (request.RawMessageCount == matched.Session.Session.RawMessageCount && requestMatchesConversationFinalTurn(request, normalized.Segments, conversation))) {
 				request.SessionRepeatTurn = true
 				request.replayResult = replayResultFromConversation(conversation)
 			}
@@ -1963,7 +2069,11 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
 	a.markEphemeralConversationRequest(&request)
-	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "chat_completions", resolveRequestPromptForContinuation(normalized), request)
+	conversationID, turnErr := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "chat_completions", resolveRequestPromptForContinuation(normalized), request)
+	if turnErr != nil {
+		writeOpenAIError(w, http.StatusConflict, turnErr.Error(), "invalid_request_error", "conversation_busy")
+		return
+	}
 	setConversationIDHeader(w, conversationID)
 	stream := typed.Stream
 	if stream {
@@ -2018,6 +2128,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 	}
 
 	requestedAccount := requestedAccountEmail(r, payload)
+	continuationScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount)
 	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount), ctx.StableHidden, ctx.RequestSegments)
 	originalRawMessageCount := sessionRawMessageCount(ctx.RequestSegments)
 	request := PromptRunRequest{
@@ -2033,6 +2144,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 		Attachments:        ctx.Normalized.Attachments,
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
+		ClientScope:        continuationScope,
 	}
 	request.SuppressReasoningOutput = !sillyTavernWantsReasoning(payload)
 	if streamEnabled, _ := payload["stream"].(bool); streamEnabled && !request.SuppressReasoningOutput {
@@ -2043,7 +2155,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 
 	preferredConversationID := requestedConversationID(r, payload)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx, originalFingerprint); ok {
+	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx, originalFingerprint, continuationScope); ok {
 		request.SuppressUpstreamThreadPersistence = matched.SuppressPersist
 		conversation = matched.Target.Conversation
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
@@ -2075,13 +2187,17 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 		}
 	}
 
-	if request.continuationDraft != nil && (request.RawMessageCount == request.continuationDraft.RawMessageCount || request.ForceSessionRepeatTurn) {
+	if request.continuationDraft != nil && (request.ForceSessionRepeatTurn || (request.RawMessageCount == request.continuationDraft.RawMessageCount && requestMatchesConversationFinalTurn(request, ctx.RequestSegments, conversation))) {
 		request.SessionRepeatTurn = true
 		request.replayResult = replayResultFromConversation(conversation)
 	}
 
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
-	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "sillytavern", "chat_completions", ctx.DisplayPrompt, request)
+	conversationID, turnErr := a.startConversationTurn(conversation.ID, preferredConversationID, "sillytavern", "chat_completions", ctx.DisplayPrompt, request)
+	if turnErr != nil {
+		writeOpenAIError(w, http.StatusConflict, turnErr.Error(), "invalid_request_error", "conversation_busy")
+		return
+	}
 	setConversationIDHeader(w, conversationID)
 
 	stream, _ := payload["stream"].(bool)
@@ -2154,6 +2270,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
+	continuationScope := requestClientContinuationScope(r, "openai", "", "responses", entry.ID, requestedAccount)
 	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "responses", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
@@ -2166,10 +2283,11 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		Attachments:        normalized.Attachments,
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
+		ClientScope:        continuationScope,
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
-	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, originalFingerprint, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
 		if accountErr != nil {
@@ -2183,7 +2301,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		} else {
 			request.UpstreamThreadID = strings.TrimSpace(conversation.ThreadID)
 			request.continuationDraft = buildContinuationDraft(matched.Session)
-			if matched.Session != nil && (request.RawMessageCount == matched.Session.Session.RawMessageCount || request.ForceSessionRepeatTurn) {
+			if matched.Session != nil && (request.ForceSessionRepeatTurn || (request.RawMessageCount == matched.Session.Session.RawMessageCount && requestMatchesConversationFinalTurn(request, normalized.Segments, conversation))) {
 				request.SessionRepeatTurn = true
 				request.replayResult = replayResultFromConversation(conversation)
 			}
@@ -2197,7 +2315,11 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
 	a.markEphemeralConversationRequest(&request)
-	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "responses", resolveRequestPromptForContinuation(normalized), request)
+	conversationID, turnErr := a.startConversationTurn(conversation.ID, preferredConversationID, "api", "responses", resolveRequestPromptForContinuation(normalized), request)
+	if turnErr != nil {
+		writeOpenAIError(w, http.StatusConflict, turnErr.Error(), "invalid_request_error", "conversation_busy")
+		return
+	}
 	setConversationIDHeader(w, conversationID)
 	if stream {
 		a.writeResponsesLiveStream(w, r, request, entry.ID, cfg.DebugUpstream, conversationID)

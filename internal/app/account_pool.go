@@ -12,6 +12,12 @@ const (
 	accountCooldownBase        = 2 * time.Minute
 	accountCooldownMax         = 30 * time.Minute
 	accountAutoReloginInterval = 5 * time.Minute
+	// accountQuotaExhaustedCooldown is how long an account sits out after
+	// upstream confirmed its workspace AI allowance is spent. Notion's
+	// allowance window is monthly, but an hour keeps a misclassification from
+	// parking an account for a month while still stopping the every-two-minutes
+	// retry storm the ordinary failure backoff would produce.
+	accountQuotaExhaustedCooldown = time.Hour
 )
 
 func parseOptionalRFC3339(value string) time.Time {
@@ -70,12 +76,17 @@ func accountHasUsableArtifacts(cfg AppConfig, account NotionAccount) bool {
 
 func accountDispatchEligible(cfg AppConfig, account NotionAccount, now time.Time) (bool, string) {
 	account = ensureAccountPaths(cfg, account)
-	_ = now
 	if account.Disabled {
 		return false, "disabled"
 	}
 	if !accountHasUsableArtifacts(cfg, account) {
 		return false, "missing_artifacts"
+	}
+	if accountCooldownActive(account, now) {
+		return false, "cooldown"
+	}
+	if remaining, limited := accountRemainingQuota(account, now); limited && remaining <= 0 {
+		return false, "quota_exhausted"
 	}
 	return true, "ready"
 }
@@ -124,11 +135,31 @@ func markAccountDispatchSuccess(account NotionAccount, now time.Time) NotionAcco
 	return account
 }
 
+// isQuotaExhaustedError reports upstream AI-quota exhaustion. Notion surfaces
+// it inside the inference error text as a sub_type marker; it is the one
+// account-level failure where retrying after the ordinary backoff is pointless,
+// because the workspace allowance itself is spent.
+func isQuotaExhaustedError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "quota-exhausted")
+}
+
 func markAccountDispatchFailure(account NotionAccount, now time.Time, err error, retryable bool) NotionAccount {
 	account.TotalFailures++
 	account.ConsecutiveFailures++
 	account.LastUsedAt = formatRFC3339OrEmpty(now)
 	account.LastError = strings.TrimSpace(err.Error())
+	if isQuotaExhaustedError(err) {
+		// Upstream confirmed the workspace allowance is spent. The ordinary
+		// failure backoff (minutes) would just re-hit the wall, so sit out a
+		// long cooldown and keep the confirmation timestamp for the admin view.
+		account.Status = "quota_exhausted"
+		account.LastQuotaExhaustedAt = formatRFC3339OrEmpty(now)
+		account.CooldownUntil = formatRFC3339OrEmpty(now.Add(accountQuotaExhaustedCooldown))
+		return account
+	}
 	if !strings.EqualFold(strings.TrimSpace(account.Status), "pending_code") {
 		if retryable {
 			account.Status = "expired"
@@ -136,7 +167,10 @@ func markAccountDispatchFailure(account NotionAccount, now time.Time, err error,
 			account.Status = "failed"
 		}
 	}
-	account.CooldownUntil = ""
+	// The cooldown scales with the consecutive-failure count that was just
+	// incremented; without it a failing account stayed immediately dispatchable
+	// and the recorded status never matched the dispatch behaviour.
+	account.CooldownUntil = formatRFC3339OrEmpty(now.Add(computeAccountCooldown(account, retryable)))
 	return account
 }
 
@@ -367,8 +401,11 @@ func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionA
 	if !ok {
 		return NotionAccount{}, false, fmt.Errorf("account %s not found", email)
 	}
-	if eligible, reason := accountDispatchEligible(cfg, account, now); !eligible {
-		return account, false, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
+	if eligible, _ := accountDispatchEligible(cfg, account, now); !eligible {
+		// Not dispatchable right now (disabled, cooldown, exhausted local
+		// quota): report it through `started=false` so the dispatch loop moves
+		// on to the next candidate instead of failing the whole request.
+		return account, false, nil
 	}
 	account = markAccountDispatchStart(account, now)
 	cfg.Accounts = cloneAccounts(cfg.Accounts)

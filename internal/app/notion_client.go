@@ -307,16 +307,20 @@ type PromptRunRequest struct {
 	SuppressUpstreamThreadPersistence bool
 	SessionFingerprint                string
 	RawMessageCount                   int
-	ConversationID                    string
-	EphemeralConversation             bool
-	EphemeralReason                   string
-	EphemeralDeleteAfter              time.Time
-	ForceLocalConversationContinue    bool
-	SessionRepeatTurn                 bool
-	ForceSessionRepeatTurn            bool
-	attachmentThreadReady             bool
-	continuationDraft                 *continuationTurnDraft
-	continuationScaffold              *continuationTurnScaffold
+	// ClientScope labels the stable client identity the conversation was created
+	// under; the suffix-matching continuation fallback only bridges entries
+	// created under the exact same scope.
+	ClientScope                    string
+	ConversationID                 string
+	EphemeralConversation          bool
+	EphemeralReason                string
+	EphemeralDeleteAfter           time.Time
+	ForceLocalConversationContinue bool
+	SessionRepeatTurn              bool
+	ForceSessionRepeatTurn         bool
+	attachmentThreadReady          bool
+	continuationDraft              *continuationTurnDraft
+	continuationScaffold           *continuationTurnScaffold
 	// preparedThreadID is the thread this turn will run in, assigned before
 	// dispatch so the conversation entry can record the execution target and a
 	// retry reuses the same thread instead of spawning a new one.
@@ -327,6 +331,10 @@ type PromptRunRequest struct {
 	// replayResult, when armed, short-circuits dispatch with the cached answer
 	// of a completed conversation for a repeated final turn (no upstream call).
 	replayResult *InferenceResult
+	// continuationFailoverAttempted marks a request that was already rebuilt
+	// once as a fresh-thread turn after the pinned account's workspace ran out
+	// of AI quota, so the retry cannot fan out into a second failover.
+	continuationFailoverAttempted bool
 }
 
 type agentMessage struct {

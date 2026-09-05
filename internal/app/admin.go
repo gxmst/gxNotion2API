@@ -802,7 +802,11 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	request.ConversationID = firstNonEmpty(strings.TrimSpace(conversation.ID), preferredConversationID)
-	conversationID := a.startConversationTurn(conversation.ID, preferredConversationID, "admin_tester", "admin_test", prompt, request)
+	conversationID, turnErr := a.startConversationTurn(conversation.ID, preferredConversationID, "admin_tester", "admin_test", prompt, request)
+	if turnErr != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": turnErr.Error()})
+		return
+	}
 	timedRequest, cancel := cloneRequestWithTimeout(r, adminSyncRequestTimeout(cfg))
 	defer cancel()
 	result, err := a.runPrompt(timedRequest, request)
@@ -895,6 +899,8 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.handleAdminAccountsTest(w, r)
 	case r.URL.Path == "/admin/accounts/refresh-models":
 		a.handleAdminAccountsRefreshModels(w, r)
+	case r.URL.Path == "/admin/accounts/ai-usage":
+		a.handleAdminAccountsAIUsage(w, r)
 	case r.URL.Path == "/admin/accounts/login/start":
 		a.handleAdminAccountLoginStart(w, r)
 	case r.URL.Path == "/admin/accounts/login/verify":

@@ -264,23 +264,25 @@ func ensureAccountPaths(cfg AppConfig, account NotionAccount) NotionAccount {
 // worse in the pool forever.
 func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAccount, int) {
 	runtime := struct {
-		status              string
-		lastError           string
-		cooldownUntil       string
-		windowStartedAt     string
-		windowRequestCount  int
-		consecutiveFailures int
-		totalSuccesses      int
-		totalFailures       int
+		status               string
+		lastError            string
+		cooldownUntil        string
+		windowStartedAt      string
+		windowRequestCount   int
+		consecutiveFailures  int
+		totalSuccesses       int
+		totalFailures        int
+		lastQuotaExhaustedAt string
 	}{
-		status:              account.Status,
-		lastError:           account.LastError,
-		cooldownUntil:       account.CooldownUntil,
-		windowStartedAt:     account.WindowStartedAt,
-		windowRequestCount:  account.WindowRequestCount,
-		consecutiveFailures: account.ConsecutiveFailures,
-		totalSuccesses:      account.TotalSuccesses,
-		totalFailures:       account.TotalFailures,
+		status:               account.Status,
+		lastError:            account.LastError,
+		cooldownUntil:        account.CooldownUntil,
+		windowStartedAt:      account.WindowStartedAt,
+		windowRequestCount:   account.WindowRequestCount,
+		consecutiveFailures:  account.ConsecutiveFailures,
+		totalSuccesses:       account.TotalSuccesses,
+		totalFailures:        account.TotalFailures,
+		lastQuotaExhaustedAt: account.LastQuotaExhaustedAt,
 	}
 	stored, index := cfg.UpsertAccount(account)
 	stored.Status = runtime.status
@@ -289,6 +291,7 @@ func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAc
 	stored.WindowStartedAt = runtime.windowStartedAt
 	stored.WindowRequestCount = runtime.windowRequestCount
 	stored.ConsecutiveFailures = runtime.consecutiveFailures
+	stored.LastQuotaExhaustedAt = firstNonEmpty(runtime.lastQuotaExhaustedAt, stored.LastQuotaExhaustedAt)
 	// Cumulative totals only ever grow, so never let a merge walk them back.
 	if stored.TotalSuccesses < runtime.totalSuccesses {
 		stored.TotalSuccesses = runtime.totalSuccesses

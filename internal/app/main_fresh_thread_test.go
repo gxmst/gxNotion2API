@@ -1234,7 +1234,7 @@ func TestResolveContinuationConversationWithExplicitUsesTypedThreadID(t *testing
 		{Role: "user", Text: "follow up"},
 	}
 
-	target, ok := app.resolveContinuationConversationWithExplicit("", "", segments, "", "thread-explicit")
+	target, ok := app.resolveContinuationConversationWithExplicit("", "", "", segments, "", "thread-explicit")
 	if !ok {
 		t.Fatalf("expected explicit typed thread id to resolve continuation target")
 	}

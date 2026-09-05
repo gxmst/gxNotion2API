@@ -15,6 +15,11 @@ import (
 // that already has one executing. Callers can match it with errors.Is.
 var errConversationInProgress = errors.New("conversation already has a turn in progress")
 
+// errConversationDeleting reports a turn arriving on a conversation whose
+// upstream thread is currently being claimed for deletion. Callers can match
+// it with errors.Is.
+var errConversationDeleting = errors.New("conversation is being deleted")
+
 const maxConversationEntries = 1000
 
 type ConversationAttachment struct {
@@ -46,6 +51,7 @@ type ConversationEntry struct {
 	AutoDeleteAt      *time.Time               `json:"auto_delete_at,omitempty"`
 	Source            string                   `json:"source"`
 	Transport         string                   `json:"transport"`
+	ClientScope       string                   `json:"client_scope,omitempty"`
 	Status            string                   `json:"status"`
 	Model             string                   `json:"model"`
 	NotionModel       string                   `json:"notion_model,omitempty"`
@@ -114,6 +120,7 @@ type ConversationCreateRequest struct {
 	AutoDeleteAt     time.Time
 	Source           string
 	Transport        string
+	ClientScope      string
 	Model            string
 	NotionModel      string
 	Prompt           string
@@ -472,6 +479,7 @@ func (s *ConversationStore) Create(req ConversationCreateRequest) ConversationEn
 		AutoDeleteAt:      timePointer(req.AutoDeleteAt),
 		Source:            firstNonEmpty(req.Source, "api"),
 		Transport:         firstNonEmpty(req.Transport, "responses"),
+		ClientScope:       strings.TrimSpace(req.ClientScope),
 		Status:            "running",
 		Model:             strings.TrimSpace(req.Model),
 		NotionModel:       strings.TrimSpace(req.NotionModel),
@@ -537,7 +545,7 @@ func (s *ConversationStore) Continue(conversationID string, req ConversationCrea
 		}
 		if strings.EqualFold(strings.TrimSpace(current.Status), "deleting") {
 			s.mu.Unlock()
-			return ConversationEntry{}, fmt.Errorf("conversation %s is being deleted", conversationID)
+			return ConversationEntry{}, fmt.Errorf("%w: %s", errConversationDeleting, conversationID)
 		}
 		next := cloneConversationEntry(current)
 		next.Source = firstNonEmpty(req.Source, next.Source)
@@ -1033,7 +1041,12 @@ func (s *ConversationStore) FindByThreadID(threadID string) (ConversationEntry, 
 	return ConversationEntry{}, false
 }
 
-func (s *ConversationStore) FindContinuationBySegments(history []conversationPromptSegment) (ConversationEntry, bool) {
+// FindContinuationBySegments matches a conversation whose recorded messages end
+// with the request's history. It is a heuristic fallback for when the scoped
+// fingerprint lookup missed (for example after a client IP or user-agent
+// change), so it must never bridge different client scopes: entries carry the
+// client scope they were created with, and only an exact match is allowed.
+func (s *ConversationStore) FindContinuationBySegments(history []conversationPromptSegment, clientScope string) (ConversationEntry, bool) {
 	normalizedHistory := normalizeConversationHistorySegments(history)
 	if len(normalizedHistory) == 0 {
 		return ConversationEntry{}, false
@@ -1046,6 +1059,9 @@ func (s *ConversationStore) FindContinuationBySegments(history []conversationPro
 			continue
 		}
 		if strings.TrimSpace(entry.ThreadID) == "" || strings.TrimSpace(strings.ToLower(entry.Status)) == "running" {
+			continue
+		}
+		if entry.ClientScope != clientScope {
 			continue
 		}
 		entrySegments := conversationMessageSegments(entry)
@@ -1144,6 +1160,7 @@ func (a *App) beginConversation(preferredConversationID string, source string, t
 		AutoDeleteAt:     request.EphemeralDeleteAfter,
 		Source:           source,
 		Transport:        transport,
+		ClientScope:      request.ClientScope,
 		Model:            request.PublicModel,
 		NotionModel:      request.NotionModel,
 		Prompt:           displayPrompt,
