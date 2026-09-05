@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
-import { RefreshCcw, Trash2 } from 'lucide-react';
+import { MessageSquare, RefreshCcw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -44,6 +44,7 @@ export function ConversationsPanel({
   onSelect,
   onDelete,
   onBatchDelete,
+  onContinue,
 }: {
   conversations: ConversationSummary[];
   selectedConversationId: string;
@@ -53,6 +54,7 @@ export function ConversationsPanel({
   onSelect: (id: string) => Promise<unknown>;
   onDelete: (id: string) => Promise<unknown>;
   onBatchDelete: (ids: string[]) => Promise<unknown>;
+  onContinue: (id: string) => void;
 }) {
   const [selectedIDs, setSelectedIDs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -292,6 +294,8 @@ export function ConversationsPanel({
               title={activeConversation.title || 'Untitled conversation'}
               description={activeConversation.preview || activeConversation.request_prompt || '暂无预览'}
               actions={
+                <>
+                <Button disabled={busy || activeConversation.status === 'running' || activeConversation.remote_only} onClick={() => onContinue(activeConversation.id)}><MessageSquare className="size-4" />继续对话</Button>
                 <Button
                   variant="outline"
                   className="text-destructive hover:text-destructive"
@@ -301,6 +305,7 @@ export function ConversationsPanel({
                   <Trash2 className="size-4" />
                   删除并同步
                 </Button>
+                </>
               }
             >
               <KeyValueGrid

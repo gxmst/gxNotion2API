@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build-binaries-${{ github.ref }}
@@ -21,8 +21,55 @@ env:
   APP_NAME: notion2api
 
 jobs:
+  check-go:
+    name: Go vet and race tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Vet
+        run: go vet ./...
+      - name: Test with race detector
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race ./... -count=1 -timeout=180s
+
+  frontend:
+    name: Check and build admin UI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Install CI browser
+        run: npx playwright install --with-deps chromium
+      - name: Smoke-test admin chat
+        run: npm run test:e2e
+      - name: Upload admin UI
+        uses: actions/upload-artifact@v4
+        with:
+          name: admin-ui
+          path: frontend/out/
+          if-no-files-found: error
+          retention-days: 1
+
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: [check-go, frontend]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -70,21 +117,15 @@ jobs:
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
             version="${GITHUB_REF_NAME}"
           else
-            version="${GITHUB_REF_NAME}-${GITHUB_SHA::7}"
+            version="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA::7}"
           fi
           echo "value=${version}" >> "$GITHUB_OUTPUT"
 
-      # Run once natively (not per cross-compile target) so a regression fails
-      # the release instead of shipping.
-      - name: Test
-        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go vet ./internal/...
-          # -race needs cgo, which Linux runners have and Windows dev boxes
-          # generally do not. This is the only place the race detector runs.
-          CGO_ENABLED=1 go test -race ./internal/...
+      - name: Download checked admin UI
+        uses: actions/download-artifact@v4
+        with:
+          name: admin-ui
+          path: admin-ui
 
       - name: Build archive
         shell: bash
@@ -108,17 +149,10 @@ jobs:
           cp config.example.json "${staging_dir}/"
           cp config.docker.json "${staging_dir}/"
 
-          # The admin UI is read from static/admin on disk at request time --
-          # it is not embedded in the binary. Leaving it out of the archive gave
-          # a release that serves /v1/* fine but 404s on /admin, and an upgrade
-          # that only swaps the binary silently loses the panel.
-          if [[ -d static/admin ]]; then
-            mkdir -p "${staging_dir}/static"
-            cp -r static/admin "${staging_dir}/static/"
-          else
-            echo "::error::static/admin is missing; the release would ship without the admin UI" >&2
-            exit 1
-          fi
+          # The UI is served from disk; package the frontend built in this run.
+          test -f admin-ui/index.html
+          mkdir -p "${staging_dir}/static/admin"
+          cp -r admin-ui/. "${staging_dir}/static/admin/"
 
           if [[ "${ARCHIVE_KIND}" == "zip" ]]; then
             (
@@ -144,12 +178,15 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-assets
+          pattern: notion2api-*
           merge-multiple: true
 
       - name: Publish GitHub release assets

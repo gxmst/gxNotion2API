@@ -16,6 +16,137 @@ import (
 
 const syntheticQuotaExhaustedError = "thread 00000000-0000-4000-8000-0000000000aa failed: AI inference is not allowed. (sub_type=quota-exhausted trace_id=trace-synthetic)"
 
+func TestKnownQuotaCooldownContinuationFailover(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		disableFailover bool
+		disableBackup   bool
+		ordinaryFailure bool
+	}{
+		{name: "healthy backup"},
+		{name: "feature disabled", disableFailover: true},
+		{name: "no backup", disableBackup: true},
+		{name: "ordinary cooldown", ordinaryFailure: true},
+	} {
+		for _, streaming := range []bool{false, true} {
+			t.Run(tc.name+map[bool]string{false: "/sync", true: "/stream"}[streaming], func(t *testing.T) {
+				app := newConversationRequestTestApp(t)
+				cfg, _, _ := app.State.Snapshot()
+				cfg.Accounts = cloneAccounts(cfg.Accounts)
+				cfg.Accounts[1].Disabled = tc.disableBackup
+				if tc.disableFailover {
+					disabled := false
+					cfg.Features.ContinuationFailover = &disabled
+				}
+				if err := app.State.SaveAndApply(cfg); err != nil {
+					t.Fatal(err)
+				}
+				failure := errors.New(syntheticQuotaExhaustedError)
+				if tc.ordinaryFailure {
+					failure = errors.New("synthetic transport failure")
+				}
+				if err := app.State.finishAccountDispatchFailure("primary@example.com", time.Now(), failure, false); err != nil {
+					t.Fatal(err)
+				}
+				entry := app.State.conversations().Create(ConversationCreateRequest{Prompt: "first question"})
+				app.completeConversation(entry.ID, InferenceResult{Text: "first answer", ThreadID: "thread-primary", AccountEmail: "primary@example.com"})
+				if _, err := app.State.conversations().Continue(entry.ID, ConversationCreateRequest{Prompt: "next question"}); err != nil {
+					t.Fatal(err)
+				}
+				calls := 0
+				app.runPromptWithSessionOverride = func(_ context.Context, _ AppConfig, session SessionInfo, request PromptRunRequest, emit func(string) error) (InferenceResult, error) {
+					calls++
+					if session.UserEmail != "backup@example.com" || request.UpstreamThreadID != "" || request.continuationDraft != nil || !request.continuationFailoverAttempted {
+						t.Fatal("known exhausted account was not replaced with a fresh backup thread")
+					}
+					for _, text := range []string{"first question", "first answer", "next question"} {
+						if !strings.Contains(request.Prompt, text) {
+							t.Fatalf("failover replay lost %q", text)
+						}
+					}
+					if emit != nil {
+						if err := emit("backup answer"); err != nil {
+							return InferenceResult{}, err
+						}
+					}
+					return InferenceResult{Text: "backup answer", ThreadID: request.preparedThreadID}, nil
+				}
+				request := PromptRunRequest{Prompt: "next question", LatestUserPrompt: "next question", ConversationID: entry.ID, UpstreamThreadID: "thread-primary", PinnedAccountEmail: "primary@example.com"}
+				r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+				var result InferenceResult
+				var err error
+				var output strings.Builder
+				if streaming {
+					result, err = app.runPromptStreamWithSink(r, request, InferenceStreamSink{Text: func(delta string) error { output.WriteString(delta); return nil }})
+				} else {
+					result, err = app.runPrompt(r, request)
+				}
+				wantSuccess := !tc.disableFailover && !tc.disableBackup && !tc.ordinaryFailure
+				if wantSuccess {
+					if err != nil || result.AccountEmail != "backup@example.com" || calls != 1 || (streaming && output.String() != "backup answer") {
+						t.Fatalf("backup dispatch failed: account=%q calls=%d output=%q err=%v", result.AccountEmail, calls, output.String(), err)
+					}
+				} else if err == nil || calls != 0 || isQuotaExhaustedError(err) == tc.ordinaryFailure {
+					t.Fatalf("ineligible continuation lost its original failure: calls=%d err=%v", calls, err)
+				}
+			})
+		}
+	}
+}
+
+func TestAIUsageMergesUsageAndLimitsIndependently(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		v2         string
+		spaceLimit int
+		userLimit  int
+	}{
+		{name: "lifetime usage uses V1 limits", v2: `{"usage":{"lifetime":{"spaceUsage":40,"userUsage":30}}}`, spaceLimit: 100, userLimit: 50},
+		{name: "basic credits retain V2 limits", v2: `{"basicCredits":{"spaceUsage":40,"userUsage":30,"spaceLimit":200,"userLimit":80}}`, spaceLimit: 200, userLimit: 80},
+		{name: "explicit zero limits survive V1", v2: `{"basicCredits":{"spaceUsage":40,"userUsage":30,"spaceLimit":0,"userLimit":0}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			usage := workspaceAIUsage{}
+			if err := parseAIUsageEligibilityV2([]byte(tc.v2), &usage); err != nil {
+				t.Fatal(err)
+			}
+			if err := parseAIUsageEligibilityV1([]byte(`{"isEligible":true,"type":"metered","spaceUsage":1,"userUsage":2,"spaceLimit":100,"userLimit":50}`), &usage); err != nil {
+				t.Fatal(err)
+			}
+			if usage.SpaceUsage != 40 || usage.UserUsage != 30 || usage.SpaceLimit != tc.spaceLimit || usage.UserLimit != tc.userLimit || !usage.QuotaEnforced {
+				t.Fatalf("incorrect merged allowance: %+v", usage)
+			}
+		})
+	}
+}
+
+func TestAIUsageMissingFieldsRemainUnknown(t *testing.T) {
+	usage := workspaceAIUsage{}
+	if err := parseAIUsageEligibilityV2([]byte(`{"basicCredits":{},"premiumCredits":{}}`), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if err := parseAIUsageEligibilityV1([]byte(`{"type":"unlimited"}`), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if usage.IsEligibleKnown || usage.BasicUsageKnown || usage.BasicLimitsKnown || usage.PremiumCreditKnown || usage.QuotaEnforced {
+		t.Fatalf("missing fields were interpreted as zero or false: %+v", usage)
+	}
+	if err := parseAIUsageEligibilityV2([]byte(`{"usage":{"currentServicePeriod":{"spaceUsage":0,"userUsage":0},"lifetime":{"spaceUsage":40,"userUsage":30,"userPromotionalUsage":0},"totalCreditBalance":0},"limits":{"free":{"spaceLimit":100,"userLimit":50,"userPromotionalLimit":0}}}`), &usage); err != nil {
+		t.Fatal(err)
+	}
+	if !usage.PremiumCreditKnown || usage.PremiumCreditBalance != 0 || !usage.CurrentPeriodUsageKnown || usage.CurrentPeriodSpaceUsage != 0 || usage.SpaceUsage != 40 || usage.SpaceLimit != 100 || !usage.BasicLimitsKnown || !usage.PromotionalUsageKnown || !usage.PromotionalLimitKnown {
+		t.Fatalf("explicit zero or V2 counters were lost: %+v", usage)
+	}
+	for _, invalid := range []string{`null`, `{}`, `{"error":"denied"}`} {
+		if err := parseAIUsageEligibilityV1([]byte(invalid), &workspaceAIUsage{}); err == nil {
+			t.Fatalf("accepted invalid V1 response %s", invalid)
+		}
+		if err := parseAIUsageEligibilityV2([]byte(invalid), &workspaceAIUsage{}); err == nil {
+			t.Fatalf("accepted invalid V2 response %s", invalid)
+		}
+	}
+}
+
 func TestIsQuotaExhaustedError(t *testing.T) {
 	if !isQuotaExhaustedError(errors.New(syntheticQuotaExhaustedError)) {
 		t.Fatal("upstream quota exhaustion marker was not recognized")

@@ -57,6 +57,7 @@
     "conversation_idle_ttl_hours": 24,
     "ephemeral_all_conversations": false,
     "use_surf_main_transport": true,
+    "allow_native_transport_fallback": false,
     "timezone": "Asia/Shanghai",
     "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
     "ai_surface": "ai_module",

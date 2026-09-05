@@ -1,4 +1,4 @@
-import { apiFetch } from '@/lib/services/core/api-client';
+import { apiEventStream, apiFetch } from '@/lib/services/core/api-client';
 import type {
   AccountsPayload,
   AdminConfigPayload,
@@ -9,6 +9,9 @@ import type {
   HealthPayload,
   JsonResult,
   VersionPayload,
+  AIUsagePayload,
+  ChatRunInput,
+  ChatRunResult,
 } from './types';
 
 export const AdminService = {
@@ -38,11 +41,24 @@ export const AdminService = {
   getAccounts() {
     return apiFetch<AccountsPayload>('/admin/accounts');
   },
+  getAIUsage(refresh = false) {
+    return apiFetch<AIUsagePayload>(`/admin/accounts/ai-usage${refresh ? '?refresh=1' : ''}`);
+  },
+  async streamTestPrompt(payload: ChatRunInput, onDelta: (text: string) => void, signal: AbortSignal): Promise<ChatRunResult> {
+    let text = '';
+    const headers = await apiEventStream('/admin/test', { ...payload, stream: true }, (data) => {
+      const event = JSON.parse(data);
+      if (event.error) throw new Error(event.error.message || '生成失败');
+      const delta = event.choices?.[0]?.delta?.content;
+      if (typeof delta === 'string') { text += delta; onDelta(delta); }
+    }, signal);
+    return { conversation_id: headers.get('x-conversation-id') || payload.conversation_id || '', text };
+  },
   getConversations() {
     return apiFetch<ConversationsPayload>('/admin/conversations');
   },
-  getConversation(id: string) {
-    return apiFetch<ConversationDetailPayload>(`/admin/conversations/${encodeURIComponent(id)}`);
+  getConversation(id: string, local = false) {
+    return apiFetch<ConversationDetailPayload>(`/admin/conversations/${encodeURIComponent(id)}${local ? '?local=1' : ''}`);
   },
   deleteConversation(id: string) {
     return apiFetch<JsonResult>(`/admin/conversations/${encodeURIComponent(id)}`, {

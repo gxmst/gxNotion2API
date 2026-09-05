@@ -65,10 +65,11 @@ type FeatureConfig struct {
 	// surf/utls impersonating client instead of Go's net/http. Go's TLS and
 	// HTTP/2 fingerprints do not match the Chrome headers this client sends,
 	// which upstream can and does notice. Defaults to true when absent.
-	UseSurfMainTransport *bool    `json:"use_surf_main_transport,omitempty"`
-	AISurface            string   `json:"ai_surface"`
-	ThreadType           string   `json:"thread_type"`
-	SearchScopes         []string `json:"search_scopes"`
+	UseSurfMainTransport         *bool    `json:"use_surf_main_transport,omitempty"`
+	AllowNativeTransportFallback bool     `json:"allow_native_transport_fallback,omitempty"`
+	AISurface                    string   `json:"ai_surface"`
+	ThreadType                   string   `json:"thread_type"`
+	SearchScopes                 []string `json:"search_scopes"`
 }
 
 type ResponsesConfig struct {

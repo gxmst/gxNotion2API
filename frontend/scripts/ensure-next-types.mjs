@@ -3,6 +3,7 @@ import path from 'node:path';
 
 const root = process.cwd();
 const files = [
+  ['.next', 'types', 'routes.d.ts'],
   ['.next', 'types', 'cache-life.d.ts'],
   ['.next', 'types', 'app', 'layout.ts'],
   ['.next', 'types', 'app', 'page.ts'],

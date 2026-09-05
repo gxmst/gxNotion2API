@@ -71,14 +71,17 @@ func buildSillyTavernContext(payload map[string]any) (sillyTavernContext, error)
 	stableHidden := normalizeSillyTavernHiddenPrompt(normalized.HiddenPrompt)
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
 	return sillyTavernContext{
-		Mode:            mode,
-		ProfileKey:      buildSillyTavernProfileKey(payload, stableHidden),
-		Normalized:      normalized,
-		LatestPrompt:    latestPrompt,
-		DisplayPrompt:   firstNonEmpty(strings.TrimSpace(normalized.DisplayPrompt), latestPrompt, strings.TrimSpace(normalized.Prompt)),
-		StableHidden:    stableHidden,
-		RequestHidden:   requestHidden,
-		RequestSegments: normalizeConversationHistorySegments(normalized.Segments),
+		Mode:          mode,
+		ProfileKey:    buildSillyTavernProfileKey(payload, stableHidden),
+		Normalized:    normalized,
+		LatestPrompt:  latestPrompt,
+		DisplayPrompt: firstNonEmpty(strings.TrimSpace(normalized.DisplayPrompt), latestPrompt, strings.TrimSpace(normalized.Prompt)),
+		StableHidden:  stableHidden,
+		RequestHidden: requestHidden,
+		// Keep interior whitespace intact for branch identity. The compact form
+		// remains suitable for display/fingerprint hints, but edited history
+		// must never be mistaken for the old cached turn.
+		RequestSegments: exactConversationSegments(normalized.Segments),
 	}, nil
 }
 
@@ -448,7 +451,7 @@ func conversationSegmentsEqual(a []conversationPromptSegment, b []conversationPr
 
 func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string]any, ctx sillyTavernContext, fingerprint string, clientScope string) (sillyTavernContinuationMatch, bool) {
 	if ctx.Mode == sillyTavernModeQuiet || ctx.Mode == sillyTavernModeImpersona {
-		return sillyTavernContinuationMatch{SuppressPersist: true}, true
+		return sillyTavernContinuationMatch{}, false
 	}
 
 	if ctx.Mode == sillyTavernModeContinue {
@@ -458,7 +461,7 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				target.Conversation = entry
 			}
 			if state, err := a.State.loadConversationContinuationStateByConversationID(explicitConversationID); err == nil && state != nil {
-				target.Session = state
+				target = continuationTargetWithSession(target.Conversation, state)
 				if strings.TrimSpace(target.Conversation.ID) == "" {
 					target.Conversation = ConversationEntry{
 						ID:           strings.TrimSpace(state.Session.ConversationID),
@@ -468,9 +471,9 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				}
 			}
 			if strings.TrimSpace(target.Conversation.ThreadID) != "" {
+				target = continuationTargetWithSession(target.Conversation, target.Session)
 				return sillyTavernContinuationMatch{
 					Target:            target,
-					ForceRepeatTurn:   true,
 					ResolvedByBinding: target.Session != nil,
 				}, true
 			}
@@ -483,7 +486,7 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				target.Conversation = entry
 			}
 			if state, err := a.State.loadConversationContinuationStateByThreadID(explicitThreadID); err == nil && state != nil {
-				target.Session = state
+				target = continuationTargetWithSession(target.Conversation, state)
 				if strings.TrimSpace(target.Conversation.ID) == "" {
 					target.Conversation = ConversationEntry{
 						ID:           strings.TrimSpace(state.Session.ConversationID),
@@ -493,9 +496,9 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				}
 			}
 			if strings.TrimSpace(target.Conversation.ThreadID) != "" {
+				target = continuationTargetWithSession(target.Conversation, target.Session)
 				return sillyTavernContinuationMatch{
 					Target:            target,
-					ForceRepeatTurn:   true,
 					ResolvedByBinding: target.Session != nil,
 				}, true
 			}
@@ -504,11 +507,7 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 
 	general, ok := a.resolveContinuationConversationWithExplicit("", fingerprint, clientScope, ctx.RequestSegments, requestedConversationID(r, payload), requestedThreadID(r, payload))
 	if ok {
-		match := sillyTavernContinuationMatch{Target: general}
-		if ctx.Mode == sillyTavernModeContinue {
-			match.ForceRepeatTurn = true
-		}
-		return match, true
+		return sillyTavernContinuationMatch{Target: general}, true
 	}
 
 	bindings, err := a.State.loadRecentSillyTavernBindings(ctx.ProfileKey, 16)
@@ -519,6 +518,13 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 	requestHistory := ctx.RequestSegments
 	requestBeforeLatestUser := stripTrailingRole(requestHistory, "user")
 	for _, binding := range bindings {
+		entry, found := a.State.conversations().Get(binding.ConversationID)
+		if !found || entry.ClientScope != clientScope {
+			continue
+		}
+		if !conversationHistoryCompatible(entry, ctx.RequestSegments, false) {
+			continue
+		}
 		storedTranscript := normalizeConversationHistorySegments(binding.Transcript)
 		if len(storedTranscript) == 0 || strings.TrimSpace(binding.ThreadID) == "" {
 			continue
@@ -527,7 +533,9 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 		forceRepeat := false
 		switch ctx.Mode {
 		case sillyTavernModeContinue:
-			forceRepeat = conversationSegmentsEqual(storedTranscript, requestHistory) || conversationSegmentSuffixMatch(storedTranscript, requestHistory)
+			if !conversationSegmentSuffixMatch(storedTranscript, requestHistory) {
+				continue
+			}
 		default:
 			if len(requestBeforeLatestUser) > 0 && conversationSegmentSuffixMatch(storedTranscript, requestBeforeLatestUser) {
 				forceRepeat = false
@@ -538,20 +546,9 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 			}
 		}
 
-		target := continuationTarget{
-			Conversation: ConversationEntry{
-				ID:           strings.TrimSpace(binding.ConversationID),
-				ThreadID:     strings.TrimSpace(binding.ThreadID),
-				AccountEmail: strings.TrimSpace(binding.AccountEmail),
-			},
-		}
+		target := continuationTarget{Conversation: entry}
 		if state, stateErr := a.State.loadConversationContinuationStateByConversationID(binding.ConversationID); stateErr == nil && state != nil {
-			target.Session = state
-		}
-		if target.Conversation.ID != "" {
-			if existing, found := a.State.conversations().Get(target.Conversation.ID); found {
-				target.Conversation = existing
-			}
+			target = continuationTargetWithSession(entry, state)
 		}
 		return sillyTavernContinuationMatch{
 			Target:            target,

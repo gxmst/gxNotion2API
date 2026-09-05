@@ -78,6 +78,8 @@ func (cfg AppConfig) ResolveProxyPolicyForAccount(email string) ProxyPolicy {
 	}
 	if value := strings.TrimSpace(account.ProxyURL); value != "" {
 		policy.URL = value
+		policy.HTTPURL = value
+		policy.HTTPSURL = value
 	}
 	if value := strings.TrimSpace(account.ProxyHTTPURL); value != "" {
 		policy.HTTPURL = value

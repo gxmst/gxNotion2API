@@ -126,13 +126,119 @@ func TestRequestMatchesConversationFinalTurnRejectsEditedMessage(t *testing.T) {
 	if requestMatchesConversationFinalTurn(request, []conversationPromptSegment{{Role: "user", Text: "explain B"}}, conversation) {
 		t.Fatal("an edited final message must not match")
 	}
-	withAttachment := PromptRunRequest{Attachments: []InputAttachment{{Name: "notes.txt", ContentType: "text/plain"}}}
+	withAttachment := PromptRunRequest{Attachments: []InputAttachment{{Name: "notes.txt", ContentType: "text/plain", Data: []byte("notes")}}}
 	if requestMatchesConversationFinalTurn(withAttachment, []conversationPromptSegment{{Role: "user", Text: "explain A"}}, conversation) {
 		t.Fatal("an attachment change must not match")
 	}
-	conversation.Messages[0].Attachments = []ConversationAttachment{{Name: "notes.txt", ContentType: "text/plain"}}
+	conversation.Messages[0].Attachments = summarizeInputAttachments(withAttachment.Attachments)
 	if !requestMatchesConversationFinalTurn(withAttachment, []conversationPromptSegment{{Role: "user", Text: "explain A"}}, conversation) {
 		t.Fatal("the same attachment set must match")
+	}
+}
+
+func TestContinuationFallbackClientIdentity(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		peer      string
+		userAgent string
+		firstID   string
+		secondID  string
+		wantMatch bool
+	}{
+		{name: "same client new port", peer: "192.0.2.1:2000", userAgent: "client-a", wantMatch: true},
+		{name: "different peer", peer: "192.0.2.2:2000", userAgent: "client-a"},
+		{name: "different user agent", peer: "192.0.2.1:2000", userAgent: "client-b"},
+		{name: "different explicit clients", peer: "192.0.2.1:2000", userAgent: "client-a", firstID: "a", secondID: "b"},
+		{name: "explicit identity survives connection change", peer: "192.0.2.2:2000", userAgent: "client-b", firstID: "a", secondID: "a", wantMatch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			app := &App{State: &ServerState{Conversations: newConversationStore()}}
+			first := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			first.RemoteAddr = "192.0.2.1:1000"
+			first.Header.Set("User-Agent", "client-a")
+			first.Header.Set("X-Client-ID", tc.firstID)
+			second := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			second.RemoteAddr = tc.peer
+			second.Header.Set("User-Agent", tc.userAgent)
+			second.Header.Set("X-Client-ID", tc.secondID)
+			scope := requestClientContinuationScope(first, "openai", "", "chat_completions", "gpt-5.4", "")
+			entry := app.State.conversations().Create(ConversationCreateRequest{Prompt: "hello", ClientScope: scope})
+			app.State.conversations().Complete(entry.ID, InferenceResult{Text: "hi", ThreadID: "thread-first-client"})
+			segments := []conversationPromptSegment{{Role: "user", Text: "hello"}, {Role: "assistant", Text: "hi"}, {Role: "user", Text: "next question"}}
+			fingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(second, "openai", "", "chat_completions", "gpt-5.4", ""), "", segments)
+			clientScope := requestClientContinuationScope(second, "openai", "", "chat_completions", "gpt-5.4", "")
+			target, matched := app.resolveContinuationConversationWithExplicit("", fingerprint, clientScope, segments, "", "")
+			if matched != tc.wantMatch || (matched && target.Conversation.ID != entry.ID) {
+				t.Fatalf("matched=%v want=%v target=%q", matched, tc.wantMatch, target.Conversation.ID)
+			}
+		})
+	}
+}
+
+func TestSillyTavernBindingFallbackRespectsClientScope(t *testing.T) {
+	for _, scopeKind := range []string{"same", "different", "legacy"} {
+		t.Run(scopeKind, func(t *testing.T) {
+			app := newConversationRequestTestApp(t)
+			payload := map[string]any{"type": "normal", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+			ctx, err := buildSillyTavernContext(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			clientScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", "gpt-5.4", "")
+			entryScope := clientScope
+			if scopeKind == "different" {
+				entryScope += "\nclient=another"
+			} else if scopeKind == "legacy" {
+				entryScope = ""
+			}
+			entry := app.State.conversations().Create(ConversationCreateRequest{Prompt: "hello", ClientScope: entryScope})
+			app.completeConversation(entry.ID, InferenceResult{Text: "hi", ThreadID: "thread-binding"})
+			app.persistSillyTavernBinding(entry.ID, ctx.ProfileKey, ctx.Mode)
+			// A single user message cannot match the general history fallback.
+			// The saved binding is the only possible implicit continuation here.
+			target, matched := app.resolveSillyTavernContinuation(r, payload, ctx, "missing-fingerprint", clientScope)
+			if matched != (scopeKind == "same") || (matched && target.Target.Conversation.ID != entry.ID) {
+				t.Fatalf("binding bypassed client scope: matched=%v target=%q", matched, target.Target.Conversation.ID)
+			}
+		})
+	}
+}
+
+func TestRepeatTurnRequiresPersistedAttachmentContent(t *testing.T) {
+	original := InputAttachment{Name: "image.png", ContentType: "image/png", Data: []byte("image-A")}
+	conversation := ConversationEntry{Messages: []ConversationMessage{{Role: "user", Content: "describe this", Attachments: summarizeInputAttachments([]InputAttachment{original})}}}
+	raw, err := json.Marshal(conversation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored ConversationEntry
+	if err := json.Unmarshal(raw, &restored); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		attachment InputAttachment
+		legacy     bool
+		wantMatch  bool
+	}{
+		{name: "same inline bytes after reload", attachment: original, wantMatch: true},
+		{name: "same name different bytes", attachment: InputAttachment{Name: original.Name, ContentType: original.ContentType, Data: []byte("image-B")}},
+		{name: "different filename", attachment: InputAttachment{Name: "other.png", ContentType: original.ContentType, Data: original.Data}},
+		{name: "mutable URL", attachment: InputAttachment{Name: original.Name, ContentType: original.ContentType, URL: "https://example.invalid/image.png"}},
+		{name: "mutable path", attachment: InputAttachment{Name: original.Name, ContentType: original.ContentType, Path: "image.png"}},
+		{name: "legacy record without digest", attachment: original, legacy: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := cloneConversationEntry(&restored)
+			if tc.legacy {
+				entry.Messages[0].Attachments[0].ContentSHA256 = ""
+			}
+			matched := requestMatchesConversationFinalTurn(PromptRunRequest{Attachments: []InputAttachment{tc.attachment}}, []conversationPromptSegment{{Role: "user", Text: "describe this"}}, entry)
+			if matched != tc.wantMatch {
+				t.Fatalf("attachment replay match=%v want=%v", matched, tc.wantMatch)
+			}
+		})
 	}
 }
 
@@ -217,13 +323,14 @@ func TestChatCompletionsRepeatTurnRoundTripsPersistedFingerprint(t *testing.T) {
 
 	modelID := "gpt-5.4"
 	entry := state.conversations().Create(ConversationCreateRequest{
-		Source:    "api",
-		Transport: "chat_completions",
-		Model:     modelID,
-		Prompt:    "A",
+		Source:       "api",
+		Transport:    "chat_completions",
+		Model:        modelID,
+		Prompt:       "A",
+		UseWebSearch: cfg.Features.UseWebSearch,
 	})
 	state.conversations().Complete(entry.ID, InferenceResult{Text: "X", ThreadID: "thread-e2e", AccountEmail: "seed@example.com"})
-	if _, err := state.conversations().Continue(entry.ID, ConversationCreateRequest{Prompt: "B"}); err != nil {
+	if _, err := state.conversations().Continue(entry.ID, ConversationCreateRequest{Prompt: "B", UseWebSearch: cfg.Features.UseWebSearch}); err != nil {
 		t.Fatal(err)
 	}
 	state.conversations().Complete(entry.ID, InferenceResult{Text: "Y", ThreadID: "thread-e2e", AccountEmail: "seed@example.com"})

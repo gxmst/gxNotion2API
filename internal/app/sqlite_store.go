@@ -186,6 +186,8 @@ func (s *SQLiteStore) init() error {
 		`ALTER TABLE responses ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE responses ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE responses ADD COLUMN account_email TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE conversation_sessions ADD COLUMN space_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE conversation_sessions ADD COLUMN space_view_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			lower := strings.ToLower(err.Error())
@@ -488,8 +490,8 @@ func (s *SQLiteStore) SaveConversationSession(session ConversationSession) error
 		`INSERT INTO conversation_sessions(
 			id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id,
 			original_datetime, model_used, turn_count, raw_message_count, status,
-			created_at, updated_at, last_used_at, deleted_at
-		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_at, updated_at, last_used_at, deleted_at, space_id, space_view_id
+		) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			conversation_id=excluded.conversation_id,
 			fingerprint=excluded.fingerprint,
@@ -505,7 +507,9 @@ func (s *SQLiteStore) SaveConversationSession(session ConversationSession) error
 			created_at=excluded.created_at,
 			updated_at=excluded.updated_at,
 			last_used_at=excluded.last_used_at,
-			deleted_at=excluded.deleted_at`,
+			deleted_at=excluded.deleted_at,
+			space_id=excluded.space_id,
+			space_view_id=excluded.space_view_id`,
 		strings.TrimSpace(session.ID),
 		strings.TrimSpace(session.ConversationID),
 		strings.TrimSpace(session.Fingerprint),
@@ -522,6 +526,8 @@ func (s *SQLiteStore) SaveConversationSession(session ConversationSession) error
 		session.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		session.LastUsedAt.UTC().Format(time.RFC3339Nano),
 		formatSQLiteTime(session.DeletedAt),
+		strings.TrimSpace(session.SpaceID),
+		strings.TrimSpace(session.SpaceViewID),
 	)
 	return err
 }
@@ -551,19 +557,19 @@ func (s *SQLiteStore) SaveConversationSessionStep(step ConversationSessionStep) 
 }
 
 func (s *SQLiteStore) LoadConversationSessionByConversationID(conversationID string) (ConversationSession, bool, error) {
-	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at FROM conversation_sessions WHERE conversation_id = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(conversationID))
+	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at, space_id, space_view_id FROM conversation_sessions WHERE conversation_id = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(conversationID))
 }
 
 func (s *SQLiteStore) LoadConversationSessionByThreadID(threadID string) (ConversationSession, bool, error) {
-	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at FROM conversation_sessions WHERE thread_id = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(threadID))
+	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at, space_id, space_view_id FROM conversation_sessions WHERE thread_id = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(threadID))
 }
 
 func (s *SQLiteStore) LoadConversationSessionByFingerprint(fingerprint string) (ConversationSession, bool, error) {
-	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at FROM conversation_sessions WHERE fingerprint = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(fingerprint))
+	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at, space_id, space_view_id FROM conversation_sessions WHERE fingerprint = ? AND status = 'active' AND deleted_at = '' ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(fingerprint))
 }
 
 func (s *SQLiteStore) LoadConversationSessionBySessionID(sessionID string) (ConversationSession, bool, error) {
-	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at FROM conversation_sessions WHERE id = ? ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(sessionID))
+	return s.loadConversationSession(`SELECT id, conversation_id, fingerprint, thread_id, account_email, config_id, context_id, original_datetime, model_used, turn_count, raw_message_count, status, created_at, updated_at, last_used_at, deleted_at, space_id, space_view_id FROM conversation_sessions WHERE id = ? ORDER BY updated_at DESC LIMIT 1`, strings.TrimSpace(sessionID))
 }
 
 func (s *SQLiteStore) loadConversationSession(query string, arg string) (ConversationSession, bool, error) {
@@ -595,6 +601,8 @@ func (s *SQLiteStore) loadConversationSession(query string, arg string) (Convers
 		&updatedAtText,
 		&lastUsedAtText,
 		&deletedAtText,
+		&session.SpaceID,
+		&session.SpaceViewID,
 	); err != nil {
 		if err == sql.ErrNoRows {
 			return ConversationSession{}, false, nil

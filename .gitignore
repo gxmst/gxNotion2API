@@ -34,18 +34,20 @@ node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/test-results/
+frontend/playwright-report/
+_tmp_mock_backend.cjs
 *.tsbuildinfo
 
 # Local test sources stay out of git
 *_test.go
-# ...except the Go tests for internal/app, which are the only thing standing
-# between a refactor and a silent regression. CI runs `go build` only, so these
-# have to at least survive a clone.
+# Keep application regression tests available to CI.
 !internal/app/*_test.go
 *.test.ts
 *.test.tsx
 *.spec.ts
 *.spec.tsx
 __tests__/
+!frontend/tests/*.spec.ts
 WEBUI_DEVELOPMENT_GUIDE.md
 .serena/

@@ -128,6 +128,12 @@ func resolveStaticProxyForUpstream(resolver *ProxyResolver, accountEmail string,
 // Notion from the operator's real address.
 type failingRoundTripper struct{}
 
+type unavailableSurfTransport struct{ err error }
+
+func (t unavailableSurfTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, t.err
+}
+
 func (failingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return nil, errors.New("upstream proxy resolution failed; refusing to send requests without it")
 }

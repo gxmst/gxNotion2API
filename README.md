@@ -125,7 +125,7 @@ HTTP 请求优先顺序：
 
 ### 额度与缓存复用
 
-上游按缓存读取计费，复用同一个会话线程比每次新建便宜得多。相关开关：
+同一上游线程会保留上下文，官方也建议在同一线程中继续对话。复用线程能减少历史重放，但具体扣额度、缓存命中和模型计费以 Notion 当前规则为准，本项目不会据此推算剩余额度。相关开关：
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
@@ -133,8 +133,13 @@ HTTP 请求优先顺序：
 | `features.conversation_idle_ttl_hours` | `24` | 会话空闲这么久后连同上游线程一起删除。设 `0` 表示永不删除。留空走默认值。 |
 | `features.ephemeral_all_conversations` | `false` | 开启后**每一轮**对话结束就删线程，线程创建量翻倍且缓存归零。与省额度的目标冲突，除非你要求不留痕，否则别开。 |
 | `features.ephemeral_ttl_seconds` | 未设置 | 仅作用于 `ephemeral_all_conversations` 标记的会话。不设置时该路径用 2 分钟。 |
+| `features.continuation_failover` | `true` | 绑定账号的上游 AI 额度耗尽后，将对话历史重放到备用账号的新线程；没有可用备用账号时保留原始额度错误。 |
 
-会话延续按「显式 conversation_id → `previous_response_id` → thread_id → 请求指纹 → 历史段落」逐级匹配，指纹取隐藏提示词加首条用户消息，因此每轮重发完整历史的客户端（如 SillyTavern）能自动命中同一线程。
+会话延续按「显式 conversation_id → `previous_response_id` → thread_id → 请求指纹 → 历史段落」逐级匹配。隐式匹配按客户端、接口、模型和指定账号划分范围；指纹还包含隐藏提示词及开头的用户、助手消息，因此每轮重发完整历史的客户端（如 SillyTavern）能自动命中同一线程。
+
+客户端身份优先取 `X-Client-ID`，其次是 `X-Session-ID`、`OpenAI-Organization`；缺省使用连接 IP 和 User-Agent。同一反代或 NAT 下、使用相同 User-Agent 的不同客户端应设置不同的身份头，或显式使用独立的 `conversation_id`。提供稳定身份头后，IP 或 User-Agent 改变仍可通过历史匹配续写；旧记录缺少匹配范围时，可用显式会话 ID 继续。
+
+完全重复的最后一轮可回放已有答案，SillyTavern 的 `continue` 始终生成新内容。附件回放需要匹配持久化的内联内容 SHA-256；旧记录没有摘要、附件使用 URL 或本地路径时，会重新执行请求，避免同名文件或同一地址的内容变化后返回旧答案。
 
 SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书触发、代打），一次性使用，会独立按 10 分钟回收，不受上面两个 ephemeral 开关影响。
 
@@ -142,7 +147,8 @@ SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书�
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| `features.use_surf_main_transport` | `true` | 主请求路径走 surf/utls 的 Chrome 伪装。关闭后回到 Go 原生 `net/http`，其 TLS 与 HTTP/2 指纹与请求头声明的 Chrome 不一致，上游会以 `sub_type=trust-rule-denied` 拒绝。传输层失败时仍会自动用原生客户端重试一次。 |
+| `features.use_surf_main_transport` | `true` | 主请求路径走 surf/utls 的 Chrome 伪装。关闭后回到 Go 原生 `net/http`，其 TLS 与 HTTP/2 指纹与请求头声明的 Chrome 不一致，上游可能以 `sub_type=trust-rule-denied` 拒绝。 |
+| `features.allow_native_transport_fallback` | `false` | surf/utls 构造或请求失败时是否允许回退到 Go 原生传输。默认关闭以避免伪装请求意外改变指纹；只在明确接受该取舍时开启。 |
 | `features.timezone` | `Asia/Shanghai` | 上报给上游的 IANA 时区。 |
 | `features.accept_language` | 跟随时区推导 | `Accept-Language` 头。留空时按时区推导匹配值，避免出现「Windows/en-US 浏览器却报 Asia/Shanghai」这类组合。账号 cookie 里的 `NEXT_LOCALE` / `notion_locale` 优先级更高。 |
 

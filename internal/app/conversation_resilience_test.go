@@ -71,7 +71,7 @@ func TestPreparePromptExecutionTargetPersistsThreadAndAccount(t *testing.T) {
 	entry := state.conversations().Create(ConversationCreateRequest{Prompt: "hello"})
 	request := PromptRunRequest{ConversationID: entry.ID, Prompt: "hello"}
 
-	app.preparePromptExecutionTarget(&request, "first@example.com")
+	app.preparePromptExecutionTarget(&request, "first@example.com", "space-first")
 	if request.preparedThreadID == "" {
 		t.Fatal("prepared thread ID was not assigned")
 	}
@@ -84,7 +84,7 @@ func TestPreparePromptExecutionTargetPersistsThreadAndAccount(t *testing.T) {
 	}
 
 	preparedThreadID := request.preparedThreadID
-	app.preparePromptExecutionTarget(&request, "second@example.com")
+	app.preparePromptExecutionTarget(&request, "second@example.com", "space-second")
 	got, _ = state.conversations().Get(entry.ID)
 	if request.preparedThreadID != preparedThreadID || got.ThreadID != preparedThreadID {
 		t.Fatalf("prepared thread changed across dispatch attempts: request=%q conversation=%q", request.preparedThreadID, got.ThreadID)

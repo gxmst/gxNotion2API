@@ -53,6 +53,15 @@ func loadSessionInfoForAccountRefresh(cfg AppConfig, account NotionAccount) (Ses
 	account = ensureAccountPaths(cfg, account)
 	session, err := loadSessionInfo(account.ProbeJSON, firstNonEmpty(account.UserName, cfg.UserName), firstNonEmpty(account.SpaceName, cfg.SpaceName))
 	if err == nil {
+		if spaceID := strings.TrimSpace(account.SpaceID); spaceID != "" {
+			if spaceID != session.SpaceID {
+				session.SpaceViewID = ""
+				session.SpaceName = ""
+			}
+			session.SpaceID = spaceID
+			session.SpaceViewID = firstNonEmpty(account.SpaceViewID, session.SpaceViewID)
+			session.SpaceName = firstNonEmpty(account.SpaceName, session.SpaceName)
+		}
 		return session, nil
 	}
 	storage, storageErr := readLoginStorageState(account.StorageStatePath)
@@ -318,7 +327,7 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 	if testHookTryRefreshAccount != nil {
 		tryRefresh = testHookTryRefreshAccount
 	}
-	saveAndApply := s.SaveAndApply
+	saveAndApply := s.saveAndApplyLocked
 	if testHookSaveAndApply != nil {
 		saveAndApply = func(cfg AppConfig) error {
 			return testHookSaveAndApply(s, cfg)

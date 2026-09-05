@@ -19,6 +19,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
+import { AIUsagePanel } from '@/components/admin/ai-usage-panel';
 import {
   EmptyHint,
   InfoCard,
@@ -100,8 +101,8 @@ function safeParseProbeJSON(raw: string): ProbeDraft | null {
 }
 
 function quotaText(item: AccountItem) {
-  if (!item.quota_limited) return 'unlimited';
-  return `${item.remaining_quota ?? 0}/${item.hourly_quota ?? 0}`;
+  if (!item.quota_limited) return '本地未限速';
+  return `${item.remaining_quota ?? 0}/${item.hourly_quota ?? 0} 次/小时`;
 }
 
 function DetailField({
@@ -156,7 +157,7 @@ function AccountListItem({
         <ChevronRight className={['mt-0.5 size-4 shrink-0', selected ? 'text-primary' : 'text-muted-foreground'].join(' ')} />
       </div>
       <div className="mt-3 grid gap-2 text-xs leading-5 text-muted-foreground sm:grid-cols-2">
-        <div>quota · {quotaText(item)}</div>
+        <div>本地限速 · {quotaText(item)}</div>
         <div>prio · {item.priority ?? 0}</div>
         <div>last login · {formatMaybeDate(item.last_login_at)}</div>
         <div>space · {item.space_name || item.space_id || '-'}</div>
@@ -449,6 +450,8 @@ export function AccountsPanel({
         ))}
       </div>
 
+      <AIUsagePanel />
+
       <div className="grid gap-6 2xl:grid-cols-[minmax(0,1.04fr)_360px]">
         <div className="min-w-0 space-y-6">
           <InfoCard
@@ -710,7 +713,7 @@ export function AccountsPanel({
                               className={FIELD_CLASS}
                             />
                           </DetailField>
-                          <DetailField label="Hourly Quota" hint="0 表示不限制。">
+                          <DetailField label="本地每小时请求上限" hint="0 表示不限制。">
                             <Input
                               type="number"
                               min="0"
@@ -752,7 +755,7 @@ export function AccountsPanel({
 
                     <Subsection eyebrow="Runtime" title="运行态摘要" description="最近登录、使用与失败记录。">
                       <div className="grid gap-3 sm:grid-cols-2">
-                        <MetaTile label="Quota" value={quotaText(selectedAccount)} />
+                        <MetaTile label="本地请求限速" value={quotaText(selectedAccount)} />
                         <MetaTile
                           label="Cooldown"
                           value={selectedAccount.cooldown_active ? `${selectedAccount.cooldown_remaining_sec || 0}s` : 'ready'}

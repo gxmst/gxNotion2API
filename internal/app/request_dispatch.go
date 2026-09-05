@@ -190,6 +190,11 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 	}
 	account = ensureAccountPaths(cfg, account)
 	if eligible, reason := accountDispatchEligible(cfg, account, now); !eligible {
+		if reason == "cooldown" {
+			if quotaErr := accountQuotaCooldownError(account, now); quotaErr != nil {
+				return nil, quotaErr
+			}
+		}
 		return nil, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
 	}
 	return []NotionAccount{account}, nil
@@ -217,6 +222,8 @@ func (a *App) buildContinuationFailoverRequest(request PromptRunRequest) (Prompt
 	failover.continuationDraft = nil
 	failover.continuationScaffold = nil
 	failover.PinnedAccountEmail = ""
+	failover.PinnedSpaceID = ""
+	failover.HiddenPrompt = firstNonEmpty(request.HiddenPrompt, conversation.HiddenPrompt)
 	failover.AllowPinnedAccountFallback = false
 	failover.preparedThreadID = ""
 	failover.onThreadPrepared = nil
@@ -224,6 +231,14 @@ func (a *App) buildContinuationFailoverRequest(request PromptRunRequest) (Prompt
 	failover.replayResult = nil
 	failover.attachmentThreadReady = false
 	failover.Prompt = buildFreshThreadReplayPromptFromConversation(conversation, request.LatestUserPrompt, request.Attachments, request.Prompt)
+	if history := exactConversationSegments(request.HistorySegments); len(history) > 1 {
+		latest := latestReplayPrompt(request.LatestUserPrompt, request.Attachments, "")
+		last := history[len(history)-1]
+		if latest != "" && (last.Role != "user" || last.Text != latest) {
+			history = append(history, conversationPromptSegment{Role: "user", Text: latest})
+		}
+		failover.Prompt = buildConversationTranscriptPrompt(history)
+	}
 	failover.continuationFailoverAttempted = true
 	return failover, true
 }
@@ -351,7 +366,7 @@ func (a *App) probeAccountProtocolHealth(ctx context.Context, cfg AppConfig, ses
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, dispatchProtocolProbeTimeout(cfg))
 	defer cancel()
-	client := newNotionAIClient(session, cfg, "")
+	client := newNotionAIClient(session, cfg, accountEmail)
 	_, err := client.listInferenceTranscripts(probeCtx)
 	if isDispatchContextAbort(probeCtx, err) {
 		a.markAccountProtocolProbeSuccess(accountKey, now)
@@ -388,9 +403,12 @@ func (a *App) loadPrimarySession(ctx context.Context, cfg AppConfig, snapshot Se
 			}
 		}
 	}
-	probePath, userName, spaceName, _ := cfg.ResolveSessionTarget()
+	probePath, userName, spaceName, activeEmail := cfg.ResolveSessionTarget()
 	if strings.TrimSpace(probePath) == "" {
 		return SessionInfo{}, fmt.Errorf("no active notion session configured; login or activate an account first")
+	}
+	if account, _, found := cfg.FindAccount(activeEmail); found {
+		return loadSessionInfoForAccountRefresh(cfg, account)
 	}
 	return loadSessionInfo(probePath, userName, spaceName)
 }
@@ -409,7 +427,7 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 	if err != nil {
 		return InferenceResult{}, err
 	}
-	if err := a.probeAccountProtocolHealth(ctx, cfg, session, ""); err != nil {
+	if err := a.probeAccountProtocolHealth(ctx, cfg, session, activeEmail); err != nil {
 		return InferenceResult{}, err
 	}
 
@@ -424,7 +442,7 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 		return onDelta(delta)
 	}
 
-	a.preparePromptExecutionTarget(&request, activeEmail)
+	a.preparePromptExecutionTarget(&request, activeEmail, session.SpaceID)
 	result, err := a.runPromptWithSession(ctx, cfg, session, activeEmail, request, wrappedDelta)
 	if err == nil {
 		result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
@@ -435,7 +453,7 @@ func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest,
 			a.invalidateDispatchProbeCache()
 			_, refreshed, _ := a.State.Snapshot()
 			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
-				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, ""); probeErr != nil {
+				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, activeEmail); probeErr != nil {
 					return InferenceResult{}, probeErr
 				}
 				result, retryErr := a.runPromptWithSession(ctx, cfg, refreshed, activeEmail, request, wrappedDelta)
@@ -458,7 +476,7 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 	if err != nil {
 		return InferenceResult{}, err
 	}
-	if err := a.probeAccountProtocolHealth(ctx, cfg, session, ""); err != nil {
+	if err := a.probeAccountProtocolHealth(ctx, cfg, session, activeEmail); err != nil {
 		return InferenceResult{}, err
 	}
 
@@ -482,7 +500,7 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 		return sink.EmitKeepAlive()
 	}
 
-	a.preparePromptExecutionTarget(&request, activeEmail)
+	a.preparePromptExecutionTarget(&request, activeEmail, session.SpaceID)
 	result, err := a.runPromptWithSessionWithSink(ctx, cfg, session, activeEmail, request, InferenceStreamSink{
 		Text:            wrappedText,
 		Reasoning:       wrappedReasoning,
@@ -498,7 +516,7 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 			a.invalidateDispatchProbeCache()
 			_, refreshed, _ := a.State.Snapshot()
 			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
-				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, ""); probeErr != nil {
+				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, activeEmail); probeErr != nil {
 					return InferenceResult{}, probeErr
 				}
 				result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshed, activeEmail, request, InferenceStreamSink{
@@ -541,6 +559,11 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 		candidates, err = resolveDispatchCandidates(cfg, request, now)
 	}
 	if err != nil {
+		if isQuotaExhaustedError(err) && cfg.ResolveContinuationFailover() {
+			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
+				return a.runPromptWithAccountPool(r, next, onDelta)
+			}, err)
+		}
 		return InferenceResult{}, err
 	}
 	candidateEmails := make([]string, 0, len(candidates))
@@ -575,11 +598,14 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 		}
 		if !started {
 			a.State.ReleaseAccountDispatchSlot(original.Email)
+			if quotaErr := accountQuotaCooldownError(account, time.Now()); quotaErr != nil {
+				lastErr = quotaErr
+			}
 			continue
 		}
 		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
-			a.preparePromptExecutionTarget(&request, account.Email)
+			a.preparePromptExecutionTarget(&request, account.Email, session.SpaceID)
 			result, runErr := a.runPromptWithSession(ctx, cfg, session, account.Email, request, wrappedDelta)
 			if runErr == nil {
 				if slotAcquired {
@@ -598,7 +624,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			a.State.ReleaseAccountDispatchSlot(account.Email)
 			slotAcquired = false
 		}
-		if isDispatchContextAbort(ctx, err) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
 			return InferenceResult{}, err
 		}
 
@@ -648,7 +674,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 				}
 			}
 		}
-		if isDispatchContextAbort(ctx, err) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
 			return InferenceResult{}, err
 		}
 
@@ -705,6 +731,11 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 		candidates, err = resolveDispatchCandidates(cfg, request, now)
 	}
 	if err != nil {
+		if isQuotaExhaustedError(err) && cfg.ResolveContinuationFailover() {
+			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
+				return a.runPromptWithAccountPoolWithSink(r, next, sink)
+			}, err)
+		}
 		return InferenceResult{}, err
 	}
 	candidateEmails := make([]string, 0, len(candidates))
@@ -748,11 +779,14 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 		}
 		if !started {
 			a.State.ReleaseAccountDispatchSlot(original.Email)
+			if quotaErr := accountQuotaCooldownError(account, time.Now()); quotaErr != nil {
+				lastErr = quotaErr
+			}
 			continue
 		}
 		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
 		if err == nil {
-			a.preparePromptExecutionTarget(&request, account.Email)
+			a.preparePromptExecutionTarget(&request, account.Email, session.SpaceID)
 			result, runErr := a.runPromptWithSessionWithSink(ctx, cfg, session, account.Email, request, InferenceStreamSink{
 				Text:            wrappedText,
 				Reasoning:       wrappedReasoning,
@@ -776,7 +810,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			a.State.ReleaseAccountDispatchSlot(account.Email)
 			slotAcquired = false
 		}
-		if isDispatchContextAbort(ctx, err) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
 			return InferenceResult{}, err
 		}
 
@@ -830,7 +864,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 				}
 			}
 		}
-		if isDispatchContextAbort(ctx, err) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
 			return InferenceResult{}, err
 		}
 

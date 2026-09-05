@@ -773,6 +773,7 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	preferredConversationID := requestedConversationID(r, payload)
 	request := PromptRunRequest{
 		Prompt:                            prompt,
+		HistorySegments:                   []conversationPromptSegment{{Role: "user", Text: prompt}},
 		LatestUserPrompt:                  prompt,
 		PublicModel:                       entry.ID,
 		NotionModel:                       entry.NotionModel,
@@ -791,6 +792,12 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	if preferredConversationID != "" {
 		if matched, ok := a.resolveContinuationConversation(r, payload, "", "", nil); ok {
 			conversation = matched.Conversation
+			if _, err := resolveContinuationAccount(cfg, conversation.ThreadID, request.PinnedAccountEmail, conversation); err != nil {
+				writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
+				return
+			}
+			request.PinnedSpaceID = conversation.SpaceID
+			request.HiddenPrompt = conversation.HiddenPrompt
 			request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), request.PinnedAccountEmail)
 			if freshThreadMode {
 				request.ForceLocalConversationContinue = strings.TrimSpace(conversation.ID) != ""
@@ -805,6 +812,12 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	conversationID, turnErr := a.startConversationTurn(conversation.ID, preferredConversationID, "admin_tester", "admin_test", prompt, request)
 	if turnErr != nil {
 		writeJSON(w, http.StatusConflict, map[string]any{"detail": turnErr.Error()})
+		return
+	}
+	request.ConversationID = conversationID
+	setConversationIDHeader(w, conversationID)
+	if stream, _ := payload["stream"].(bool); stream {
+		a.writeChatCompletionLiveStream(w, r, request, entry.ID, false, conversationID)
 		return
 	}
 	timedRequest, cancel := cloneRequestWithTimeout(r, adminSyncRequestTimeout(cfg))

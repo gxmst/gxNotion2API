@@ -1,4 +1,5 @@
 import type { AttachmentInput } from '@/lib/services/admin/types';
+import { EventSourceParserStream } from 'eventsource-parser/stream';
 
 const API_BASE = (process.env.NEXT_PUBLIC_BACKEND_BASE_URL || '').replace(/\/$/, '');
 
@@ -57,6 +58,37 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   return payload as T;
 }
 
+export async function apiEventStream(path: string, payload: unknown, onEvent: (data: string) => void, signal: AbortSignal): Promise<Headers> {
+  const response = await fetch(buildURL(path), {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload), credentials: 'include', signal,
+  });
+  if (!response.ok || !response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
+    const text = await response.text();
+    let message = summarizeHTMLText(text) || `${response.status} ${response.statusText}`;
+    try {
+      const error = JSON.parse(text);
+      message = error.detail || error.error?.message || message;
+    } catch { /* Non-JSON responses use the HTTP status or HTML title. */ }
+    throw new Error(message);
+  }
+  const reader = response.body.pipeThrough(new TextDecoderStream()).pipeThrough(new EventSourceParserStream()).getReader();
+  let done = false;
+  try {
+    while (true) {
+      const item = await reader.read();
+      if (item.done) break;
+      if (item.value.data === '[DONE]') { done = true; break; }
+      onEvent(item.value.data);
+    }
+    if (!done) throw new Error('连接中断，回答尚未完成');
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  return response.headers;
+}
+
 export async function readFilesAsAttachments(files: File[]): Promise<AttachmentInput[]> {
   return Promise.all(
     files.map(
@@ -78,5 +110,20 @@ export async function readFilesAsAttachments(files: File[]): Promise<AttachmentI
 }
 
 export async function copyText(text: string): Promise<void> {
-  await navigator.clipboard.writeText(text);
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = document.createElement('textarea');
+  area.value = text;
+  area.setAttribute('readonly', '');
+  area.style.position = 'fixed';
+  area.style.opacity = '0';
+  document.body.appendChild(area);
+  area.select();
+  try {
+    if (!document.execCommand('copy')) throw new Error('复制失败');
+  } finally {
+    area.remove();
+  }
 }

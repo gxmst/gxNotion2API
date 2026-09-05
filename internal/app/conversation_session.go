@@ -19,6 +19,8 @@ type ConversationSession struct {
 	Fingerprint      string    `json:"fingerprint"`
 	ThreadID         string    `json:"thread_id"`
 	AccountEmail     string    `json:"account_email"`
+	SpaceID          string    `json:"space_id,omitempty"`
+	SpaceViewID      string    `json:"space_view_id,omitempty"`
 	ConfigID         string    `json:"config_id"`
 	ContextID        string    `json:"context_id"`
 	OriginalDatetime string    `json:"original_datetime"`
@@ -44,6 +46,17 @@ type ConversationSessionStep struct {
 type conversationContinuationState struct {
 	Session          ConversationSession
 	UpdatedConfigIDs []string
+}
+
+func continuationTargetWithSession(entry ConversationEntry, state *conversationContinuationState) continuationTarget {
+	if state != nil {
+		entry.ID = firstNonEmpty(entry.ID, state.Session.ConversationID)
+		entry.ThreadID = firstNonEmpty(entry.ThreadID, state.Session.ThreadID)
+		entry.AccountEmail = firstNonEmpty(entry.AccountEmail, state.Session.AccountEmail)
+		entry.SpaceID = firstNonEmpty(entry.SpaceID, state.Session.SpaceID)
+		entry.SpaceViewID = firstNonEmpty(entry.SpaceViewID, state.Session.SpaceViewID)
+	}
+	return continuationTarget{Conversation: entry, Session: state}
 }
 
 func canonicalConversationFingerprintScoped(scope string, hiddenPrompt string, segments []conversationPromptSegment) string {

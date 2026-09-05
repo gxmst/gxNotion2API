@@ -277,7 +277,7 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 			if strings.TrimSpace(item.Origin) == "" {
 				item.Origin = "local"
 			}
-			if threadID := strings.TrimSpace(item.ThreadID); threadID != "" {
+			if threadID := strings.TrimSpace(item.ThreadID); threadID != "" && r.URL.Query().Get("local") != "1" {
 				remoteItem, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, item.AccountEmail, nil)
 				if err == nil {
 					item = mergeConversationEntry(item, remoteItem)

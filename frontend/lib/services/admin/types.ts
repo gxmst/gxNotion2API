@@ -30,6 +30,7 @@ export interface FeatureConfig {
   use_read_only_mode?: boolean;
   force_disable_upstream_edits?: boolean;
   force_fresh_thread_per_request?: boolean;
+  allow_native_transport_fallback?: boolean;
   writer_mode?: boolean;
   enable_generate_image?: boolean;
   enable_csv_attachment_support?: boolean;
@@ -205,6 +206,51 @@ export interface AccountsPayload {
   session_refresh_runtime?: SessionRefreshRuntime;
 }
 
+export interface AIUsageReport {
+  email: string;
+  space_id?: string;
+  status: string;
+  detail?: string;
+  cached: boolean;
+  fetched_at?: string;
+  usage?: {
+    is_eligible: boolean;
+    is_eligible_known: boolean;
+    type?: string;
+    quota_enforced: boolean;
+    basic_usage_known?: boolean;
+    basic_limits_known?: boolean;
+    space_usage: number;
+    space_limit: number;
+    user_usage: number;
+    user_limit: number;
+    current_period_usage_known?: boolean;
+    current_period_space_usage?: number;
+    current_period_user_usage?: number;
+    promotional_usage_known?: boolean;
+    promotional_usage?: number;
+    promotional_limit_known?: boolean;
+    promotional_limit?: number;
+    premium_credit_known?: boolean;
+    premium_credit_balance?: number;
+    credits_in_overage?: number;
+    overage_limit?: number;
+    premium_service_period_start_ms?: number;
+  };
+}
+
+export interface AIUsagePayload { accounts: AIUsageReport[]; ttl_seconds: number }
+
+export interface ChatRunInput {
+  prompt: string;
+  model: string;
+  use_web_search: boolean;
+  attachments: AttachmentInput[];
+  conversation_id?: string;
+}
+
+export interface ChatRunResult { conversation_id: string; text: string }
+
 export interface ConversationMessageAttachment {
   name?: string;
   content_type?: string;
@@ -234,6 +280,7 @@ export interface ConversationSummary {
   model?: string;
   notion_model?: string;
   account_email?: string;
+  space_id?: string;
   thread_id?: string;
   trace_id?: string;
   response_id?: string;

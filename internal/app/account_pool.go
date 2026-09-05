@@ -14,9 +14,8 @@ const (
 	accountAutoReloginInterval = 5 * time.Minute
 	// accountQuotaExhaustedCooldown is how long an account sits out after
 	// upstream confirmed its workspace AI allowance is spent. Notion's
-	// allowance window is monthly, but an hour keeps a misclassification from
-	// parking an account for a month while still stopping the every-two-minutes
-	// retry storm the ordinary failure backoff would produce.
+	// reset time is not present in the captured response. This is a local retry
+	// backoff, independent of Notion's six-hour and monthly allowance windows.
 	accountQuotaExhaustedCooldown = time.Hour
 )
 
@@ -144,6 +143,13 @@ func isQuotaExhaustedError(err error) bool {
 		return false
 	}
 	return strings.Contains(strings.ToLower(err.Error()), "quota-exhausted")
+}
+
+func accountQuotaCooldownError(account NotionAccount, now time.Time) error {
+	if account.Disabled || !strings.EqualFold(strings.TrimSpace(account.Status), "quota_exhausted") || !accountCooldownActive(account, now) {
+		return nil
+	}
+	return fmt.Errorf("%s: %s", account.Email, firstNonEmpty(strings.TrimSpace(account.LastError), "upstream AI quota-exhausted"))
 }
 
 func markAccountDispatchFailure(account NotionAccount, now time.Time, err error, retryable bool) NotionAccount {
@@ -285,7 +291,11 @@ func (s *ServerState) startAutoRelogin(ctx context.Context, cfg AppConfig, accou
 	return cfg, fmt.Errorf("verification code required for %s; auto relogin started (%s)", account.Email, reason)
 }
 
-func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
+func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, onDelta func(string) error) (result InferenceResult, err error) {
+	if request.PinnedSpaceID != "" && request.PinnedSpaceID != session.SpaceID {
+		return InferenceResult{}, errConversationWorkspaceMismatch
+	}
+	defer func() { result.SpaceID, result.SpaceViewID = session.SpaceID, session.SpaceViewID }()
 	if a.runPromptWithSessionOverride != nil {
 		return a.runPromptWithSessionOverride(ctx, cfg, session, request, onDelta)
 	}
@@ -304,7 +314,11 @@ func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session S
 	return execute(ctx, request, onDelta)
 }
 
-func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
+func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, sink InferenceStreamSink) (result InferenceResult, err error) {
+	if request.PinnedSpaceID != "" && request.PinnedSpaceID != session.SpaceID {
+		return InferenceResult{}, errConversationWorkspaceMismatch
+	}
+	defer func() { result.SpaceID, result.SpaceViewID = session.SpaceID, session.SpaceViewID }()
 	if a.runPromptWithSessionSinkOverride != nil {
 		return a.runPromptWithSessionSinkOverride(ctx, cfg, session, request, sink)
 	}

@@ -1,310 +1,219 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { Bot, Copy, FileImage, LoaderCircle, Paperclip, Plus, RefreshCcw, SendHorizontal, Square, User, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
-import { Copy, FileImage, Search, SendHorizonal, Sparkles, type LucideIcon } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
-import { InfoCard, JsonPreview, MetaTile, PanelHeader, StatCard } from '@/components/admin/shared';
 import { copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
-import type { ModelItem } from '@/lib/services/admin/types';
+import type { ChatRunInput, ChatRunResult, ConversationDetailPayload, ConversationMessage, ModelItem } from '@/lib/services/admin/types';
 
-const SELECT_TRIGGER_CLASS = 'h-10 w-full rounded-lg border-input bg-transparent';
+const SESSION_KEY = 'notion2api-chat-session';
 
-function buildTesterConversationID(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return `conv_${crypto.randomUUID().replace(/-/g, '')}`;
-  }
-  return `conv_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
-}
-
-function ToggleTile({
-  icon: Icon,
-  label,
-  description,
-  checked,
-  onCheckedChange,
-}: {
-  icon: LucideIcon;
-  label: string;
-  description: string;
-  checked: boolean;
-  onCheckedChange: (checked: boolean) => void;
-}) {
-  return (
-    <div className="surface-subtle min-w-0 px-4 py-4">
-      <div className="flex items-start justify-between gap-4">
-        <div className="min-w-0 space-y-1">
-          <div className="flex items-center gap-2 text-sm font-semibold tracking-tight">
-            <Icon className="size-4 text-primary" />
-            {label}
-          </div>
-          <p className="text-[13px] leading-6 text-muted-foreground">{description}</p>
-        </div>
-        <Switch checked={checked} onCheckedChange={onCheckedChange} />
-      </div>
-    </div>
-  );
+function randomID() {
+  if (typeof crypto.randomUUID === 'function') return crypto.randomUUID().replace(/-/g, '');
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export function TesterPanel({
-  models,
-  defaultModel,
-  defaultWebSearch,
-  onRun,
+  models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun,
 }: {
   models: ModelItem[];
   defaultModel?: string;
   defaultWebSearch: boolean;
-  onRun: (payload: {
-    prompt: string;
-    model: string;
-    use_web_search: boolean;
-    attachments: Awaited<ReturnType<typeof readFilesAsAttachments>>;
-    conversation_id?: string;
-  }) => Promise<unknown>;
+  initialConversationID?: string;
+  onResumeHandled: () => void;
+  onLoad: (id: string) => Promise<ConversationDetailPayload>;
+  onRun: (payload: ChatRunInput, onDelta: (text: string) => void, signal: AbortSignal) => Promise<ChatRunResult>;
 }) {
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState(defaultModel || models[0]?.id || 'auto');
   const [useWebSearch, setUseWebSearch] = useState(defaultWebSearch);
-  const [useConversationID, setUseConversationID] = useState(false);
   const [conversationID, setConversationID] = useState('');
+  const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [files, setFiles] = useState<File[]>([]);
-  const [output, setOutput] = useState('等待运行...');
+  const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [remoteRunning, setRemoteRunning] = useState(false);
   const [running, setRunning] = useState(false);
+  const [error, setError] = useState('');
+  const [owner, setOwner] = useState('');
+  const abortRef = useRef<AbortController | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  const historyRef = useRef<HTMLDivElement>(null);
+  const mounted = useRef(false);
+  const initialRef = useRef(initialConversationID);
 
-  const fileLabels = useMemo(() => files.map((file) => file.name), [files]);
-  const promptLength = useMemo(() => prompt.trim().length, [prompt]);
-  const normalizedConversationID = useMemo(() => conversationID.trim(), [conversationID]);
+  useEffect(() => {
+    mounted.current = true;
+    let cancelled = false;
+    let saved: { conversationID?: string; prompt?: string; model?: string; useWebSearch?: boolean } = {};
+    try {
+      const value: unknown = JSON.parse(sessionStorage.getItem(SESSION_KEY) || '{}');
+      if (value && typeof value === 'object' && !Array.isArray(value)) saved = value;
+    } catch { /* Storage is optional. */ }
+    const resume = initialRef.current;
+    const id = resume || (typeof saved.conversationID === 'string' ? saved.conversationID : '');
+    if (!resume) setPrompt(typeof saved.prompt === 'string' ? saved.prompt : '');
+    if (saved.model && models.some((item) => item.id === saved.model)) setModel(saved.model);
+    if (typeof saved.useWebSearch === 'boolean') setUseWebSearch(saved.useWebSearch);
+    setConversationID(id);
+    if (resume) onResumeHandled();
+    if (id) {
+      void onLoad(id).then(({ item }) => {
+        if (cancelled) return;
+        setMessages(item.messages || []);
+        setOwner(item.account_email || '');
+        setRemoteRunning(item.status === 'running');
+        if (resume && item.model && models.some((model) => model.id === item.model)) setModel(item.model);
+        if (item.status === 'running') setError('这个会话仍在生成，请稍后重新打开。');
+      }).catch((cause) => {
+        if (!cancelled) { setLoadFailed(true); setError(cause instanceof Error ? cause.message : '会话加载失败'); }
+      }).finally(() => { if (!cancelled) setLoading(false); });
+    } else { setLoading(false); }
+    return () => { cancelled = true; mounted.current = false; abortRef.current?.abort(); };
+    // The selected conversation is consumed once when this panel opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  const summaryCards = [
-    { label: '当前模型', value: model || '-', hint: '本次测试目标模型' },
-    { label: '联网开关', value: useWebSearch ? '开启' : '关闭', hint: defaultWebSearch ? '服务端默认开启' : '服务端默认关闭' },
-    { label: '续聊模式', value: useConversationID ? '开启' : '关闭', hint: useConversationID ? (normalizedConversationID || '将自动生成并记住会话 ID') : '关闭后每次都是新测试' },
-    { label: '附件数量', value: String(files.length), hint: fileLabels[0] || '尚未挂载附件' },
-    { label: 'Prompt 长度', value: String(promptLength), hint: promptLength ? '已输入提示词' : '可只传附件测试' },
-  ];
+  useEffect(() => {
+    if (loading) return;
+    try { sessionStorage.setItem(SESSION_KEY, JSON.stringify({ conversationID, prompt, model, useWebSearch })); } catch { /* Storage is optional. */ }
+  }, [conversationID, prompt, model, useWebSearch, loading]);
+
+  useEffect(() => {
+    const history = historyRef.current;
+    if (history) history.scrollTop = history.scrollHeight;
+  }, [messages]);
+
+  async function reloadConversation() {
+    setLoading(true);
+    try {
+      const { item } = await onLoad(conversationID);
+      if (!mounted.current) return;
+      setMessages(item.messages || []); setOwner(item.account_email || ''); setLoadFailed(false);
+      setRemoteRunning(item.status === 'running');
+      setError(item.status === 'running' ? '这个会话仍在生成，请稍后刷新。' : '');
+    } catch (cause) {
+      if (mounted.current) { setLoadFailed(true); setError(cause instanceof Error ? cause.message : '会话加载失败'); }
+    } finally { if (mounted.current) setLoading(false); }
+  }
 
   async function performRun() {
+    if (abortRef.current || loading || loadFailed || remoteRunning || (!prompt.trim() && !files.length)) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
     setRunning(true);
-    setOutput('运行中...');
+    setError('');
+    const sentPrompt = prompt;
+    const id = conversationID || `conv_${randomID()}`;
+    const answerID = `answer_${randomID()}`;
     try {
-      const attachments = files.length ? await readFilesAsAttachments(files) : [];
-      let nextConversationID = '';
-      if (useConversationID) {
-        nextConversationID = normalizedConversationID || buildTesterConversationID();
-        if (nextConversationID !== normalizedConversationID) {
-          setConversationID(nextConversationID);
-        }
-      }
-      const payload = await onRun({
-        prompt,
-        model,
-        use_web_search: useWebSearch,
-        attachments,
-        conversation_id: nextConversationID || undefined,
-      });
-      if (payload && typeof payload === 'object' && payload !== null) {
-        const returnedConversationID = typeof (payload as { conversation_id?: unknown }).conversation_id === 'string'
-          ? String((payload as { conversation_id?: string }).conversation_id).trim()
-          : '';
-        if (returnedConversationID) {
-          setConversationID(returnedConversationID);
-        }
-      }
-      setOutput(JSON.stringify(payload, null, 2));
-      toast.success('测试完成');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '测试失败';
-      setOutput(message);
-      toast.error(message);
+      const attachments = await readFilesAsAttachments(files);
+      if (controller.signal.aborted) return;
+      setConversationID(id);
+      setMessages((current) => [...current,
+        { id: `user_${answerID}`, role: 'user', content: sentPrompt, status: 'completed', attachments: files.map((file) => ({ name: file.name, content_type: file.type })) },
+        { id: answerID, role: 'assistant', content: '', status: 'streaming' },
+      ]);
+      setPrompt('');
+      setFiles([]);
+      if (fileRef.current) fileRef.current.value = '';
+      const result = await onRun({ prompt: sentPrompt, model, use_web_search: useWebSearch, attachments, conversation_id: id }, (delta) => {
+        if (mounted.current) setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: (message.content || '') + delta } : message));
+      }, controller.signal);
+      if (!mounted.current) return;
+      setConversationID(result.conversation_id || id);
+      setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: result.text, status: 'completed' } : message));
+      try {
+        const { item } = await onLoad(result.conversation_id || id);
+        if (mounted.current) { setMessages(item.messages || []); setOwner(item.account_email || ''); }
+      } catch { /* The completed response remains visible when history refresh fails. */ }
+    } catch (cause) {
+      if (!mounted.current) return;
+      const message = controller.signal.aborted ? '已停止生成' : cause instanceof Error ? cause.message : '生成失败';
+      setError(message);
+      setMessages((current) => current.map((item) => item.id === answerID ? { ...item, status: 'failed' } : item));
+      if (!controller.signal.aborted) setPrompt((current) => current || sentPrompt);
     } finally {
-      setRunning(false);
+      abortRef.current = null;
+      if (mounted.current) setRunning(false);
     }
   }
 
-  return (
-    <div className="space-y-6">
-      <PanelHeader
-        eyebrow="API Tester"
-        title="直接试跑 Nation AI"
-        description="直接回归模型、附件与原始输出。"
-      />
+  function startNew() {
+    setConversationID(''); setMessages([]); setOwner(''); setError(''); setPrompt(''); setFiles([]);
+    setLoadFailed(false); setRemoteRunning(false);
+    if (fileRef.current) fileRef.current.value = '';
+  }
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-5">
-        {summaryCards.map((item) => (
-          <StatCard key={item.label} label={item.label} value={item.value} hint={item.hint} />
+  return (
+    <section className="mx-auto flex min-h-[600px] w-full max-w-5xl flex-col gap-4">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold">Notion AI</h1>
+          {owner ? <p className="mt-1 break-all text-xs text-muted-foreground">{owner}</p> : null}
+        </div>
+        <Button variant="outline" onClick={startNew} disabled={running || loading}><Plus className="size-4" />新对话</Button>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-4">
+        <div className="w-full sm:w-64">
+          <Select value={model} onValueChange={setModel} disabled={running}>
+            <SelectTrigger className="w-full" aria-label="模型"><SelectValue /></SelectTrigger>
+            <SelectContent>{models.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>)}</SelectContent>
+          </Select>
+        </div>
+        <label className="flex items-center gap-2 text-sm"><Switch checked={useWebSearch} onCheckedChange={setUseWebSearch} disabled={running} aria-label="联网搜索" />联网搜索</label>
+      </div>
+
+      <div ref={historyRef} className="h-[min(58vh,640px)] min-h-64 overflow-y-auto overscroll-contain px-1" aria-label="聊天记录" aria-busy={loading || running}>
+        {loading ? <LoaderCircle className="mx-auto mt-10 size-5 animate-spin" aria-label="加载中" /> : null}
+        {!loading && !messages.length ? <p className="py-16 text-center text-sm text-muted-foreground">新对话</p> : null}
+        {messages.map((message, index) => (
+          <article key={message.id || index} className="flex min-w-0 gap-3 border-b border-border/50 py-5 last:border-0">
+            <span className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted" aria-label={message.role === 'user' ? '你' : 'Notion AI'}>
+              {message.role === 'user' ? <User className="size-4" /> : <Bot className="size-4" />}
+            </span>
+            <div className="min-w-0 flex-1">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="text-xs font-semibold text-muted-foreground">{message.role === 'user' ? '你' : 'Notion AI'}</span>
+                <Button size="icon" variant="ghost" className="size-7 shrink-0" title="复制消息" aria-label="复制消息" disabled={!message.content}
+                  onClick={() => void copyText(message.content || '').then(() => toast.success('已复制')).catch(() => toast.error('复制失败'))}><Copy className="size-3.5" /></Button>
+              </div>
+              <div className="space-y-3 break-words text-sm leading-7 [overflow-wrap:anywhere] [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_h1]:text-lg [&_h2]:text-base [&_h3]:font-semibold [&_li]:ml-5 [&_ol]:list-decimal [&_ul]:list-disc [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_code]:text-xs [&_img]:max-w-full">
+                {message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content || ''}</p> : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                  a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+                  table: ({ children }) => <div className="overflow-x-auto"><table className="w-full border-collapse [&_td]:border [&_td]:p-2 [&_th]:border [&_th]:p-2">{children}</table></div>,
+                }}>{message.content || ''}</ReactMarkdown>}
+                {!message.content && message.status === 'streaming' ? <LoaderCircle className="size-4 animate-spin" aria-label="正在生成" /> : null}
+                {message.status === 'failed' ? <p className="text-xs text-muted-foreground">未完成</p> : null}
+              </div>
+              {message.attachments?.length ? <div className="mt-3 flex flex-wrap gap-2">{message.attachments.map((file, i) => <span key={i} className="flex max-w-full items-center gap-1 text-xs text-muted-foreground"><FileImage className="size-3 shrink-0" /><span className="break-all">{file.name}</span></span>)}</div> : null}
+            </div>
+          </article>
         ))}
       </div>
 
-      <div className="grid gap-6 2xl:grid-cols-[minmax(0,1.06fr)_360px]">
-        <InfoCard
-          title="测试请求"
-          description="填写 prompt、选择模型与附件后执行。"
-        >
-          <div className="space-y-6">
-            <div className="grid gap-2">
-              <Label htmlFor="tester-prompt" className="text-sm font-semibold tracking-tight">Prompt</Label>
-              <Textarea
-                id="tester-prompt"
-                value={prompt}
-                onChange={(event) => setPrompt(event.target.value)}
-                placeholder="输入测试提示词，或留空仅回归附件链路"
-                className="min-h-[236px] rounded-lg bg-transparent leading-7"
-              />
-            </div>
-
-            <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(280px,0.92fr)]">
-              <div className="grid gap-2">
-                <Label className="text-sm font-semibold tracking-tight">Model</Label>
-                <Select value={model} onValueChange={setModel}>
-                  <SelectTrigger className={SELECT_TRIGGER_CLASS}>
-                    <SelectValue placeholder="选择模型" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {models.map((item) => (
-                      <SelectItem key={item.id} value={item.id}>
-                        {item.name || item.id}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <ToggleTile
-                icon={Search}
-                label="联网搜索"
-                description="默认沿用服务端设置，可单次覆盖。"
-                checked={useWebSearch}
-                onCheckedChange={setUseWebSearch}
-              />
-            </div>
-
-            <div className="grid gap-4 lg:grid-cols-[minmax(240px,0.72fr)_minmax(0,1.28fr)]">
-              <ToggleTile
-                icon={Sparkles}
-                label="携带 conversation_id"
-                description="开启后优先复用同一条测试会话；关闭则每次新建。"
-                checked={useConversationID}
-                onCheckedChange={setUseConversationID}
-              />
-
-              <div className="grid gap-2">
-                <Label htmlFor="tester-conversation-id" className="text-sm font-semibold tracking-tight">conversation_id</Label>
-                <div className="flex flex-wrap gap-2">
-                  <Input
-                    id="tester-conversation-id"
-                    value={conversationID}
-                    disabled={!useConversationID}
-                    onChange={(event) => setConversationID(event.target.value)}
-                    placeholder="开启后可手动输入；留空则首次运行时自动生成"
-                    className="min-w-[280px] flex-1 rounded-lg bg-transparent"
-                  />
-                  <Button
-                    type="button"
-                    variant="outline"
-                    disabled={!conversationID}
-                    onClick={() => setConversationID('')}
-                  >
-                    清空
-                  </Button>
-                </div>
-                <p className="text-xs leading-5 text-muted-foreground">
-                  运行成功后会自动回填最新的 <code className="rounded bg-muted px-1">conversation_id</code>。
-                </p>
-              </div>
-            </div>
-
-            <div className="grid gap-3">
-              <Label htmlFor="tester-files" className="text-sm font-semibold tracking-tight">附件</Label>
-              <Input
-                id="tester-files"
-                type="file"
-                multiple
-                accept="application/pdf,text/csv,image/png,image/jpeg,image/gif,image/webp,image/heic"
-                className="h-auto rounded-lg bg-transparent py-3"
-                onChange={(event) => setFiles(Array.from(event.target.files || []))}
-              />
-              <p className="text-xs leading-5 text-muted-foreground">支持图片、PDF、CSV；浏览器会转成 data URL 后提交到 <code className="rounded bg-muted px-1">/admin/test</code>。</p>
-              <div className="surface-subtle min-h-[60px] rounded-lg p-3">
-                {fileLabels.length ? (
-                  <div className="flex flex-wrap gap-2">
-                    {fileLabels.map((label) => (
-                      <div key={label} className="inline-flex items-center gap-2 rounded-lg border border-primary/20 bg-[color-mix(in_oklab,var(--primary)_12%,var(--card))] px-3 py-1.5 text-sm font-medium text-primary">
-                        <FileImage className="size-4" />
-                        {label}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <div className="flex h-full items-center text-sm text-muted-foreground">当前未选择附件。</div>
-                )}
-              </div>
-            </div>
-
-            <div className="flex flex-wrap gap-3">
-              <Button
-                className="px-4"
-                disabled={running || (!prompt.trim() && files.length === 0)}
-                onClick={() => void performRun()}
-              >
-                <SendHorizonal className="size-4" />
-                {running ? '运行中...' : '运行测试'}
-              </Button>
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  try {
-                    await copyText(output);
-                    toast.success('结果已复制');
-                  } catch (error) {
-                    toast.error(error instanceof Error ? error.message : '复制失败');
-                  }
-                }}
-              >
-                <Copy className="size-4" />
-                复制结果
-              </Button>
-            </div>
-          </div>
-        </InfoCard>
-
-        <aside className="pretty-scroll min-w-0 space-y-5 self-start xl:sticky xl:top-6 xl:max-h-[calc(100vh-3rem)] xl:overflow-y-auto xl:pr-1">
-          <InfoCard
-            title="本次执行摘要"
-            description="本次请求参数一览。"
-          >
-            <div className="grid gap-3">
-              <MetaTile label="模型" scrollable value={model || '-'} />
-              <MetaTile label="联网" value={useWebSearch ? '开启' : '关闭'} />
-              <MetaTile
-                label="conversation_id"
-                scrollable
-                value={useConversationID ? (normalizedConversationID || '运行时自动生成') : '未携带'}
-              />
-              <MetaTile
-                label="附件"
-                scrollable
-                value={fileLabels.length ? fileLabels.join(' · ') : '未挂载附件'}
-              />
-              <MetaTile label="输出格式" value="Raw JSON" />
-            </div>
-            <div className="mt-4 rounded-xl border border-dashed bg-muted/30 px-4 py-3 text-sm leading-6 text-muted-foreground">
-              <div className="mb-2 flex items-center gap-2 font-semibold text-foreground">
-                <Sparkles className="size-4 text-primary" />
-                测试建议
-              </div>
-              先用短 prompt 验证账号与模型，再追加图片、PDF、CSV 回归附件链路。
-            </div>
-          </InfoCard>
-
-          <JsonPreview title="输出" value={output} minHeight={320} />
-        </aside>
-      </div>
-    </div>
+      <form className="space-y-3 border-t pt-4" onSubmit={(event) => { event.preventDefault(); void performRun(); }}>
+        {error ? <p role="status" className="break-words text-sm text-destructive">{error}</p> : null}
+        {loadFailed || remoteRunning ? <Button type="button" variant="outline" disabled={loading} onClick={() => void reloadConversation()}><RefreshCcw className="size-4" />刷新会话</Button> : null}
+        {files.length ? <div className="flex flex-wrap gap-2">{files.map((file, index) => <div key={`${file.name}-${index}`} className="flex max-w-full items-center gap-1 text-xs"><Paperclip className="size-3 shrink-0" /><span className="break-all">{file.name}</span><Button type="button" size="icon" variant="ghost" className="size-6 shrink-0" disabled={running} title="移除附件" aria-label={`移除 ${file.name}`} onClick={() => setFiles((current) => current.filter((_, i) => i !== index))}><X className="size-3" /></Button></div>)}</div> : null}
+        <Textarea aria-label="消息" placeholder="发送消息" value={prompt} onChange={(event) => setPrompt(event.target.value)} className="min-h-24 resize-y rounded-md" disabled={loading || loadFailed || remoteRunning}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void performRun(); }
+          }} />
+        <div className="flex items-center justify-between gap-3">
+          <input ref={fileRef} type="file" className="hidden" multiple disabled={running} onChange={(event) => setFiles((current) => [...current, ...Array.from(event.target.files || [])])} />
+          <Button type="button" variant="ghost" size="icon" title="添加附件" aria-label="添加附件" disabled={loading || running || loadFailed || remoteRunning} onClick={() => fileRef.current?.click()}><Paperclip className="size-4" /></Button>
+          {running ? <Button type="button" variant="outline" onClick={() => abortRef.current?.abort()}><Square className="size-4" />停止</Button>
+            : <Button type="submit" disabled={loading || loadFailed || remoteRunning || (!prompt.trim() && !files.length)}><SendHorizontal className="size-4" />发送</Button>}
+        </div>
+      </form>
+    </section>
   );
 }

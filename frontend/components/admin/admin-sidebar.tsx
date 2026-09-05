@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils';
 
 const tabMeta: Array<{ key: TabKey; label: string; icon: ComponentType<{ className?: string }>; group: 'workbench' | 'config' }> = [
   { key: 'dashboard', label: '状态', icon: LayoutDashboard, group: 'workbench' },
-  { key: 'tester', label: 'API Tester', icon: Sparkles, group: 'workbench' },
+  { key: 'tester', label: '聊天', icon: Sparkles, group: 'workbench' },
   { key: 'conversations', label: '会话', icon: History, group: 'workbench' },
   { key: 'settings', label: '设置', icon: Settings2, group: 'config' },
   { key: 'accounts', label: '账号', icon: KeyRound, group: 'config' },

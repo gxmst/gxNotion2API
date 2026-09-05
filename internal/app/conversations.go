@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -23,12 +25,13 @@ var errConversationDeleting = errors.New("conversation is being deleted")
 const maxConversationEntries = 1000
 
 type ConversationAttachment struct {
-	Name        string `json:"name,omitempty"`
-	ContentType string `json:"content_type,omitempty"`
-	Source      string `json:"source,omitempty"`
-	URL         string `json:"url,omitempty"`
-	Path        string `json:"path,omitempty"`
-	SizeBytes   int    `json:"size_bytes,omitempty"`
+	Name          string `json:"name,omitempty"`
+	ContentType   string `json:"content_type,omitempty"`
+	Source        string `json:"source,omitempty"`
+	URL           string `json:"url,omitempty"`
+	Path          string `json:"path,omitempty"`
+	SizeBytes     int    `json:"size_bytes,omitempty"`
+	ContentSHA256 string `json:"content_sha256,omitempty"`
 }
 
 type ConversationMessage struct {
@@ -42,35 +45,39 @@ type ConversationMessage struct {
 }
 
 type ConversationEntry struct {
-	ID                string                   `json:"id"`
-	Title             string                   `json:"title"`
-	Origin            string                   `json:"origin,omitempty"`
-	RemoteOnly        bool                     `json:"remote_only,omitempty"`
-	Ephemeral         bool                     `json:"ephemeral,omitempty"`
-	EphemeralReason   string                   `json:"ephemeral_reason,omitempty"`
-	AutoDeleteAt      *time.Time               `json:"auto_delete_at,omitempty"`
-	Source            string                   `json:"source"`
-	Transport         string                   `json:"transport"`
-	ClientScope       string                   `json:"client_scope,omitempty"`
-	Status            string                   `json:"status"`
-	Model             string                   `json:"model"`
-	NotionModel       string                   `json:"notion_model,omitempty"`
-	UseWebSearch      bool                     `json:"use_web_search"`
-	RequestPrompt     string                   `json:"request_prompt,omitempty"`
-	CreatedAt         time.Time                `json:"created_at"`
-	UpdatedAt         time.Time                `json:"updated_at"`
-	ResponseID        string                   `json:"response_id,omitempty"`
-	CompletionID      string                   `json:"completion_id,omitempty"`
-	ThreadID          string                   `json:"thread_id,omitempty"`
-	TraceID           string                   `json:"trace_id,omitempty"`
-	MessageID         string                   `json:"message_id,omitempty"`
-	AccountEmail      string                   `json:"account_email,omitempty"`
-	CreatedByDisplay  string                   `json:"created_by_display_name,omitempty"`
-	Error             string                   `json:"error,omitempty"`
-	InputAttachments  []ConversationAttachment `json:"input_attachments,omitempty"`
-	OutputAttachments []UploadedAttachment     `json:"output_attachments,omitempty"`
-	Messages          []ConversationMessage    `json:"messages,omitempty"`
-	cachedPreview     string                   `json:"-"`
+	ID                 string                   `json:"id"`
+	Title              string                   `json:"title"`
+	Origin             string                   `json:"origin,omitempty"`
+	RemoteOnly         bool                     `json:"remote_only,omitempty"`
+	Ephemeral          bool                     `json:"ephemeral,omitempty"`
+	EphemeralReason    string                   `json:"ephemeral_reason,omitempty"`
+	AutoDeleteAt       *time.Time               `json:"auto_delete_at,omitempty"`
+	Source             string                   `json:"source"`
+	Transport          string                   `json:"transport"`
+	ClientScope        string                   `json:"client_scope,omitempty"`
+	HiddenPrompt       string                   `json:"hidden_prompt,omitempty"`
+	RequestFingerprint string                   `json:"request_fingerprint,omitempty"`
+	Status             string                   `json:"status"`
+	Model              string                   `json:"model"`
+	NotionModel        string                   `json:"notion_model,omitempty"`
+	UseWebSearch       bool                     `json:"use_web_search"`
+	RequestPrompt      string                   `json:"request_prompt,omitempty"`
+	CreatedAt          time.Time                `json:"created_at"`
+	UpdatedAt          time.Time                `json:"updated_at"`
+	ResponseID         string                   `json:"response_id,omitempty"`
+	CompletionID       string                   `json:"completion_id,omitempty"`
+	ThreadID           string                   `json:"thread_id,omitempty"`
+	TraceID            string                   `json:"trace_id,omitempty"`
+	MessageID          string                   `json:"message_id,omitempty"`
+	AccountEmail       string                   `json:"account_email,omitempty"`
+	SpaceID            string                   `json:"space_id,omitempty"`
+	SpaceViewID        string                   `json:"space_view_id,omitempty"`
+	CreatedByDisplay   string                   `json:"created_by_display_name,omitempty"`
+	Error              string                   `json:"error,omitempty"`
+	InputAttachments   []ConversationAttachment `json:"input_attachments,omitempty"`
+	OutputAttachments  []UploadedAttachment     `json:"output_attachments,omitempty"`
+	Messages           []ConversationMessage    `json:"messages,omitempty"`
+	cachedPreview      string                   `json:"-"`
 }
 
 type ConversationSummary struct {
@@ -94,6 +101,7 @@ type ConversationSummary struct {
 	ResponseID            string     `json:"response_id,omitempty"`
 	CompletionID          string     `json:"completion_id,omitempty"`
 	AccountEmail          string     `json:"account_email,omitempty"`
+	SpaceID               string     `json:"space_id,omitempty"`
 	CreatedByDisplay      string     `json:"created_by_display_name,omitempty"`
 	Error                 string     `json:"error,omitempty"`
 	Preview               string     `json:"preview,omitempty"`
@@ -114,18 +122,22 @@ type ConversationEvent struct {
 }
 
 type ConversationCreateRequest struct {
-	PreferredID      string
-	Ephemeral        bool
-	EphemeralReason  string
-	AutoDeleteAt     time.Time
-	Source           string
-	Transport        string
-	ClientScope      string
-	Model            string
-	NotionModel      string
-	Prompt           string
-	UseWebSearch     bool
-	InputAttachments []ConversationAttachment
+	PreferredID        string
+	Ephemeral          bool
+	EphemeralReason    string
+	AutoDeleteAt       time.Time
+	Source             string
+	Transport          string
+	ClientScope        string
+	Model              string
+	NotionModel        string
+	Prompt             string
+	UseWebSearch       bool
+	InputAttachments   []ConversationAttachment
+	History            []conversationPromptSegment
+	HiddenPrompt       string
+	RequestFingerprint string
+	Replay             bool
 }
 
 type ConversationStore struct {
@@ -183,13 +195,19 @@ func newConversationStoreFromEntries(entries []ConversationEntry) *ConversationS
 func summarizeInputAttachments(items []InputAttachment) []ConversationAttachment {
 	out := make([]ConversationAttachment, 0, len(items))
 	for _, item := range items {
+		contentSHA256 := ""
+		if len(item.Data) > 0 {
+			digest := sha256.Sum256(item.Data)
+			contentSHA256 = hex.EncodeToString(digest[:])
+		}
 		out = append(out, ConversationAttachment{
-			Name:        strings.TrimSpace(item.Name),
-			ContentType: strings.TrimSpace(item.ContentType),
-			Source:      strings.TrimSpace(item.Source),
-			URL:         strings.TrimSpace(item.URL),
-			Path:        strings.TrimSpace(item.Path),
-			SizeBytes:   len(item.Data),
+			Name:          strings.TrimSpace(item.Name),
+			ContentType:   strings.TrimSpace(item.ContentType),
+			Source:        strings.TrimSpace(item.Source),
+			URL:           strings.TrimSpace(item.URL),
+			Path:          strings.TrimSpace(item.Path),
+			SizeBytes:     len(item.Data),
+			ContentSHA256: contentSHA256,
 		})
 	}
 	return out
@@ -358,6 +376,7 @@ func buildConversationSummary(entry *ConversationEntry) ConversationSummary {
 		ResponseID:            entry.ResponseID,
 		CompletionID:          entry.CompletionID,
 		AccountEmail:          entry.AccountEmail,
+		SpaceID:               entry.SpaceID,
 		CreatedByDisplay:      entry.CreatedByDisplay,
 		Error:                 entry.Error,
 		Preview:               preview,
@@ -397,7 +416,7 @@ func conversationMessageSegments(entry *ConversationEntry) []conversationPromptS
 		if role != "user" && role != "assistant" {
 			continue
 		}
-		text := collapseWhitespace(msg.Content)
+		text := strings.TrimSpace(msg.Content)
 		if text == "" {
 			continue
 		}
@@ -471,24 +490,36 @@ func (s *ConversationStore) Create(req ConversationCreateRequest) ConversationEn
 		id = "conv_" + strings.ReplaceAll(randomUUID(), "-", "")
 	}
 	entry := ConversationEntry{
-		ID:                id,
-		Title:             conversationTitle(req.Prompt, req.InputAttachments),
-		Origin:            "local",
-		Ephemeral:         req.Ephemeral,
-		EphemeralReason:   strings.TrimSpace(req.EphemeralReason),
-		AutoDeleteAt:      timePointer(req.AutoDeleteAt),
-		Source:            firstNonEmpty(req.Source, "api"),
-		Transport:         firstNonEmpty(req.Transport, "responses"),
-		ClientScope:       strings.TrimSpace(req.ClientScope),
-		Status:            "running",
-		Model:             strings.TrimSpace(req.Model),
-		NotionModel:       strings.TrimSpace(req.NotionModel),
-		UseWebSearch:      req.UseWebSearch,
-		RequestPrompt:     strings.TrimSpace(req.Prompt),
-		CreatedAt:         now,
-		UpdatedAt:         now,
-		InputAttachments:  cloneConversationAttachments(req.InputAttachments),
-		OutputAttachments: nil,
+		ID:                 id,
+		Title:              conversationTitle(req.Prompt, req.InputAttachments),
+		Origin:             "local",
+		Ephemeral:          req.Ephemeral,
+		EphemeralReason:    strings.TrimSpace(req.EphemeralReason),
+		AutoDeleteAt:       timePointer(req.AutoDeleteAt),
+		Source:             firstNonEmpty(req.Source, "api"),
+		Transport:          firstNonEmpty(req.Transport, "responses"),
+		ClientScope:        strings.TrimSpace(req.ClientScope),
+		HiddenPrompt:       strings.TrimSpace(req.HiddenPrompt),
+		RequestFingerprint: req.RequestFingerprint,
+		Status:             "running",
+		Model:              strings.TrimSpace(req.Model),
+		NotionModel:        strings.TrimSpace(req.NotionModel),
+		UseWebSearch:       req.UseWebSearch,
+		RequestPrompt:      strings.TrimSpace(req.Prompt),
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		InputAttachments:   cloneConversationAttachments(req.InputAttachments),
+		OutputAttachments:  nil,
+	}
+	history := exactConversationSegments(req.History)
+	if len(history) > 0 && history[len(history)-1].Role == "user" {
+		history = history[:len(history)-1]
+	}
+	for _, segment := range history {
+		entry.Messages = append(entry.Messages, ConversationMessage{
+			ID:   "msg_history_" + strings.ReplaceAll(randomUUID(), "-", ""),
+			Role: segment.Role, Content: segment.Text, Status: "completed", CreatedAt: now, UpdatedAt: now,
+		})
 	}
 	if entry.RequestPrompt != "" || len(entry.InputAttachments) > 0 {
 		entry.Messages = append(entry.Messages, ConversationMessage{
@@ -547,7 +578,14 @@ func (s *ConversationStore) Continue(conversationID string, req ConversationCrea
 			s.mu.Unlock()
 			return ConversationEntry{}, fmt.Errorf("%w: %s", errConversationDeleting, conversationID)
 		}
+		if req.Replay {
+			cloned = copyConversationEntryValue(current)
+			s.mu.Unlock()
+			return cloned, nil
+		}
 		next := cloneConversationEntry(current)
+		next.HiddenPrompt = firstNonEmpty(req.HiddenPrompt, next.HiddenPrompt)
+		next.RequestFingerprint = req.RequestFingerprint
 		next.Source = firstNonEmpty(req.Source, next.Source)
 		next.Transport = firstNonEmpty(req.Transport, next.Transport)
 		if req.Ephemeral {
@@ -677,7 +715,7 @@ func (s *ConversationStore) AppendAssistantDelta(conversationID string, delta st
 	)
 	s.mu.Lock()
 	current := s.items[conversationID]
-	if current != nil {
+	if current != nil && conversationStatusBusy(current.Status) {
 		next := cloneConversationEntry(current)
 		assistant := s.ensureAssistantMessageLocked(&next, now)
 		assistant.Content += delta
@@ -708,6 +746,9 @@ func (s *ConversationStore) AppendAssistantDelta(conversationID string, delta st
 }
 
 func (s *ConversationStore) Complete(conversationID string, result InferenceResult) {
+	if result.cachedReplay {
+		return
+	}
 	now := time.Now().UTC()
 	var (
 		summary ConversationSummary
@@ -727,6 +768,8 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 		next.TraceID = strings.TrimSpace(result.TraceID)
 		next.MessageID = strings.TrimSpace(result.MessageID)
 		next.AccountEmail = strings.TrimSpace(result.AccountEmail)
+		next.SpaceID = firstNonEmpty(result.SpaceID, next.SpaceID)
+		next.SpaceViewID = firstNonEmpty(result.SpaceViewID, next.SpaceViewID)
 		next.Error = ""
 		next.OutputAttachments = cloneUploadedAttachments(result.Attachments)
 		assistant := s.ensureAssistantMessageLocked(&next, now)
@@ -747,12 +790,12 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 	s.mu.Unlock()
 	if ok {
 		s.broadcast(ConversationEvent{
-		Type:           "conversation.completed",
-		ConversationID: conversationID,
-		At:             now,
-		Summary:        &summary,
-		Conversation:   entry,
-	})
+			Type:           "conversation.completed",
+			ConversationID: conversationID,
+			At:             now,
+			Summary:        &summary,
+			Conversation:   entry,
+		})
 	}
 }
 
@@ -794,13 +837,13 @@ func (s *ConversationStore) Fail(conversationID string, err error) {
 	s.mu.Unlock()
 	if ok {
 		s.broadcast(ConversationEvent{
-		Type:           "conversation.failed",
-		ConversationID: conversationID,
-		At:             now,
-		Error:          message,
-		Summary:        &summary,
-		Conversation:   entry,
-	})
+			Type:           "conversation.failed",
+			ConversationID: conversationID,
+			At:             now,
+			Error:          message,
+			Summary:        &summary,
+			Conversation:   entry,
+		})
 	}
 }
 
@@ -925,7 +968,7 @@ func (s *ConversationStore) Get(conversationID string) (ConversationEntry, bool)
 // the process dies mid-request the entry still records what was in flight and
 // startup reconciliation can fail the turn cleanly without orphaning the thread.
 // Only running turns carry an execution target; finished entries are untouched.
-func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID string, accountEmail string) bool {
+func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID string, accountEmail string, spaceID string) bool {
 	conversationID = strings.TrimSpace(conversationID)
 	threadID = strings.TrimSpace(threadID)
 	accountEmail = strings.TrimSpace(accountEmail)
@@ -942,6 +985,7 @@ func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID s
 	next := cloneConversationEntry(entry)
 	next.ThreadID = threadID
 	next.AccountEmail = accountEmail
+	next.SpaceID = spaceID
 	next.UpdatedAt = now
 	s.items[conversationID] = &next
 	summary := buildConversationSummary(&next)
@@ -1047,7 +1091,7 @@ func (s *ConversationStore) FindByThreadID(threadID string) (ConversationEntry, 
 // change), so it must never bridge different client scopes: entries carry the
 // client scope they were created with, and only an exact match is allowed.
 func (s *ConversationStore) FindContinuationBySegments(history []conversationPromptSegment, clientScope string) (ConversationEntry, bool) {
-	normalizedHistory := normalizeConversationHistorySegments(history)
+	normalizedHistory := exactConversationSegments(history)
 	if len(normalizedHistory) == 0 {
 		return ConversationEntry{}, false
 	}
@@ -1065,7 +1109,7 @@ func (s *ConversationStore) FindContinuationBySegments(history []conversationPro
 			continue
 		}
 		entrySegments := conversationMessageSegments(entry)
-		if !conversationSegmentsMatchSuffix(entrySegments, normalizedHistory) {
+		if !exactHistorySuffix(entrySegments, normalizedHistory) {
 			continue
 		}
 		return copyConversationEntryValue(entry), true
@@ -1154,18 +1198,21 @@ func (s *ServerState) deleteResponsesByConversationOrThread(conversationID strin
 
 func (a *App) beginConversation(preferredConversationID string, source string, transport string, displayPrompt string, request PromptRunRequest) string {
 	entry := a.State.conversations().Create(ConversationCreateRequest{
-		PreferredID:      preferredConversationID,
-		Ephemeral:        request.EphemeralConversation,
-		EphemeralReason:  request.EphemeralReason,
-		AutoDeleteAt:     request.EphemeralDeleteAfter,
-		Source:           source,
-		Transport:        transport,
-		ClientScope:      request.ClientScope,
-		Model:            request.PublicModel,
-		NotionModel:      request.NotionModel,
-		Prompt:           displayPrompt,
-		UseWebSearch:     request.UseWebSearch,
-		InputAttachments: summarizeInputAttachments(request.Attachments),
+		PreferredID:        preferredConversationID,
+		Ephemeral:          request.EphemeralConversation,
+		EphemeralReason:    request.EphemeralReason,
+		AutoDeleteAt:       request.EphemeralDeleteAfter,
+		Source:             source,
+		Transport:          transport,
+		ClientScope:        request.ClientScope,
+		History:            request.HistorySegments,
+		HiddenPrompt:       request.HiddenPrompt,
+		RequestFingerprint: conversationRequestFingerprint(request),
+		Model:              request.PublicModel,
+		NotionModel:        request.NotionModel,
+		Prompt:             displayPrompt,
+		UseWebSearch:       request.UseWebSearch,
+		InputAttachments:   summarizeInputAttachments(request.Attachments),
 	})
 	a.State.persistConversationSnapshot(entry.ID)
 	return entry.ID
@@ -1173,16 +1220,19 @@ func (a *App) beginConversation(preferredConversationID string, source string, t
 
 func (a *App) continueConversation(conversationID string, source string, transport string, displayPrompt string, request PromptRunRequest) (string, error) {
 	entry, err := a.State.conversations().Continue(conversationID, ConversationCreateRequest{
-		Ephemeral:        request.EphemeralConversation,
-		EphemeralReason:  request.EphemeralReason,
-		AutoDeleteAt:     request.EphemeralDeleteAfter,
-		Source:           source,
-		Transport:        transport,
-		Model:            request.PublicModel,
-		NotionModel:      request.NotionModel,
-		Prompt:           displayPrompt,
-		UseWebSearch:     request.UseWebSearch,
-		InputAttachments: summarizeInputAttachments(request.Attachments),
+		HiddenPrompt:       request.HiddenPrompt,
+		RequestFingerprint: conversationRequestFingerprint(request),
+		Replay:             request.replayResult != nil,
+		Ephemeral:          request.EphemeralConversation,
+		EphemeralReason:    request.EphemeralReason,
+		AutoDeleteAt:       request.EphemeralDeleteAfter,
+		Source:             source,
+		Transport:          transport,
+		Model:              request.PublicModel,
+		NotionModel:        request.NotionModel,
+		Prompt:             displayPrompt,
+		UseWebSearch:       request.UseWebSearch,
+		InputAttachments:   summarizeInputAttachments(request.Attachments),
 	})
 	if err != nil {
 		return "", err
@@ -1216,6 +1266,13 @@ func (a *App) completeConversation(conversationID string, result InferenceResult
 }
 
 func (a *App) persistConversationSession(conversationID string, request PromptRunRequest, result InferenceResult) {
+	if result.cachedReplay {
+		return
+	}
+	if request.UpstreamThreadID != "" && request.UpstreamThreadID != result.ThreadID {
+		request.continuationDraft = nil
+		request.continuationScaffold = nil
+	}
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" || request.SuppressUpstreamThreadPersistence || strings.TrimSpace(result.ThreadID) == "" {
 		return
@@ -1248,6 +1305,8 @@ func (a *App) persistConversationSession(conversationID string, request PromptRu
 		Fingerprint:      strings.TrimSpace(request.SessionFingerprint),
 		ThreadID:         strings.TrimSpace(result.ThreadID),
 		AccountEmail:     strings.TrimSpace(result.AccountEmail),
+		SpaceID:          strings.TrimSpace(result.SpaceID),
+		SpaceViewID:      strings.TrimSpace(result.SpaceViewID),
 		ConfigID:         strings.TrimSpace(result.ConfigID),
 		ContextID:        strings.TrimSpace(result.ContextID),
 		OriginalDatetime: strings.TrimSpace(result.OriginalDatetime),
@@ -1343,13 +1402,14 @@ func (a *App) notionClientForAccount(ctx context.Context, accountEmail string) (
 			account = ensureAccountPaths(cfg, account)
 			session, err := loadSessionInfoForAccountRefresh(cfg, account)
 			if err != nil {
-				if fallbackClient != nil {
-					return fallbackClient, nil
-				}
 				return nil, fmt.Errorf("load account session for %s: %w", email, err)
 			}
 			return newNotionAIClient(session, cfg, email), nil
 		}
+		if len(cfg.Accounts) == 0 && canonicalEmailKey(snapshot.UserEmail) == canonicalEmailKey(email) && fallbackClient != nil {
+			return fallbackClient, nil
+		}
+		return nil, fmt.Errorf("account %s not found", email)
 	}
 	if fallbackClient != nil {
 		return fallbackClient, nil
@@ -1390,6 +1450,10 @@ func (a *App) deleteConversation(conversationID string) error {
 			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 			return err
 		}
+		if entry.SpaceID != "" && entry.SpaceID != client.Session.SpaceID {
+			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
+			return errConversationWorkspaceMismatch
+		}
 		if err := client.deleteThread(ctx, threadID); err != nil {
 			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 			return err
@@ -1420,7 +1484,7 @@ func (a *App) deleteConversation(conversationID string) error {
 // upstream thread, and a retry reuses the same thread rather than spawning a
 // new one. Continuation turns carry their own scaffold and requests with an
 // upstream thread are already pinned, so neither gets a new target.
-func (a *App) preparePromptExecutionTarget(request *PromptRunRequest, accountEmail string) {
+func (a *App) preparePromptExecutionTarget(request *PromptRunRequest, accountEmail string, spaceID string) {
 	if a == nil || a.State == nil || request == nil {
 		return
 	}
@@ -1438,7 +1502,7 @@ func (a *App) preparePromptExecutionTarget(request *PromptRunRequest, accountEma
 		return
 	}
 	request.onThreadPrepared = func(threadID string) {
-		a.State.conversations().SetExecutionTarget(conversationID, threadID, accountEmail)
+		a.State.conversations().SetExecutionTarget(conversationID, threadID, accountEmail, spaceID)
 		a.State.persistConversationSnapshot(conversationID)
 	}
 	request.onThreadPrepared(request.preparedThreadID)

@@ -37,7 +37,7 @@ import type { TabKey } from '@/lib/services/admin/types';
 
 const TAB_LABEL: Record<TabKey, string> = {
   dashboard: '状态',
-  tester: 'API Tester',
+  tester: '聊天',
   conversations: '会话',
   settings: '设置',
   accounts: '账号',
@@ -47,6 +47,7 @@ const TAB_LABEL: Record<TabKey, string> = {
 export function AdminConsole() {
   const consoleState = useAdminConsole();
   const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [resumeConversationID, setResumeConversationID] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
   const [isFullWidth, setIsFullWidth] = useState(false);
@@ -107,9 +108,12 @@ export function AdminConsole() {
             models={models}
             defaultModel={defaultModel}
             defaultWebSearch={defaultWebSearch}
-            onRun={async (payload) => {
-              const result = await services.testPrompt(payload);
-              await loadConversations();
+            initialConversationID={resumeConversationID}
+            onResumeHandled={() => setResumeConversationID('')}
+            onLoad={(id) => services.getConversation(id, true)}
+            onRun={async (payload, onDelta, signal) => {
+              const result = await services.streamTestPrompt(payload, onDelta, signal);
+              void loadConversations().catch(() => undefined);
               return result;
             }}
           />
@@ -128,6 +132,7 @@ export function AdminConsole() {
             }}
             onDelete={deleteConversation}
             onBatchDelete={batchDeleteConversations}
+            onContinue={(id) => { setResumeConversationID(id); setActiveTab('tester'); }}
           />
         );
       case 'settings':
@@ -269,6 +274,8 @@ export function AdminConsole() {
                 variant="outline"
                 size="icon"
                 className="lg:hidden"
+                aria-label="打开导航菜单"
+                title="打开导航菜单"
                 onClick={() => setMobileNavOpen(true)}
               >
                 <Menu className="size-4" />

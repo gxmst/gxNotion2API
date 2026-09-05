@@ -263,6 +263,8 @@ type InferenceResult struct {
 	Model            string               `json:"model"`
 	NotionModel      string               `json:"notion_model"`
 	AccountEmail     string               `json:"account_email,omitempty"`
+	SpaceID          string               `json:"space_id,omitempty"`
+	SpaceViewID      string               `json:"space_view_id,omitempty"`
 	ThreadID         string               `json:"thread_id"`
 	TraceID          string               `json:"trace_id"`
 	Text             string               `json:"text"`
@@ -275,6 +277,7 @@ type InferenceResult struct {
 	ConfigID         string               `json:"config_id,omitempty"`
 	ContextID        string               `json:"context_id,omitempty"`
 	OriginalDatetime string               `json:"original_datetime,omitempty"`
+	cachedReplay     bool
 }
 
 type InferenceTranscriptSummary struct {
@@ -290,6 +293,7 @@ type PromptRunRequest struct {
 	Prompt                            string
 	LatestUserPrompt                  string
 	HiddenPrompt                      string
+	HistorySegments                   []conversationPromptSegment
 	PublicModel                       string
 	NotionModel                       string
 	ClientProfile                     string
@@ -301,6 +305,7 @@ type PromptRunRequest struct {
 	UseWebSearch                      bool
 	Attachments                       []InputAttachment
 	PinnedAccountEmail                string
+	PinnedSpaceID                     string
 	AllowPinnedAccountFallback        bool
 	StreamReasoningWarmup             bool
 	SuppressReasoningOutput           bool
@@ -819,9 +824,14 @@ func newNotionAIClientWithMode(session SessionInfo, cfg AppConfig, accountEmail 
 	if surfMainTransportEnabled(normalizedCfg) {
 		if surfClient, err := surfMainClientWithTimeout(proxy, clientTimeout); err == nil {
 			client.HTTPClient = surfClient
-			client.FallbackHTTPClient = nativeClient
+			if normalizedCfg.Features.AllowNativeTransportFallback {
+				client.FallbackHTTPClient = nativeClient
+			}
 		} else {
-			log.Printf("[transport] surf impersonation unavailable, using native net/http: %v", err)
+			log.Printf("[transport] surf impersonation unavailable: %v", err)
+			if !normalizedCfg.Features.AllowNativeTransportFallback {
+				client.HTTPClient = &http.Client{Transport: unavailableSurfTransport{err: err}}
+			}
 		}
 	}
 	return client
@@ -3986,6 +3996,23 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 }
 
 func (c *NotionAIClient) preparePromptRequest(ctx context.Context, req PromptRunRequest) (string, []UploadedAttachment, string, map[string]any, inferencePayloadMeta, error) {
+	if req.UpstreamThreadID != "" {
+		spaceID := req.PinnedSpaceID
+		if spaceID == "" {
+			// Legacy records and bare thread IDs have no persisted workspace.
+			// Verify ownership before uploading files or appending thread steps.
+			data, err := c.syncThread(ctx, req.UpstreamThreadID)
+			if err != nil {
+				return "", nil, "", nil, inferencePayloadMeta{}, fmt.Errorf("verify conversation workspace: %w", err)
+			}
+			record := mapValue(mapValue(mapValue(data["recordMap"])["thread"])[req.UpstreamThreadID])
+			value := mapValue(mapValue(record["value"])["value"])
+			spaceID = firstNonEmpty(stringValue(value["space_id"]), stringValue(record["spaceId"]))
+		}
+		if spaceID == "" || spaceID != c.Session.SpaceID {
+			return "", nil, "", nil, inferencePayloadMeta{}, errConversationWorkspaceMismatch
+		}
+	}
 	cleanPrompt := strings.TrimSpace(req.Prompt)
 	if cleanPrompt == "" && len(req.Attachments) == 0 {
 		return "", nil, "", nil, inferencePayloadMeta{}, fmt.Errorf("prompt is empty")
