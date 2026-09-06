@@ -16,6 +16,8 @@ type chatCompletionsRequestBody struct {
 	NotionThreadID     string   `json:"notion_thread_id,omitempty"`
 	AccountEmail       string   `json:"account_email,omitempty"`
 	NotionAccountEmail string   `json:"notion_account_email,omitempty"`
+	WorkspaceID        string   `json:"workspace_id,omitempty"`
+	SpaceID            string   `json:"space_id,omitempty"`
 	UseWebSearch       *bool    `json:"use_web_search,omitempty"`
 	Metadata           any      `json:"metadata,omitempty"`
 	Tools              any      `json:"tools,omitempty"`
@@ -42,6 +44,8 @@ type responsesRequestBody struct {
 	NotionThreadID     string `json:"notion_thread_id,omitempty"`
 	AccountEmail       string `json:"account_email,omitempty"`
 	NotionAccountEmail string `json:"notion_account_email,omitempty"`
+	WorkspaceID        string `json:"workspace_id,omitempty"`
+	SpaceID            string `json:"space_id,omitempty"`
 	UseWebSearch       *bool  `json:"use_web_search,omitempty"`
 	Metadata           any    `json:"metadata,omitempty"`
 	Tools              any    `json:"tools,omitempty"`
@@ -74,6 +78,8 @@ func normalizeTypedChatCompletionsRequestBody(body chatCompletionsRequestBody) c
 	body.NotionThreadID = strings.TrimSpace(body.NotionThreadID)
 	body.AccountEmail = strings.TrimSpace(body.AccountEmail)
 	body.NotionAccountEmail = strings.TrimSpace(body.NotionAccountEmail)
+	body.WorkspaceID = strings.TrimSpace(body.WorkspaceID)
+	body.SpaceID = strings.TrimSpace(body.SpaceID)
 	body.Type = strings.TrimSpace(body.Type)
 	body.UserName = strings.TrimSpace(body.UserName)
 	body.CharName = strings.TrimSpace(body.CharName)
@@ -96,6 +102,8 @@ func normalizeTypedResponsesRequestBody(body responsesRequestBody) responsesRequ
 	body.NotionThreadID = strings.TrimSpace(body.NotionThreadID)
 	body.AccountEmail = strings.TrimSpace(body.AccountEmail)
 	body.NotionAccountEmail = strings.TrimSpace(body.NotionAccountEmail)
+	body.WorkspaceID = strings.TrimSpace(body.WorkspaceID)
+	body.SpaceID = strings.TrimSpace(body.SpaceID)
 	return body
 }
 
@@ -120,6 +128,8 @@ func extractChatCompletionsRequestBody(payload map[string]any) chatCompletionsRe
 		NotionThreadID:     strings.TrimSpace(stringValue(payload["notion_thread_id"])),
 		AccountEmail:       strings.TrimSpace(stringValue(payload["account_email"])),
 		NotionAccountEmail: strings.TrimSpace(stringValue(payload["notion_account_email"])),
+		WorkspaceID:        strings.TrimSpace(stringValue(payload["workspace_id"])),
+		SpaceID:            strings.TrimSpace(stringValue(payload["space_id"])),
 		Type:               strings.TrimSpace(stringValue(payload["type"])),
 		UserName:           strings.TrimSpace(stringValue(payload["user_name"])),
 		CharName:           strings.TrimSpace(stringValue(payload["char_name"])),
@@ -161,6 +171,8 @@ func extractResponsesRequestBody(payload map[string]any) responsesRequestBody {
 		NotionThreadID:     strings.TrimSpace(stringValue(payload["notion_thread_id"])),
 		AccountEmail:       strings.TrimSpace(stringValue(payload["account_email"])),
 		NotionAccountEmail: strings.TrimSpace(stringValue(payload["notion_account_email"])),
+		WorkspaceID:        strings.TrimSpace(stringValue(payload["workspace_id"])),
+		SpaceID:            strings.TrimSpace(stringValue(payload["space_id"])),
 	}
 	body.Stream, _ = payload["stream"].(bool)
 	if value, ok := parseBoolField(payload["use_web_search"]); ok {
@@ -209,6 +221,18 @@ func requestedAccountEmailFromTyped(r *http.Request, accountEmail string, notion
 		}
 	}
 	return parseStringFieldFromMetadataAny(metadata, "account_email", "notion_account_email")
+}
+
+func requestedWorkspaceID(r *http.Request, workspaceID string, spaceID string, metadata any) string {
+	if fromHeader := firstRequestValue(r, "X-Workspace-ID", "X-Notion-Workspace-ID", "X-Notion-Space-ID"); fromHeader != "" {
+		return fromHeader
+	}
+	for _, value := range []string{workspaceID, spaceID} {
+		if clean := strings.TrimSpace(value); clean != "" {
+			return clean
+		}
+	}
+	return parseStringFieldFromMetadataAny(metadata, "workspace_id", "notion_workspace_id", "space_id", "notion_space_id")
 }
 
 func requestedWebSearchFromTyped(useWebSearch *bool, metadata any, tools any, fallback bool) bool {

@@ -116,6 +116,8 @@ HTTP 请求优先顺序：
 - `resin_enabled` / `resin_url` / `resin_platform` / `resin_mode`
 - `accounts[*].sticky_proxy_account`
 - `accounts` / `active_account`
+- `accounts[*].workspaces` / `accounts[*].default_workspace_id`
+- `active_workspace_id`
 - `storage.sqlite_path`
 
 可直接参考：
@@ -167,6 +169,14 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 
 省略 `email` 时使用当前活动账号。与导入时相反，这个接口让上游返回的定义**覆盖**配置里的同名条目，因此上游改过代号的模型会被纠正，而不是被旧值挡住。
 
+### 多账号与多工作区
+
+账号是凭证和登录态的边界，工作区是额度、冷却和并发的边界。一个账号可以保存多个工作区，多个账号也可以共同指向同一个工作区。导入或登录时会保留自动发现的全部工作区，并优先选择带付费订阅且启用 AI 的工作区作为默认值；旧配置里的 `space_id` / `space_view_id` 会自动迁移成一个 workspace。
+
+`workspace_id` 是新的请求字段，`space_id` 仍作为兼容别名。请求级选择支持 JSON 字段、`X-Workspace-ID`、`X-Notion-Workspace-ID`、`X-Notion-Space-ID`；未指定时使用活动工作区，再回退到账号默认工作区。工作区选择不会改变账号的 cookie、probe、浏览器 profile 或代理身份。
+
+管理台的账号详情可以查看全部工作区，并分别设置本地每小时额度、最大并发、默认工作区；激活和快速测试也会携带所选工作区。AI 额度查询按“账号 + 工作区”返回，不会把同一账号下的多个区合并成一个数。
+
 ### 工作区选择（免费区会静默失败）
 
 `space_id` 决定推理落在哪个工作区，而 AI 额度是按工作区算的，不是按账号算的。一个账号有多个区时，probe 里记的往往是默认的个人区——如果那是免费区，试用额度用完之后的表现是：
@@ -192,9 +202,17 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
   -d '{"probe_json_text":"<probe json>","space_id":"<付费区>","space_view_id":"<对应 space_view>"}'
 ```
 
+同一个邮箱再次导入另一个工作区时，账号的登录文件会复用，新的 workspace 会合并进原账号，不会覆盖原来的 workspace。需要将导入的 workspace 设为默认时，可在管理台点击“设为默认工作区”，或调用：
+
+```bash
+curl -X PUT http://127.0.0.1:8787/admin/accounts \
+  -H "X-Admin-Token: <token>" -H "Content-Type: application/json" \
+  -d '{"email":"you@example.com","workspace_id":"<付费区>","default_workspace_id":"<付费区>","hourly_quota":0,"max_concurrency":2}'
+```
+
 切区之后要清掉已存的会话记录：里面的 thread 属于旧区，复用它们会稳定失败。
 
-选定的区会被保留：会话刷新只在账号还没有 `space_id` 时才采纳自动发现的结果。上游 `getSpacesInitial` 只返回 `space_view_pointers` 的顺序（不含 plan/tier 字段），而多区账号的第一个指针通常就是免费个人区，所以早期版本每次刷新都会把推理悄悄挪回免费区——症状和上面完全一样，但发生在已经切好区之后。首次导入走 `loadUserContent` 时按 `subscription_tier` 优选付费区；注意免费个人区的 `plan_type` 是 `personal` 而不是 `free`，只看 `plan_type` 区分不出来。
+选定的工作区会被保留：会话刷新、启动恢复和 SQLite 持久化都会使用活动 workspace，不会把推理悄悄挪回免费区。上游 `getSpacesInitial` 只返回 `space_view_pointers` 的顺序（不含 plan/tier 字段），而多区账号的第一个指针通常就是免费个人区，所以早期版本每次刷新都会把推理挪回免费区——症状和上面完全一样，但发生在已经切好区之后。首次导入走 `loadUserContent` 时按 `subscription_tier` 优选付费区；注意免费个人区的 `plan_type` 是 `personal` 而不是 `free`，只看 `plan_type` 区分不出来。
 
 ### 把管理台放到公网（反代）
 

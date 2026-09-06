@@ -15,6 +15,7 @@ type discoveredAccountMetadata struct {
 	SpaceViewID   string
 	SpaceName     string
 	PlanType      string
+	Workspaces    []discoveredSpaceCandidate
 	ClientVersion string
 	Models        []ModelDefinition
 }
@@ -71,22 +72,21 @@ func boolValue(v any) bool {
 	return false
 }
 
-func chooseBestSpace(recordMap map[string]any, userID string) discoveredSpaceCandidate {
+func discoverSpaceCandidates(recordMap map[string]any, userID string) []discoveredSpaceCandidate {
 	if recordMap == nil || strings.TrimSpace(userID) == "" {
-		return discoveredSpaceCandidate{}
+		return nil
 	}
 	userRoots := mapValue(recordMap["user_root"])
 	spaces := mapValue(recordMap["space"])
 	if userRoots == nil || spaces == nil {
-		return discoveredSpaceCandidate{}
+		return nil
 	}
 	root := unwrapRecordValue(userRoots[userID])
 	if root == nil {
-		return discoveredSpaceCandidate{}
+		return nil
 	}
 	pointers := sliceValue(root["space_view_pointers"])
-	best := discoveredSpaceCandidate{}
-	bestScore := -1
+	candidates := make([]discoveredSpaceCandidate, 0, len(pointers))
 	for _, rawPointer := range pointers {
 		pointer := mapValue(rawPointer)
 		spaceID := strings.TrimSpace(stringValue(pointer["spaceId"]))
@@ -108,24 +108,37 @@ func chooseBestSpace(recordMap map[string]any, userID string) discoveredSpaceCan
 			SubscriptionTier: strings.TrimSpace(stringValue(value["subscription_tier"])),
 			AIEnabled:        enabledAI || !disabledAI,
 		}
-		// A paid subscription outweighs everything else: AI quota is billed per
-		// workspace, and a free workspace accepts messages then silently never
-		// answers once its trial allowance is gone. Weight it above AIEnabled,
-		// which is true for free workspaces too.
-		score := 0
-		if paidSubscriptionTier(candidate.SubscriptionTier) {
-			score += 4
-		}
-		if candidate.AIEnabled {
-			score += 2
-		}
-		if plan := strings.ToLower(candidate.PlanType); plan != "" && plan != "personal" {
-			score++
-		}
-		if candidate.Name != "" {
-			score++
-		}
-		if score > bestScore {
+		candidates = append(candidates, candidate)
+	}
+	return candidates
+}
+
+func spaceCandidateScore(candidate discoveredSpaceCandidate) int {
+	// A paid subscription outweighs everything else: AI quota is billed per
+	// workspace, and a free workspace accepts messages then silently never
+	// answers once its trial allowance is gone. Weight it above AIEnabled,
+	// which is true for free workspaces too.
+	score := 0
+	if paidSubscriptionTier(candidate.SubscriptionTier) {
+		score += 4
+	}
+	if candidate.AIEnabled {
+		score += 2
+	}
+	if plan := strings.ToLower(candidate.PlanType); plan != "" && plan != "personal" {
+		score++
+	}
+	if candidate.Name != "" {
+		score++
+	}
+	return score
+}
+
+func chooseBestSpace(recordMap map[string]any, userID string) discoveredSpaceCandidate {
+	best := discoveredSpaceCandidate{}
+	bestScore := -1
+	for _, candidate := range discoverSpaceCandidates(recordMap, userID) {
+		if score := spaceCandidateScore(candidate); score > bestScore {
 			best = candidate
 			bestScore = score
 		}
@@ -150,7 +163,15 @@ func parseLoadUserContentMetadata(payload map[string]any) discoveredAccountMetad
 		meta.UserName = strings.TrimSpace(stringValue(value["name"]))
 		break
 	}
-	space := chooseBestSpace(recordMap, meta.UserID)
+	meta.Workspaces = discoverSpaceCandidates(recordMap, meta.UserID)
+	space := discoveredSpaceCandidate{}
+	bestScore := -1
+	for _, candidate := range meta.Workspaces {
+		if score := spaceCandidateScore(candidate); score > bestScore {
+			space = candidate
+			bestScore = score
+		}
+	}
 	meta.SpaceID = space.ID
 	meta.SpaceViewID = space.ViewID
 	meta.SpaceName = space.Name
@@ -268,6 +289,9 @@ func discoverImportedAccountMetadata(ctx context.Context, cfg AppConfig, account
 			meta.Email = firstNonEmpty(meta.Email, discovered.Email)
 			meta.UserID = firstNonEmpty(meta.UserID, discovered.UserID)
 			meta.UserName = firstNonEmpty(meta.UserName, discovered.UserName)
+			if len(discovered.Workspaces) > 0 {
+				meta.Workspaces = discovered.Workspaces
+			}
 			// The view id has to come from the same space as the id it accompanies,
 			// so adopt the pair together or not at all.
 			if strings.TrimSpace(meta.SpaceID) == "" {
@@ -292,6 +316,9 @@ func discoverImportedAccountMetadata(ctx context.Context, cfg AppConfig, account
 				if strings.TrimSpace(meta.SpaceID) == "" {
 					meta.SpaceID = bootstrap.SpaceID
 					meta.SpaceViewID = bootstrap.SpaceViewID
+				}
+				if len(meta.Workspaces) == 0 && bootstrap.SpaceID != "" {
+					meta.Workspaces = []discoveredSpaceCandidate{{ID: bootstrap.SpaceID, ViewID: bootstrap.SpaceViewID, Name: meta.SpaceName}}
 				}
 			} else if primaryErr == nil {
 				primaryErr = err

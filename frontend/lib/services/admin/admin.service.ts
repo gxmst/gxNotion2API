@@ -128,10 +128,10 @@ export const AdminService = {
       body: JSON.stringify(payload),
     });
   },
-  activateAccount(email: string) {
+  activateAccount(email: string, workspaceId?: string) {
     return apiFetch<JsonResult>('/admin/accounts/activate', {
       method: 'POST',
-      body: JSON.stringify({ email }),
+      body: JSON.stringify({ email, workspace_id: workspaceId }),
     });
   },
   deleteAccount(email: string) {

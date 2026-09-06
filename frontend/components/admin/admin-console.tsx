@@ -189,8 +189,8 @@ export function AdminConsole() {
               await loadConversations();
               return result;
             }}
-            onActivate={async (email) => {
-              const payload = await services.activateAccount(email);
+            onActivate={async (email, workspaceId) => {
+              const payload = await services.activateAccount(email, workspaceId);
               await refreshAll();
               return payload;
             }}

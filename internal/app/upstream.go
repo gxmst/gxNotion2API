@@ -95,4 +95,3 @@ func proxyFromEnvironmentFresh(req *http.Request) (*url.URL, error) {
 	}
 	return nil, nil
 }
-

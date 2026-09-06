@@ -32,7 +32,7 @@ import {
   Subsection,
   formatMaybeDate,
 } from '@/components/admin/shared';
-import type { AccountItem, AccountsPayload, JsonResult, ModelItem } from '@/lib/services/admin/types';
+import type { AccountItem, AccountsPayload, JsonResult, ModelItem, WorkspaceItem } from '@/lib/services/admin/types';
 
 interface AccountEditState {
   priority: number;
@@ -80,14 +80,74 @@ const defaultManualImportState: ManualImportState = {
 function buildAccountEditMap(items: AccountItem[]): Record<string, AccountEditState> {
   return items.reduce<Record<string, AccountEditState>>((accumulator, item) => {
     if (!item.email) return accumulator;
-    accumulator[item.email] = {
-      priority: Number(item.priority ?? 0),
-      hourlyQuota: Number(item.hourly_quota ?? 0),
-      maxConcurrency: Math.max(1, Number(item.max_concurrency ?? 1)),
-      disabled: Boolean(item.disabled),
-    };
+    const workspaces = item.workspaces?.length
+      ? item.workspaces
+      : item.space_id
+        ? [{
+            id: item.space_id,
+            view_id: item.space_view_id,
+            name: item.space_name,
+            plan_type: item.plan_type,
+            priority: item.priority,
+            hourly_quota: item.hourly_quota,
+            max_concurrency: item.max_concurrency,
+            quota_limited: item.quota_limited,
+            remaining_quota: item.remaining_quota,
+            cooldown_active: item.cooldown_active,
+            cooldown_remaining_sec: item.cooldown_remaining_sec,
+            total_successes: item.total_successes,
+            total_failures: item.total_failures,
+            last_used_at: item.last_used_at,
+          } satisfies WorkspaceItem]
+        : [];
+    if (!workspaces.length) {
+      accumulator[item.email] = {
+        priority: Number(item.priority ?? 0),
+        hourlyQuota: Number(item.hourly_quota ?? 0),
+        maxConcurrency: Math.max(1, Number(item.max_concurrency ?? 1)),
+        disabled: Boolean(item.disabled),
+      };
+      return accumulator;
+    }
+    for (const workspace of workspaces) {
+      accumulator[workspaceEditKey(item.email, workspace.id)] = {
+        priority: Number(workspace.priority ?? 0),
+        hourlyQuota: Number(workspace.hourly_quota ?? 0),
+        maxConcurrency: Math.max(1, Number(workspace.max_concurrency ?? 1)),
+        disabled: Boolean(item.disabled),
+      };
+    }
     return accumulator;
   }, {});
+}
+
+function workspaceEditKey(email: string, workspaceId?: string) {
+  return `${email}\u0000${workspaceId || 'account'}`;
+}
+
+function workspaceItems(item: AccountItem): WorkspaceItem[] {
+  if (item.workspaces?.length) return item.workspaces;
+  if (!item.space_id) return [];
+  return [{
+    id: item.space_id,
+    view_id: item.space_view_id,
+    name: item.space_name,
+    plan_type: item.plan_type,
+    priority: item.priority,
+    hourly_quota: item.hourly_quota,
+    max_concurrency: item.max_concurrency,
+    quota_limited: item.quota_limited,
+    remaining_quota: item.remaining_quota,
+    cooldown_active: item.cooldown_active,
+    cooldown_remaining_sec: item.cooldown_remaining_sec,
+    total_successes: item.total_successes,
+    total_failures: item.total_failures,
+    last_used_at: item.last_used_at,
+  }];
+}
+
+function workspaceTitle(workspace: WorkspaceItem) {
+  return workspace.name?.trim() || workspace.id;
 }
 
 function safeParseProbeJSON(raw: string): ProbeDraft | null {
@@ -157,10 +217,10 @@ function AccountListItem({
         <ChevronRight className={['mt-0.5 size-4 shrink-0', selected ? 'text-primary' : 'text-muted-foreground'].join(' ')} />
       </div>
       <div className="mt-3 grid gap-2 text-xs leading-5 text-muted-foreground sm:grid-cols-2">
-        <div>本地限速 · {quotaText(item)}</div>
-        <div>prio · {item.priority ?? 0}</div>
+        <div>工作区 · {item.workspaces?.length || (item.space_id ? 1 : 0)}</div>
+        <div>默认 · {item.workspaces?.find((workspace) => workspace.default)?.name || item.space_name || item.space_id || '-'}</div>
         <div>last login · {formatMaybeDate(item.last_login_at)}</div>
-        <div>space · {item.space_name || item.space_id || '-'}</div>
+        <div>当前限速 · {quotaText(item)}</div>
       </div>
     </button>
   );
@@ -187,12 +247,13 @@ export function AccountsPanel({
   onVerifyCode: (email: string, code: string) => Promise<unknown>;
   onImportAccount: (payload: JsonResult) => Promise<unknown>;
   onQuickTest: (payload: JsonResult) => Promise<unknown>;
-  onActivate: (email: string) => Promise<unknown>;
+  onActivate: (email: string, workspaceId?: string) => Promise<unknown>;
   onDelete: (email: string) => Promise<unknown>;
   onSaveAccountSettings: (payload: JsonResult) => Promise<unknown>;
 }) {
   const items = accountsPayload?.items || [];
   const activeAccount = accountsPayload?.active_account || '';
+  const activeWorkspaceID = accountsPayload?.active_workspace_id || '';
   const loginHelper = accountsPayload?.login_helper;
   const runtimeSession = accountsPayload?.session;
   const refreshRuntime = accountsPayload?.session_refresh_runtime;
@@ -211,6 +272,7 @@ export function AccountsPanel({
   const [manualBusy, setManualBusy] = useState(false);
 
   const [quickTestEmail, setQuickTestEmail] = useState('');
+  const [quickTestWorkspaceId, setQuickTestWorkspaceId] = useState('');
   const [quickTestModel, setQuickTestModel] = useState(defaultModel || models[0]?.id || 'auto');
   const [quickTestPrompt, setQuickTestPrompt] = useState('Reply with NOTION2API_ACCOUNT_OK only.');
   const [quickTestMessage, setQuickTestMessage] = useState('');
@@ -219,6 +281,12 @@ export function AccountsPanel({
 
   const [accountEdits, setAccountEdits] = useState<Record<string, AccountEditState>>({});
   const [selectedEmail, setSelectedEmail] = useState('');
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
+
+  const accountOptions = useMemo(
+    () => items.filter((item): item is AccountItem & { email: string } => Boolean(item.email)),
+    [items],
+  );
 
   useEffect(() => {
     setAccountEdits(buildAccountEditMap(items));
@@ -228,6 +296,25 @@ export function AccountsPanel({
     setVerifyEmail((current) => current || preferredEmail);
     setSelectedEmail((current) => (current && items.some((item) => item.email === current) ? current : preferredEmail));
   }, [activeAccount, items]);
+
+  useEffect(() => {
+    const item = accountOptions.find((candidate) => candidate.email === quickTestEmail);
+    const workspaces = item ? workspaceItems(item) : [];
+    setQuickTestWorkspaceId((current) => current && workspaces.some((workspace) => workspace.id === current)
+      ? current
+      : workspaces.find((workspace) => workspace.active)?.id || workspaces.find((workspace) => workspace.default)?.id || workspaces[0]?.id || '');
+  }, [accountOptions, quickTestEmail]);
+
+  useEffect(() => {
+    const item = accountOptions.find((candidate) => candidate.email === selectedEmail);
+    const workspaces = item ? workspaceItems(item) : [];
+    setSelectedWorkspaceId((current) => {
+      if (current && workspaces.some((workspace) => workspace.id === current)) return current;
+      return workspaces.find((workspace) => workspace.id === activeWorkspaceID)?.id ||
+        workspaces.find((workspace) => workspace.default)?.id ||
+        workspaces[0]?.id || '';
+    });
+  }, [accountOptions, activeWorkspaceID, selectedEmail]);
 
   useEffect(() => {
     setQuickTestModel((current) => current || defaultModel || models[0]?.id || 'auto');
@@ -261,20 +348,20 @@ export function AccountsPanel({
     }
   }, [manual.probeJsonText]);
 
-  const accountOptions = useMemo(
-    () => items.filter((item): item is AccountItem & { email: string } => Boolean(item.email)),
-    [items],
-  );
-
   const selectedAccount = useMemo(
     () => accountOptions.find((item) => item.email === selectedEmail) || null,
     [accountOptions, selectedEmail],
   );
 
+  const selectedWorkspace = useMemo(() => {
+    if (!selectedAccount) return null;
+    return workspaceItems(selectedAccount).find((workspace) => workspace.id === selectedWorkspaceId) || null;
+  }, [selectedAccount, selectedWorkspaceId]);
+
   const modelOptions = useMemo(() => models.filter((item) => item.id), [models]);
 
   const selectedEdit = selectedAccount?.email
-    ? accountEdits[selectedAccount.email] || { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false }
+    ? accountEdits[workspaceEditKey(selectedAccount.email, selectedWorkspace?.id)] || accountEdits[selectedAccount.email] || { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false }
     : { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false };
 
   const summaryCards = [
@@ -310,7 +397,10 @@ export function AccountsPanel({
   ];
 
   function populateEmail(email: string) {
+    const item = accountOptions.find((candidate) => candidate.email === email);
+    const workspaces = item ? workspaceItems(item) : [];
     setSelectedEmail(email);
+    setSelectedWorkspaceId(workspaces.find((workspace) => workspace.active)?.id || workspaces[0]?.id || '');
     setStartEmail(email);
     setVerifyEmail(email);
     setQuickTestEmail(email);
@@ -330,7 +420,7 @@ export function AccountsPanel({
     }));
   }
 
-  async function runQuickTest(email: string) {
+  async function runQuickTest(email: string, workspaceId = quickTestWorkspaceId) {
     setQuickTesting(true);
     setQuickTestEmail(email);
     setQuickTestMessage('测试中...');
@@ -338,6 +428,7 @@ export function AccountsPanel({
     try {
       const payload = await onQuickTest({
         email,
+        workspace_id: workspaceId,
         model: quickTestModel,
         prompt: quickTestPrompt.trim() || 'Reply with NOTION2API_ACCOUNT_OK only.',
       });
@@ -358,6 +449,7 @@ export function AccountsPanel({
     try {
       await onSaveAccountSettings({
         email,
+        workspace_id: selectedWorkspace?.id,
         priority: edit.priority,
         hourly_quota: edit.hourlyQuota,
         max_concurrency: edit.maxConcurrency,
@@ -369,13 +461,22 @@ export function AccountsPanel({
     }
   }
 
-  async function activateAccount(email: string) {
+  async function activateAccount(email: string, workspaceId = selectedWorkspace?.id) {
     try {
-      await onActivate(email);
-      toast.success(`已激活 ${email}`);
+      await onActivate(email, workspaceId);
+      toast.success(`已激活 ${email}${workspaceId ? ` · ${workspaceId}` : ''}`);
       populateEmail(email);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '激活账号失败');
+    }
+  }
+
+  async function setDefaultWorkspace(email: string, workspaceId: string) {
+    try {
+      await onSaveAccountSettings({ email, workspace_id: workspaceId, default_workspace_id: workspaceId });
+      toast.success(`已将 ${workspaceTitle(selectedWorkspace || { id: workspaceId })} 设为默认工作区`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : '设置默认工作区失败');
     }
   }
 
@@ -685,13 +786,32 @@ export function AccountsPanel({
             <InfoCard title="账号详情与操作" description="当前账号的运行信息与操作入口。">
               {selectedAccount ? (
                 <div className="space-y-5">
+                  {(() => {
+                    const workspaces = workspaceItems(selectedAccount);
+                    return workspaces.length ? (
+                      <DetailField label="Workspace" hint="额度、并发和会话目标都按这里选择的工作区计算。">
+                        <Select value={selectedWorkspace?.id || ''} onValueChange={setSelectedWorkspaceId} disabled={workspaces.length < 2}>
+                          <SelectTrigger className={FIELD_CLASS}>
+                            <SelectValue placeholder="选择工作区" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {workspaces.map((workspace) => (
+                              <SelectItem key={workspace.id} value={workspace.id}>
+                                {workspaceTitle(workspace)}{workspace.default ? ' · 默认' : ''}{workspace.active ? ' · 当前' : ''}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </DetailField>
+                    ) : null;
+                  })()}
                   <KeyValueGrid
                     items={[
                       { label: 'Email', value: selectedAccount.email },
                       { label: 'Status', value: selectedAccount.status || '-' },
                       { label: 'User', value: selectedAccount.user_name || selectedAccount.user_id || '-' },
-                      { label: 'Space', value: selectedAccount.space_name || selectedAccount.space_id || '-' },
-                      { label: 'Plan', value: selectedAccount.plan_type || '-' },
+                      { label: 'Workspace', value: selectedWorkspace ? `${workspaceTitle(selectedWorkspace)} (${selectedWorkspace.id})` : selectedAccount.space_name || selectedAccount.space_id || '-' },
+                      { label: 'Plan', value: selectedWorkspace?.plan_type || selectedAccount.plan_type || '-' },
                       { label: 'Last Login', value: formatMaybeDate(selectedAccount.last_login_at) },
                       { label: 'Client Version', value: selectedAccount.client_version || '-' },
                     ]}
@@ -755,16 +875,16 @@ export function AccountsPanel({
 
                     <Subsection eyebrow="Runtime" title="运行态摘要" description="最近登录、使用与失败记录。">
                       <div className="grid gap-3 sm:grid-cols-2">
-                        <MetaTile label="本地请求限速" value={quotaText(selectedAccount)} />
-                        <MetaTile
-                          label="Cooldown"
-                          value={selectedAccount.cooldown_active ? `${selectedAccount.cooldown_remaining_sec || 0}s` : 'ready'}
-                        />
-                        <MetaTile
-                          label="Success / Fail"
-                          value={`${selectedAccount.total_successes || 0} / ${selectedAccount.total_failures || 0}`}
-                        />
-                        <MetaTile label="Last Used" value={formatMaybeDate(selectedAccount.last_used_at)} />
+                        <MetaTile label="本地请求限速" value={quotaText(selectedWorkspace || selectedAccount)} />
+                          <MetaTile
+                            label="Cooldown"
+                            value={selectedWorkspace?.cooldown_active ? `${selectedWorkspace.cooldown_remaining_sec || 0}s` : 'ready'}
+                          />
+                          <MetaTile
+                            label="Success / Fail"
+                            value={`${selectedWorkspace?.total_successes || 0} / ${selectedWorkspace?.total_failures || 0}`}
+                          />
+                          <MetaTile label="Last Used" value={formatMaybeDate(selectedWorkspace?.last_used_at || selectedAccount.last_used_at)} />
                       </div>
                     </Subsection>
                   </div>
@@ -786,16 +906,24 @@ export function AccountsPanel({
 
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
                     <Button className="w-full" onClick={() => void saveAccount(selectedAccount.email, selectedEdit)}>
-                      保存设置
+                      保存工作区设置
+                    </Button>
+                    <Button
+                      className="w-full"
+                      variant="outline"
+                      disabled={!selectedWorkspace || selectedWorkspace.default}
+                      onClick={() => selectedWorkspace && void setDefaultWorkspace(selectedAccount.email, selectedWorkspace.id)}
+                    >
+                      设为默认工作区
                     </Button>
                     <Button className="w-full" variant="outline" onClick={() => populateEmail(selectedAccount.email)}>
                       填充到表单
                     </Button>
-                    <Button className="w-full" variant="outline" onClick={() => void activateAccount(selectedAccount.email)}>
-                      激活账号
+                    <Button className="w-full" variant="outline" onClick={() => void activateAccount(selectedAccount.email, selectedWorkspace?.id)}>
+                      激活工作区
                     </Button>
-                    <Button className="w-full" variant="outline" onClick={() => void runQuickTest(selectedAccount.email)}>
-                      测试账号
+                    <Button className="w-full" variant="outline" onClick={() => void runQuickTest(selectedAccount.email, selectedWorkspace?.id)}>
+                      测试工作区
                     </Button>
                     <Button
                       variant="outline"
@@ -839,6 +967,24 @@ export function AccountsPanel({
                   </SelectContent>
                 </Select>
               </DetailField>
+              {(() => {
+                const item = accountOptions.find((candidate) => candidate.email === quickTestEmail);
+                const workspaces = item ? workspaceItems(item) : [];
+                return workspaces.length > 1 ? (
+                  <DetailField label="Workspace">
+                    <Select value={quickTestWorkspaceId} onValueChange={setQuickTestWorkspaceId}>
+                      <SelectTrigger className={FIELD_CLASS}>
+                        <SelectValue placeholder="选择工作区" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {workspaces.map((workspace) => (
+                          <SelectItem key={workspace.id} value={workspace.id}>{workspaceTitle(workspace)}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </DetailField>
+                ) : null;
+              })()}
               <DetailField label="Model">
                 <Select value={quickTestModel} onValueChange={setQuickTestModel}>
                   <SelectTrigger className={FIELD_CLASS}>

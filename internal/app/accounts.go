@@ -29,26 +29,27 @@ type ResolvedSessionRefresh struct {
 }
 
 type LoginStatusFile struct {
-	Success          bool   `json:"success"`
-	Status           string `json:"status,omitempty"`
-	Email            string `json:"email,omitempty"`
-	ProfileDir       string `json:"profile_dir,omitempty"`
-	PendingStatePath string `json:"pending_state_path,omitempty"`
-	StorageStatePath string `json:"storage_state_path,omitempty"`
-	ProbePath        string `json:"probe_path,omitempty"`
-	UserID           string `json:"user_id,omitempty"`
-	UserName         string `json:"user_name,omitempty"`
-	SpaceID          string `json:"space_id,omitempty"`
-	SpaceViewID      string `json:"space_view_id,omitempty"`
-	SpaceName        string `json:"space_name,omitempty"`
-	ClientVersion    string `json:"client_version,omitempty"`
-	CurrentURL       string `json:"current_url,omitempty"`
-	FinalURL         string `json:"final_url,omitempty"`
-	Title            string `json:"title,omitempty"`
-	Message          string `json:"message,omitempty"`
-	Error            string `json:"error,omitempty"`
-	UpdatedAt        string `json:"updated_at,omitempty"`
-	LastLoginAt      string `json:"last_login_at,omitempty"`
+	Success          bool              `json:"success"`
+	Status           string            `json:"status,omitempty"`
+	Email            string            `json:"email,omitempty"`
+	ProfileDir       string            `json:"profile_dir,omitempty"`
+	PendingStatePath string            `json:"pending_state_path,omitempty"`
+	StorageStatePath string            `json:"storage_state_path,omitempty"`
+	ProbePath        string            `json:"probe_path,omitempty"`
+	UserID           string            `json:"user_id,omitempty"`
+	UserName         string            `json:"user_name,omitempty"`
+	SpaceID          string            `json:"space_id,omitempty"`
+	SpaceViewID      string            `json:"space_view_id,omitempty"`
+	SpaceName        string            `json:"space_name,omitempty"`
+	Workspaces       []NotionWorkspace `json:"workspaces,omitempty"`
+	ClientVersion    string            `json:"client_version,omitempty"`
+	CurrentURL       string            `json:"current_url,omitempty"`
+	FinalURL         string            `json:"final_url,omitempty"`
+	Title            string            `json:"title,omitempty"`
+	Message          string            `json:"message,omitempty"`
+	Error            string            `json:"error,omitempty"`
+	UpdatedAt        string            `json:"updated_at,omitempty"`
+	LastLoginAt      string            `json:"last_login_at,omitempty"`
 }
 
 func canonicalEmailKey(email string) string {
@@ -162,10 +163,35 @@ func (cfg AppConfig) FindAccount(email string) (NotionAccount, int, bool) {
 	}
 	for i, account := range cfg.Accounts {
 		if getAccountEmailKey(account) == target {
-			return account, i, true
+			return normalizeAccountWorkspaces(account), i, true
 		}
 	}
 	return NotionAccount{}, -1, false
+}
+
+func (cfg AppConfig) FindAccountWorkspace(email string, workspaceID string) (NotionAccount, int, bool) {
+	account, index, ok := cfg.FindAccount(email)
+	if !ok {
+		return NotionAccount{}, -1, false
+	}
+	selected, ok := accountForWorkspace(account, workspaceID)
+	if !ok {
+		return NotionAccount{}, -1, false
+	}
+	return selected, index, true
+}
+
+func (cfg AppConfig) ResolveActiveWorkspace() (NotionAccount, int, bool) {
+	account, index, ok := cfg.ResolveActiveAccount()
+	if !ok {
+		return NotionAccount{}, -1, false
+	}
+	workspaceID := firstNonEmpty(cfg.ActiveWorkspaceID, account.DefaultWorkspaceID, account.SpaceID)
+	selected, ok := accountForWorkspace(account, workspaceID)
+	if !ok {
+		return account, index, true
+	}
+	return selected, index, true
 }
 
 func (cfg AppConfig) ResolveActiveAccount() (NotionAccount, int, bool) {
@@ -176,7 +202,7 @@ func (cfg AppConfig) ResolveActiveAccount() (NotionAccount, int, bool) {
 }
 
 func (cfg AppConfig) ResolveSessionTarget() (probePath string, userName string, spaceName string, activeEmail string) {
-	if account, _, ok := cfg.ResolveActiveAccount(); ok {
+	if account, _, ok := cfg.ResolveActiveWorkspace(); ok {
 		account = ensureAccountPaths(cfg, account)
 		return strings.TrimSpace(account.ProbeJSON), firstNonEmpty(account.UserName, cfg.UserName), firstNonEmpty(account.SpaceName, cfg.SpaceName), account.Email
 	}
@@ -263,6 +289,7 @@ func ensureAccountPaths(cfg AppConfig, account NotionAccount) NotionAccount {
 // with it, so a healthy account accumulated ever longer cooldowns and sorted
 // worse in the pool forever.
 func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAccount, int) {
+	selectedWorkspaceID := accountWorkspaceID(account)
 	runtime := struct {
 		status               string
 		lastError            string
@@ -284,7 +311,17 @@ func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAc
 		totalFailures:        account.TotalFailures,
 		lastQuotaExhaustedAt: account.LastQuotaExhaustedAt,
 	}
+	account = syncSelectedWorkspaceFromAccount(account)
 	stored, index := cfg.UpsertAccount(account)
+	if index >= 0 && index < len(cfg.Accounts) && selectedWorkspaceID != "" {
+		live := normalizeAccountWorkspaces(cfg.Accounts[index])
+		workspace := workspaceFromAccountFields(account)
+		workspace.ID = selectedWorkspaceID
+		setAccountWorkspace(&live, workspace)
+		live = normalizeAccountWorkspaces(live)
+		cfg.Accounts[index] = live
+		stored = live
+	}
 	stored.Status = runtime.status
 	stored.LastError = runtime.lastError
 	stored.CooldownUntil = runtime.cooldownUntil
@@ -306,8 +343,19 @@ func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAc
 }
 
 func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) {
+	rawSpaceID := strings.TrimSpace(account.SpaceID)
+	rawSpaceViewID := strings.TrimSpace(account.SpaceViewID)
+	rawSpaceName := strings.TrimSpace(account.SpaceName)
+	rawPlanType := strings.TrimSpace(account.PlanType)
+	rawDefaultWorkspaceID := strings.TrimSpace(account.DefaultWorkspaceID)
 	account = ensureAccountPaths(*cfg, account)
+	if account.selectedWorkspaceID != "" {
+		account = syncSelectedWorkspaceFromAccount(account)
+	} else {
+		account = normalizeAccountWorkspaces(account)
+	}
 	if existing, index, ok := cfg.FindAccount(account.Email); ok {
+		existing = normalizeAccountWorkspaces(existing)
 		if account.ProbeJSON == "" {
 			account.ProbeJSON = existing.ProbeJSON
 		}
@@ -326,17 +374,11 @@ func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) 
 		if account.UserName == "" {
 			account.UserName = existing.UserName
 		}
-		if account.SpaceID == "" {
-			account.SpaceID = existing.SpaceID
+		if account.DefaultWorkspaceID == "" {
+			account.DefaultWorkspaceID = existing.DefaultWorkspaceID
 		}
-		if account.SpaceViewID == "" {
-			account.SpaceViewID = existing.SpaceViewID
-		}
-		if account.SpaceName == "" {
-			account.SpaceName = existing.SpaceName
-		}
-		if account.PlanType == "" {
-			account.PlanType = existing.PlanType
+		if rawDefaultWorkspaceID == "" {
+			account.DefaultWorkspaceID = existing.DefaultWorkspaceID
 		}
 		if account.ClientVersion == "" {
 			account.ClientVersion = existing.ClientVersion
@@ -353,24 +395,6 @@ func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) 
 		if account.Priority == 0 {
 			account.Priority = existing.Priority
 		}
-		if account.HourlyQuota == 0 {
-			account.HourlyQuota = existing.HourlyQuota
-		}
-		if account.WindowStartedAt == "" {
-			account.WindowStartedAt = existing.WindowStartedAt
-		}
-		if account.WindowRequestCount == 0 {
-			account.WindowRequestCount = existing.WindowRequestCount
-		}
-		if account.CooldownUntil == "" {
-			account.CooldownUntil = existing.CooldownUntil
-		}
-		if account.LastUsedAt == "" {
-			account.LastUsedAt = existing.LastUsedAt
-		}
-		if account.LastSuccessAt == "" {
-			account.LastSuccessAt = existing.LastSuccessAt
-		}
 		if account.LastRefreshAt == "" {
 			account.LastRefreshAt = existing.LastRefreshAt
 		}
@@ -386,9 +410,132 @@ func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) 
 		if account.TotalFailures == 0 {
 			account.TotalFailures = existing.TotalFailures
 		}
-		cfg.Accounts[index] = account
-		return account, index
+		legacyWorkspace := NotionWorkspace{
+			ID:       firstNonEmpty(rawSpaceID, account.DefaultWorkspaceID, existing.DefaultWorkspaceID),
+			ViewID:   rawSpaceViewID,
+			Name:     rawSpaceName,
+			PlanType: rawPlanType,
+		}
+		if legacyWorkspace.ID != "" && (rawSpaceID != "" || rawSpaceViewID != "" || rawSpaceName != "" || rawPlanType != "") {
+			account.Workspaces = append(account.Workspaces, legacyWorkspace)
+		}
+		merged := existing
+		merged.Email = account.Email
+		merged.emailKey = account.emailKey
+		if account.ProbeJSON != "" {
+			merged.ProbeJSON = account.ProbeJSON
+		}
+		if account.ProfileDir != "" {
+			merged.ProfileDir = account.ProfileDir
+		}
+		if account.StorageStatePath != "" {
+			merged.StorageStatePath = account.StorageStatePath
+		}
+		if account.PendingStatePath != "" {
+			merged.PendingStatePath = account.PendingStatePath
+		}
+		if account.UserID != "" {
+			merged.UserID = account.UserID
+		}
+		if account.UserName != "" {
+			merged.UserName = account.UserName
+		}
+		if account.ClientVersion != "" {
+			merged.ClientVersion = account.ClientVersion
+		}
+		if account.Status != "" {
+			merged.Status = account.Status
+		}
+		if account.LastError != "" {
+			merged.LastError = account.LastError
+		}
+		if account.LastLoginAt != "" {
+			merged.LastLoginAt = account.LastLoginAt
+		}
+		if account.LastRefreshAt != "" {
+			merged.LastRefreshAt = account.LastRefreshAt
+		}
+		if account.LastReloginAt != "" {
+			merged.LastReloginAt = account.LastReloginAt
+		}
+		if account.LastUsedAt != "" {
+			merged.LastUsedAt = account.LastUsedAt
+		}
+		if account.LastSuccessAt != "" {
+			merged.LastSuccessAt = account.LastSuccessAt
+		}
+		if account.CooldownUntil != "" {
+			merged.CooldownUntil = account.CooldownUntil
+		}
+		if account.WindowStartedAt != "" {
+			merged.WindowStartedAt = account.WindowStartedAt
+		}
+		if account.WindowRequestCount != 0 {
+			merged.WindowRequestCount = account.WindowRequestCount
+		}
+		if account.ConsecutiveFailures != 0 {
+			merged.ConsecutiveFailures = account.ConsecutiveFailures
+		}
+		if account.TotalSuccesses != 0 {
+			merged.TotalSuccesses = account.TotalSuccesses
+		}
+		if account.TotalFailures != 0 {
+			merged.TotalFailures = account.TotalFailures
+		}
+		if account.Priority != 0 {
+			merged.Priority = account.Priority
+		}
+		if account.StickyProxyAccount != "" {
+			merged.StickyProxyAccount = account.StickyProxyAccount
+		}
+		if account.ProxyMode != "" {
+			merged.ProxyMode = account.ProxyMode
+		}
+		if account.ProxyURL != "" {
+			merged.ProxyURL = account.ProxyURL
+		}
+		if account.ProxyHTTPURL != "" {
+			merged.ProxyHTTPURL = account.ProxyHTTPURL
+		}
+		if account.ProxyHTTPSURL != "" {
+			merged.ProxyHTTPSURL = account.ProxyHTTPSURL
+		}
+		if account.ResinURL != "" {
+			merged.ResinURL = account.ResinURL
+		}
+		if account.ResinPlatform != "" {
+			merged.ResinPlatform = account.ResinPlatform
+		}
+		if account.ResinMode != "" {
+			merged.ResinMode = account.ResinMode
+		}
+		merged.Disabled = account.Disabled || existing.Disabled
+		if account.DefaultWorkspaceID != "" {
+			merged.DefaultWorkspaceID = account.DefaultWorkspaceID
+		}
+		merged.Workspaces = append([]NotionWorkspace(nil), existing.Workspaces...)
+		for _, incoming := range account.Workspaces {
+			incoming = normalizeWorkspace(incoming)
+			if incoming.ID == "" {
+				continue
+			}
+			found := false
+			for i := range merged.Workspaces {
+				if merged.Workspaces[i].ID == incoming.ID {
+					merged.Workspaces[i] = mergeWorkspaceValues(merged.Workspaces[i], incoming)
+					found = true
+					break
+				}
+			}
+			if !found {
+				merged.Workspaces = append(merged.Workspaces, incoming)
+			}
+		}
+		merged = normalizeAccountWorkspaces(merged)
+		cfg.Accounts[index] = merged
+		return merged, index
 	}
+	account = normalizeAccountWorkspaces(account)
 	cfg.Accounts = append(cfg.Accounts, account)
 	return account, len(cfg.Accounts) - 1
 }
@@ -402,6 +549,7 @@ func (cfg *AppConfig) DeleteAccount(email string) bool {
 	cfg.Accounts = append(cfg.Accounts[:index], cfg.Accounts[index+1:]...)
 	if canonicalEmailKey(cfg.ActiveAccount) == target {
 		cfg.ActiveAccount = ""
+		cfg.ActiveWorkspaceID = ""
 		cfg.ProbeJSON = ""
 	}
 	return true

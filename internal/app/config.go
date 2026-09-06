@@ -133,24 +133,17 @@ type PromptConfig struct {
 	precomputedAllRetryPrefixes []string `json:"-"`
 }
 
-type NotionAccount struct {
-	Email                string `json:"email"`
-	emailKey             string `json:"-"`
-	ProbeJSON            string `json:"probe_json,omitempty"`
-	ProfileDir           string `json:"profile_dir,omitempty"`
-	StorageStatePath     string `json:"storage_state_path,omitempty"`
-	PendingStatePath     string `json:"pending_state_path,omitempty"`
-	UserID               string `json:"user_id,omitempty"`
-	UserName             string `json:"user_name,omitempty"`
-	SpaceID              string `json:"space_id,omitempty"`
-	SpaceViewID          string `json:"space_view_id,omitempty"`
-	SpaceName            string `json:"space_name,omitempty"`
+// NotionWorkspace is the billing and dispatch boundary inside an account.
+// Cookies, profile paths, proxy settings, and login state belong to the parent
+// account; quota, cooldown, and concurrency belong here because Notion bills
+// AI per workspace.
+type NotionWorkspace struct {
+	ID                   string `json:"id"`
+	ViewID               string `json:"view_id,omitempty"`
+	Name                 string `json:"name,omitempty"`
 	PlanType             string `json:"plan_type,omitempty"`
-	ClientVersion        string `json:"client_version,omitempty"`
-	Status               string `json:"status,omitempty"`
-	LastError            string `json:"last_error,omitempty"`
-	LastLoginAt          string `json:"last_login_at,omitempty"`
-	Disabled             bool   `json:"disabled,omitempty"`
+	SubscriptionTier     string `json:"subscription_tier,omitempty"`
+	AIEnabled            bool   `json:"ai_enabled,omitempty"`
 	Priority             int    `json:"priority,omitempty"`
 	HourlyQuota          int    `json:"hourly_quota,omitempty"`
 	MaxConcurrency       int    `json:"max_concurrency,omitempty"`
@@ -160,20 +153,58 @@ type NotionAccount struct {
 	LastUsedAt           string `json:"last_used_at,omitempty"`
 	LastSuccessAt        string `json:"last_success_at,omitempty"`
 	LastRefreshAt        string `json:"last_refresh_at,omitempty"`
-	LastReloginAt        string `json:"last_relogin_at,omitempty"`
 	LastQuotaExhaustedAt string `json:"last_quota_exhausted_at,omitempty"`
-	ProxyMode            string `json:"proxy_mode,omitempty"`
-	ProxyURL             string `json:"proxy_url,omitempty"`
-	ProxyHTTPURL         string `json:"proxy_http_url,omitempty"`
-	ProxyHTTPSURL        string `json:"proxy_https_url,omitempty"`
-	StickyProxyAccount   string `json:"sticky_proxy_account,omitempty"`
-	ResinEnabled         bool   `json:"resin_enabled,omitempty"`
-	ResinURL             string `json:"resin_url,omitempty"`
-	ResinPlatform        string `json:"resin_platform,omitempty"`
-	ResinMode            string `json:"resin_mode,omitempty"`
 	ConsecutiveFailures  int    `json:"consecutive_failures,omitempty"`
 	TotalSuccesses       int    `json:"total_successes,omitempty"`
 	TotalFailures        int    `json:"total_failures,omitempty"`
+	Status               string `json:"status,omitempty"`
+	LastError            string `json:"last_error,omitempty"`
+}
+
+type NotionAccount struct {
+	Email                string            `json:"email"`
+	emailKey             string            `json:"-"`
+	ProbeJSON            string            `json:"probe_json,omitempty"`
+	ProfileDir           string            `json:"profile_dir,omitempty"`
+	StorageStatePath     string            `json:"storage_state_path,omitempty"`
+	PendingStatePath     string            `json:"pending_state_path,omitempty"`
+	UserID               string            `json:"user_id,omitempty"`
+	UserName             string            `json:"user_name,omitempty"`
+	SpaceID              string            `json:"space_id,omitempty"`
+	SpaceViewID          string            `json:"space_view_id,omitempty"`
+	SpaceName            string            `json:"space_name,omitempty"`
+	PlanType             string            `json:"plan_type,omitempty"`
+	DefaultWorkspaceID   string            `json:"default_workspace_id,omitempty"`
+	Workspaces           []NotionWorkspace `json:"workspaces,omitempty"`
+	ClientVersion        string            `json:"client_version,omitempty"`
+	Status               string            `json:"status,omitempty"`
+	LastError            string            `json:"last_error,omitempty"`
+	LastLoginAt          string            `json:"last_login_at,omitempty"`
+	Disabled             bool              `json:"disabled,omitempty"`
+	Priority             int               `json:"priority,omitempty"`
+	HourlyQuota          int               `json:"hourly_quota,omitempty"`
+	MaxConcurrency       int               `json:"max_concurrency,omitempty"`
+	WindowStartedAt      string            `json:"window_started_at,omitempty"`
+	WindowRequestCount   int               `json:"window_request_count,omitempty"`
+	CooldownUntil        string            `json:"cooldown_until,omitempty"`
+	LastUsedAt           string            `json:"last_used_at,omitempty"`
+	LastSuccessAt        string            `json:"last_success_at,omitempty"`
+	LastRefreshAt        string            `json:"last_refresh_at,omitempty"`
+	LastReloginAt        string            `json:"last_relogin_at,omitempty"`
+	LastQuotaExhaustedAt string            `json:"last_quota_exhausted_at,omitempty"`
+	ProxyMode            string            `json:"proxy_mode,omitempty"`
+	ProxyURL             string            `json:"proxy_url,omitempty"`
+	ProxyHTTPURL         string            `json:"proxy_http_url,omitempty"`
+	ProxyHTTPSURL        string            `json:"proxy_https_url,omitempty"`
+	StickyProxyAccount   string            `json:"sticky_proxy_account,omitempty"`
+	ResinEnabled         bool              `json:"resin_enabled,omitempty"`
+	ResinURL             string            `json:"resin_url,omitempty"`
+	ResinPlatform        string            `json:"resin_platform,omitempty"`
+	ResinMode            string            `json:"resin_mode,omitempty"`
+	ConsecutiveFailures  int               `json:"consecutive_failures,omitempty"`
+	TotalSuccesses       int               `json:"total_successes,omitempty"`
+	TotalFailures        int               `json:"total_failures,omitempty"`
+	selectedWorkspaceID  string            `json:"-"`
 }
 
 type ModelDefinition struct {
@@ -209,6 +240,7 @@ type AppConfig struct {
 	ModelID               string               `json:"model_id,omitempty"`
 	DefaultModel          string               `json:"default_model,omitempty"`
 	ActiveAccount         string               `json:"active_account,omitempty"`
+	ActiveWorkspaceID     string               `json:"active_workspace_id,omitempty"`
 	TimeoutSec            int                  `json:"timeout_sec"`
 	PollIntervalSec       float64              `json:"poll_interval_sec"`
 	PollMaxRounds         int                  `json:"poll_max_rounds"`
@@ -725,7 +757,9 @@ func normalizeConfig(cfg AppConfig) AppConfig {
 		cfg.Accounts = []NotionAccount{}
 	}
 	cfg.ActiveAccount = strings.TrimSpace(cfg.ActiveAccount)
+	cfg.ActiveWorkspaceID = strings.TrimSpace(cfg.ActiveWorkspaceID)
 	for i := range cfg.Accounts {
+		previousDefaultWorkspaceID := strings.TrimSpace(cfg.Accounts[i].DefaultWorkspaceID)
 		cfg.Accounts[i].Email = strings.TrimSpace(cfg.Accounts[i].Email)
 		cfg.Accounts[i].emailKey = canonicalEmailKey(cfg.Accounts[i].Email)
 		cfg.Accounts[i].ProbeJSON = strings.TrimSpace(cfg.Accounts[i].ProbeJSON)
@@ -735,7 +769,9 @@ func normalizeConfig(cfg AppConfig) AppConfig {
 		cfg.Accounts[i].UserID = strings.TrimSpace(cfg.Accounts[i].UserID)
 		cfg.Accounts[i].UserName = strings.TrimSpace(cfg.Accounts[i].UserName)
 		cfg.Accounts[i].SpaceID = strings.TrimSpace(cfg.Accounts[i].SpaceID)
+		cfg.Accounts[i].SpaceViewID = strings.TrimSpace(cfg.Accounts[i].SpaceViewID)
 		cfg.Accounts[i].SpaceName = strings.TrimSpace(cfg.Accounts[i].SpaceName)
+		cfg.Accounts[i].DefaultWorkspaceID = strings.TrimSpace(cfg.Accounts[i].DefaultWorkspaceID)
 		cfg.Accounts[i].ClientVersion = strings.TrimSpace(cfg.Accounts[i].ClientVersion)
 		cfg.Accounts[i].Status = strings.TrimSpace(cfg.Accounts[i].Status)
 		cfg.Accounts[i].LastError = strings.TrimSpace(cfg.Accounts[i].LastError)
@@ -755,11 +791,24 @@ func normalizeConfig(cfg AppConfig) AppConfig {
 			cfg.Accounts[i].ProxyMode = cfg.normalizedProxyMode()
 		}
 		cfg.Accounts[i] = ensureAccountPaths(cfg, cfg.Accounts[i])
+		cfg.Accounts[i] = normalizeAccountWorkspaces(cfg.Accounts[i])
+		if getAccountEmailKey(cfg.Accounts[i]) == canonicalEmailKey(cfg.ActiveAccount) &&
+			cfg.ActiveWorkspaceID == previousDefaultWorkspaceID &&
+			previousDefaultWorkspaceID != cfg.Accounts[i].DefaultWorkspaceID {
+			cfg.ActiveWorkspaceID = cfg.Accounts[i].DefaultWorkspaceID
+		}
 	}
 	cfg.ProbeJSON = strings.TrimSpace(cfg.ProbeJSON)
-	if account, _, ok := cfg.ResolveActiveAccount(); ok {
+	if account, _, ok := cfg.ResolveActiveWorkspace(); ok {
 		account = ensureAccountPaths(cfg, account)
 		cfg.ProbeJSON = account.ProbeJSON
+		workspaceID := firstNonEmpty(cfg.ActiveWorkspaceID, account.DefaultWorkspaceID, account.SpaceID)
+		if _, workspaceOK := accountForWorkspace(account, workspaceID); !workspaceOK {
+			workspaceID = account.DefaultWorkspaceID
+		}
+		cfg.ActiveWorkspaceID = workspaceID
+	} else {
+		cfg.ActiveWorkspaceID = ""
 	}
 	for i := range cfg.Models {
 		cfg.Models[i].ID = strings.TrimSpace(cfg.Models[i].ID)

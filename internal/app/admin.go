@@ -780,6 +780,7 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		UseWebSearch:                      requestedWebSearch(payload, cfg.Features.UseWebSearch),
 		Attachments:                       attachments,
 		SuppressUpstreamThreadPersistence: strings.TrimSpace(preferredConversationID) == "",
+		WorkspaceID:                       requestedWorkspaceID(r, strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), payload["metadata"]),
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	request.PinnedAccountEmail = requestedAccountEmail(r, payload)
@@ -797,6 +798,10 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			request.PinnedSpaceID = conversation.SpaceID
+			if request.WorkspaceID != "" && request.WorkspaceID != conversation.SpaceID {
+				writeJSON(w, http.StatusConflict, map[string]any{"detail": errConversationWorkspaceMismatch.Error()})
+				return
+			}
 			request.HiddenPrompt = conversation.HiddenPrompt
 			request.PinnedAccountEmail = firstNonEmpty(strings.TrimSpace(conversation.AccountEmail), request.PinnedAccountEmail)
 			if freshThreadMode {

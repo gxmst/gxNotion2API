@@ -305,6 +305,7 @@ func (s *ServerState) tryRefreshAccount(ctx context.Context, cfg AppConfig, acco
 	// counters must survive persistence rather than being merged back.
 	cfg.UpsertAccountRuntimeState(account)
 	cfg.ActiveAccount = account.Email
+	cfg.ActiveWorkspaceID = accountWorkspaceID(account)
 	cfg.ProbeJSON = account.ProbeJSON
 	return cfg, nil
 }
@@ -318,7 +319,7 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 	if !refreshCfg.Enabled {
 		return fmt.Errorf("session refresh disabled")
 	}
-	account, _, ok := cfg.ResolveActiveAccount()
+	account, _, ok := cfg.ResolveActiveWorkspace()
 	if !ok {
 		return fmt.Errorf("no active account configured for session refresh")
 	}

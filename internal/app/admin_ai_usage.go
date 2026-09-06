@@ -17,19 +17,29 @@ const aiUsageCacheTTL = 5 * time.Minute
 // workspace recorded, account disabled); "error" means the upstream query
 // itself failed and Detail says why. A report never invents numbers.
 type workspaceAIUsageReport struct {
-	Email     string            `json:"email"`
-	SpaceID   string            `json:"space_id,omitempty"`
-	Status    string            `json:"status"`
-	Detail    string            `json:"detail,omitempty"`
-	Cached    bool              `json:"cached"`
-	FetchedAt time.Time         `json:"fetched_at,omitempty"`
-	Usage     *workspaceAIUsage `json:"usage,omitempty"`
+	Email         string            `json:"email"`
+	SpaceID       string            `json:"space_id,omitempty"`
+	WorkspaceName string            `json:"workspace_name,omitempty"`
+	Status        string            `json:"status"`
+	Detail        string            `json:"detail,omitempty"`
+	Cached        bool              `json:"cached"`
+	FetchedAt     time.Time         `json:"fetched_at,omitempty"`
+	Usage         *workspaceAIUsage `json:"usage,omitempty"`
 }
 
 func (a *App) workspaceAIUsageReport(ctx context.Context, cfg AppConfig, account NotionAccount, force bool) workspaceAIUsageReport {
+	account = normalizeAccountWorkspaces(account)
+	return a.workspaceAIUsageReportForWorkspace(ctx, cfg, account, accountWorkspaceID(account), force)
+}
+
+func (a *App) workspaceAIUsageReportForWorkspace(ctx context.Context, cfg AppConfig, account NotionAccount, workspaceID string, force bool) workspaceAIUsageReport {
+	account = normalizeAccountWorkspaces(account)
+	if selected, ok := accountForWorkspace(account, workspaceID); ok {
+		account = selected
+	}
 	email := strings.TrimSpace(account.Email)
 	spaceID := strings.TrimSpace(account.SpaceID)
-	report := workspaceAIUsageReport{Email: email, SpaceID: spaceID, Status: "unknown"}
+	report := workspaceAIUsageReport{Email: email, SpaceID: spaceID, WorkspaceName: account.SpaceName, Status: "unknown"}
 	if email == "" {
 		report.Detail = "account has no email"
 		return report
@@ -99,7 +109,14 @@ func (a *App) handleAdminAccountsAIUsage(w http.ResponseWriter, r *http.Request)
 	cfg, _, _ := a.State.Snapshot()
 	reports := make([]workspaceAIUsageReport, 0, len(cfg.Accounts))
 	for _, account := range cfg.Accounts {
-		reports = append(reports, a.workspaceAIUsageReport(r.Context(), cfg, account, force))
+		account = normalizeAccountWorkspaces(account)
+		if len(account.Workspaces) == 0 {
+			reports = append(reports, a.workspaceAIUsageReport(r.Context(), cfg, account, force))
+			continue
+		}
+		for _, workspace := range account.Workspaces {
+			reports = append(reports, a.workspaceAIUsageReportForWorkspace(r.Context(), cfg, account, workspace.ID, force))
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"accounts":    reports,

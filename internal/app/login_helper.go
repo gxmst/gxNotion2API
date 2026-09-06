@@ -717,6 +717,17 @@ func VerifyEmailLogin(ctx context.Context, cfg AppConfig, req LoginVerifyRequest
 	if err != nil {
 		return failLoginState(req.PendingPath, pending, wrapLoginStageError(cfg, upstream, "load spaces after login", err))
 	}
+	// getSpacesInitial exposes only the first pointer, which is commonly the
+	// free personal workspace. Prefer the complete record map when available so
+	// a newly verified account starts in its paid/AI-enabled workspace.
+	var discovered discoveredAccountMetadata
+	if found, discoverErr := fetchLoadUserContentMetadata(ctx, session, upstream, clientVersion, userID); discoverErr == nil && found.SpaceID != "" {
+		discovered = found
+		spaces.Email = firstNonEmpty(discovered.Email, spaces.Email)
+		spaces.UserName = firstNonEmpty(discovered.UserName, spaces.UserName)
+		spaces.SpaceID = discovered.SpaceID
+		spaces.SpaceViewID = discovered.SpaceViewID
+	}
 
 	cookies := probeCookiesFromJar(session.Jar, upstream.HomeURL())
 	if len(cookies) == 0 {
@@ -756,6 +767,13 @@ func VerifyEmailLogin(ctx context.Context, cfg AppConfig, req LoginVerifyRequest
 	pending.UserName = spaces.UserName
 	pending.SpaceID = spaces.SpaceID
 	pending.SpaceViewID = spaces.SpaceViewID
+	for _, candidate := range discovered.Workspaces {
+		pending.Workspaces = append(pending.Workspaces, NotionWorkspace{
+			ID: candidate.ID, ViewID: candidate.ViewID, Name: candidate.Name,
+			PlanType: candidate.PlanType, SubscriptionTier: candidate.SubscriptionTier,
+			AIEnabled: candidate.AIEnabled, Status: "ready",
+		})
+	}
 	pending.ClientVersion = clientVersion
 	pending.CurrentURL = upstream.HomeURL()
 	pending.FinalURL = upstream.HomeURL()

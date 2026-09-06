@@ -170,8 +170,11 @@ export interface AccountItem {
   user_id?: string;
   user_name?: string;
   space_id?: string;
+  space_view_id?: string;
   space_name?: string;
   plan_type?: string;
+  default_workspace_id?: string;
+  workspaces?: WorkspaceItem[];
   client_version?: string;
   probe_json?: string;
   probe_exists?: boolean;
@@ -190,9 +193,40 @@ export interface AccountItem {
   };
 }
 
+export interface WorkspaceItem {
+  id: string;
+  view_id?: string;
+  name?: string;
+  plan_type?: string;
+  subscription_tier?: string;
+  ai_enabled?: boolean;
+  status?: string;
+  last_error?: string;
+  priority?: number;
+  hourly_quota?: number;
+  max_concurrency?: number;
+  quota_limited?: boolean;
+  remaining_quota?: number;
+  window_started_at?: string;
+  window_request_count?: number;
+  cooldown_until?: string;
+  cooldown_active?: boolean;
+  cooldown_remaining_sec?: number;
+  last_used_at?: string;
+  last_success_at?: string;
+  last_refresh_at?: string;
+  last_quota_exhausted_at?: string;
+  consecutive_failures?: number;
+  total_successes?: number;
+  total_failures?: number;
+  default?: boolean;
+  active?: boolean;
+}
+
 export interface AccountsPayload {
   items?: AccountItem[];
   active_account?: string;
+  active_workspace_id?: string;
   session_ready?: boolean;
   session?: SessionSummary;
   login_helper?: {
@@ -209,6 +243,7 @@ export interface AccountsPayload {
 export interface AIUsageReport {
   email: string;
   space_id?: string;
+  workspace_name?: string;
   status: string;
   detail?: string;
   cached: boolean;

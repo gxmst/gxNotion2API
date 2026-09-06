@@ -306,6 +306,7 @@ type PromptRunRequest struct {
 	Attachments                       []InputAttachment
 	PinnedAccountEmail                string
 	PinnedSpaceID                     string
+	WorkspaceID                       string
 	AllowPinnedAccountFallback        bool
 	StreamReasoningWarmup             bool
 	SuppressReasoningOutput           bool

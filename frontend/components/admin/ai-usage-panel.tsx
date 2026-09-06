@@ -39,7 +39,7 @@ export function AIUsagePanel() {
             const enforced = usage?.quota_enforced;
             const status = report.status !== 'ok' ? '未知' : !usage?.is_eligible_known ? '资格未知' : !usage.is_eligible ? '不可用' : enforced ? '有限额' : usage.type === 'unlimited' ? '基础限额未启用' : '限额未知';
             return <tr key={`${report.email}-${report.space_id}`} className="border-b last:border-0">
-              <td className="max-w-64 py-3 pr-4"><div className="break-all">{report.email}</div><div className="mt-1 break-all text-xs text-muted-foreground">{report.space_id || '工作区未知'}</div>{report.detail ? <p className="mt-1 break-words text-xs text-destructive">{report.detail}</p> : null}</td>
+              <td className="max-w-64 py-3 pr-4"><div className="break-all">{report.email}</div><div className="mt-1 break-all text-xs text-muted-foreground">{report.workspace_name || report.space_id || '工作区未知'}</div><div className="break-all text-[11px] text-muted-foreground">{report.space_id || '-'}</div>{report.detail ? <p className="mt-1 break-words text-xs text-destructive">{report.detail}</p> : null}</td>
               <td className="px-2 py-3">{status}</td>
               <td className="px-2 py-3 tabular-nums">{usage?.basic_usage_known ? `${usage.space_usage}${enforced && usage.basic_limits_known ? ` / ${usage.space_limit}` : ''}` : '未知'}</td>
               <td className="px-2 py-3 tabular-nums">{usage?.basic_usage_known ? `${usage.user_usage}${enforced && usage.basic_limits_known ? ` / ${usage.user_limit}` : ''}` : '未知'}</td>

@@ -221,20 +221,22 @@ func (s *ServerState) rebuildAccountSlotsLocked() {
 	}
 	next := make(map[string]*accountSlot, len(s.Config.Accounts))
 	for _, account := range s.Config.Accounts {
-		emailKey := getAccountEmailKey(account)
-		if emailKey == "" {
-			continue
+		for _, candidate := range accountWorkspaceCandidates(account) {
+			key := dispatchWorkspaceKey(candidate)
+			if key == "" {
+				continue
+			}
+			maxConcurrency := int32(normalizeAccountMaxConcurrency(candidate.MaxConcurrency))
+			if existing := previous[key]; existing != nil {
+				existing.max.Store(maxConcurrency)
+				clampSlotInFlight(existing, maxConcurrency)
+				next[key] = existing
+				continue
+			}
+			slot := &accountSlot{}
+			slot.max.Store(maxConcurrency)
+			next[key] = slot
 		}
-		maxConcurrency := int32(normalizeAccountMaxConcurrency(account.MaxConcurrency))
-		if existing := previous[emailKey]; existing != nil {
-			existing.max.Store(maxConcurrency)
-			clampSlotInFlight(existing, maxConcurrency)
-			next[emailKey] = existing
-			continue
-		}
-		slot := &accountSlot{}
-		slot.max.Store(maxConcurrency)
-		next[emailKey] = slot
 	}
 	s.slots.Store(&next)
 	syncDispatchSlotInflightFromSlots(next)
@@ -252,11 +254,31 @@ func (s *ServerState) loadAccountSlots() map[string]*accountSlot {
 }
 
 func (s *ServerState) TryAcquireAccountDispatchSlot(email string) bool {
-	emailKey := canonicalEmailKey(email)
-	if emailKey == "" {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.ResolveActiveAccount()
+	if !ok || canonicalEmailKey(account.Email) != canonicalEmailKey(email) {
+		account, _, ok = cfg.FindAccount(email)
+	}
+	if !ok {
 		return false
 	}
-	slot := s.loadAccountSlots()[emailKey]
+	return s.TryAcquireWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
+}
+
+func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
+	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
+	if !ok {
+		return false
+	}
+	return s.tryAcquireDispatchSlotKey(dispatchWorkspaceKey(account))
+}
+
+func (s *ServerState) tryAcquireDispatchSlotKey(key string) bool {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return false
+	}
+	slot := s.loadAccountSlots()[key]
 	if slot == nil {
 		return false
 	}
@@ -270,40 +292,74 @@ func (s *ServerState) TryAcquireAccountDispatchSlot(email string) bool {
 			return false
 		}
 		if slot.inflight.CompareAndSwap(inflight, inflight+1) {
-			setDispatchSlotInflight(emailKey, int(inflight+1))
+			setDispatchSlotInflight(key, int(inflight+1))
 			return true
 		}
 	}
 }
 
 func (s *ServerState) ReleaseAccountDispatchSlot(email string) {
-	emailKey := canonicalEmailKey(email)
-	if emailKey == "" {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
 		return
 	}
-	slot := s.loadAccountSlots()[emailKey]
+	s.ReleaseWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
+}
+
+func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID string) {
+	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
+	if !ok {
+		return
+	}
+	s.releaseDispatchSlotKey(dispatchWorkspaceKey(account))
+}
+
+func (s *ServerState) releaseDispatchSlotKey(key string) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return
+	}
+	slot := s.loadAccountSlots()[key]
 	if slot == nil {
 		return
 	}
 	for {
 		inflight := slot.inflight.Load()
 		if inflight <= 0 {
-			setDispatchSlotInflight(emailKey, 0)
+			setDispatchSlotInflight(key, 0)
 			return
 		}
 		if slot.inflight.CompareAndSwap(inflight, inflight-1) {
-			setDispatchSlotInflight(emailKey, int(inflight-1))
+			setDispatchSlotInflight(key, int(inflight-1))
 			return
 		}
 	}
 }
 
 func (s *ServerState) RemainingAccountDispatchSlots(email string) int {
-	emailKey := canonicalEmailKey(email)
-	if emailKey == "" {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
 		return 0
 	}
-	slot := s.loadAccountSlots()[emailKey]
+	return s.RemainingWorkspaceDispatchSlots(account.Email, accountWorkspaceID(account))
+}
+
+func (s *ServerState) RemainingWorkspaceDispatchSlots(email string, workspaceID string) int {
+	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
+	if !ok {
+		return 0
+	}
+	return s.remainingDispatchSlotKey(dispatchWorkspaceKey(account))
+}
+
+func (s *ServerState) remainingDispatchSlotKey(key string) int {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return 0
+	}
+	slot := s.loadAccountSlots()[key]
 	if slot == nil {
 		return 0
 	}
@@ -320,14 +376,25 @@ func (s *ServerState) RemainingAccountDispatchSlots(email string) int {
 }
 
 func (s *ServerState) AvailableDispatchCapacity(emails []string) int {
+	cfg, _, _ := s.Snapshot()
+	keys := make([]string, 0, len(emails))
+	for _, email := range emails {
+		if account, _, ok := cfg.FindAccount(email); ok {
+			keys = append(keys, dispatchWorkspaceKey(account))
+		}
+	}
+	return s.AvailableDispatchCapacityKeys(keys)
+}
+
+func (s *ServerState) AvailableDispatchCapacityKeys(keys []string) int {
 	slots := s.loadAccountSlots()
 	if len(slots) == 0 {
 		return 0
 	}
 	total := 0
 	seen := map[string]struct{}{}
-	for _, email := range emails {
-		emailKey := canonicalEmailKey(email)
+	for _, key := range keys {
+		emailKey := strings.TrimSpace(key)
 		if emailKey == "" {
 			continue
 		}
@@ -418,7 +485,7 @@ func newServerState(cfg AppConfig) (*ServerState, error) {
 	state.ResponseStore = newResponseStore(time.Duration(maxInt(cfg.Responses.StoreTTLSeconds, 1)) * time.Second)
 	persistedAccountsLoaded := false
 	if store != nil {
-		accounts, activeAccount, ok, loadErr := store.LoadAccounts()
+		accounts, activeAccount, activeWorkspaceID, ok, loadErr := store.LoadAccountsWithWorkspace()
 		if loadErr != nil {
 			_ = store.Close()
 			return nil, loadErr
@@ -426,6 +493,7 @@ func newServerState(cfg AppConfig) (*ServerState, error) {
 		if ok {
 			cfg.Accounts = accounts
 			cfg.ActiveAccount = strings.TrimSpace(activeAccount)
+			cfg.ActiveWorkspaceID = strings.TrimSpace(activeWorkspaceID)
 			if cfg.ActiveAccount != "" {
 				if account, _, found := cfg.FindAccount(cfg.ActiveAccount); found {
 					cfg.ProbeJSON = account.ProbeJSON
@@ -496,7 +564,7 @@ func (s *ServerState) ApplyConfig(cfg AppConfig) error {
 	var client *NotionAIClient
 	if strings.TrimSpace(probePath) != "" {
 		loadedSession, err := loadSessionInfo(probePath, userName, spaceName)
-		if account, _, found := cfg.FindAccount(activeEmail); found {
+		if account, _, found := cfg.ResolveActiveWorkspace(); found {
 			loadedSession, err = loadSessionInfoForAccountRefresh(cfg, account)
 		}
 		if err != nil {
@@ -1524,7 +1592,7 @@ func resolveContinuationAccount(cfg AppConfig, threadID string, requestedAccount
 	requested := strings.TrimSpace(requestedAccount)
 	threadID = strings.TrimSpace(threadID)
 	if owner != "" {
-		if account, _, ok := cfg.FindAccount(owner); ok && entry.SpaceID != "" && account.SpaceID != "" && entry.SpaceID != account.SpaceID {
+		if _, _, ok := cfg.FindAccountWorkspace(owner, entry.SpaceID); !ok && strings.TrimSpace(entry.SpaceID) != "" {
 			return "", errConversationWorkspaceMismatch
 		}
 		if requested != "" && canonicalEmailKey(owner) != canonicalEmailKey(requested) {
@@ -2049,6 +2117,7 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	preferredConversationID := requestedConversationIDFromTyped(r, typed.ConversationID, typed.Conversation, typed.Metadata)
 	explicitThreadID := requestedThreadIDFromTyped(r, typed.ThreadID, typed.Thread, typed.NotionThreadID, typed.Metadata)
 	requestedAccount := requestedAccountEmailFromTyped(r, typed.AccountEmail, typed.NotionAccountEmail, typed.Metadata)
+	requestedWorkspace := requestedWorkspaceID(r, typed.WorkspaceID, typed.SpaceID, typed.Metadata)
 	entry, err := registry.Resolve(requestedModelID, cfg.DefaultPublicModel())
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "model_not_found")
@@ -2072,11 +2141,16 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
 		ClientScope:        continuationScope,
+		WorkspaceID:        requestedWorkspace,
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
 	if matched, ok := a.resolveContinuationConversationWithExplicit("", originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
+		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
+			writeOpenAIError(w, http.StatusBadRequest, errConversationWorkspaceMismatch.Error(), "invalid_request_error", "conversation_workspace_mismatch")
+			return
+		}
 		request.PinnedSpaceID = conversation.SpaceID
 		request.HiddenPrompt = firstNonEmpty(request.HiddenPrompt, conversation.HiddenPrompt)
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
@@ -2162,6 +2236,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 	}
 
 	requestedAccount := requestedAccountEmail(r, payload)
+	requestedWorkspace := requestedWorkspaceID(r, strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), payload["metadata"])
 	continuationScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount)
 	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount), ctx.StableHidden, ctx.RequestSegments)
 	originalRawMessageCount := sessionRawMessageCount(ctx.RequestSegments)
@@ -2180,6 +2255,7 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
 		ClientScope:        continuationScope,
+		WorkspaceID:        requestedWorkspace,
 	}
 	if ctx.Mode == sillyTavernModeContinue {
 		request.LatestUserPrompt = sillyTavernContinuationPrompt(payload)
@@ -2196,6 +2272,10 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx, originalFingerprint, continuationScope); ok {
 		request.SuppressUpstreamThreadPersistence = matched.SuppressPersist
 		conversation = matched.Target.Conversation
+		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
+			writeOpenAIError(w, http.StatusBadRequest, errConversationWorkspaceMismatch.Error(), "invalid_request_error", "conversation_workspace_mismatch")
+			return
+		}
 		request.PinnedSpaceID = conversation.SpaceID
 		request.HiddenPrompt = firstNonEmpty(request.HiddenPrompt, conversation.HiddenPrompt)
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)
@@ -2307,6 +2387,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	preferredConversationID := requestedConversationIDFromTyped(r, typed.ConversationID, typed.Conversation, typed.Metadata)
 	explicitThreadID := requestedThreadIDFromTyped(r, typed.ThreadID, typed.Thread, typed.NotionThreadID, typed.Metadata)
 	requestedAccount := requestedAccountEmailFromTyped(r, typed.AccountEmail, typed.NotionAccountEmail, typed.Metadata)
+	requestedWorkspace := requestedWorkspaceID(r, typed.WorkspaceID, typed.SpaceID, typed.Metadata)
 	entry, err := registry.Resolve(requestedModelID, cfg.DefaultPublicModel())
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "model_not_found")
@@ -2330,11 +2411,16 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		SessionFingerprint: originalFingerprint,
 		RawMessageCount:    originalRawMessageCount,
 		ClientScope:        continuationScope,
+		WorkspaceID:        requestedWorkspace,
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
 	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
 		conversation = matched.Conversation
+		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
+			writeOpenAIError(w, http.StatusBadRequest, errConversationWorkspaceMismatch.Error(), "invalid_request_error", "conversation_workspace_mismatch")
+			return
+		}
 		request.PinnedSpaceID = conversation.SpaceID
 		request.HiddenPrompt = firstNonEmpty(request.HiddenPrompt, conversation.HiddenPrompt)
 		account, accountErr := resolveContinuationAccount(cfg, strings.TrimSpace(conversation.ThreadID), requestedAccount, conversation)

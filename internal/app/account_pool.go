@@ -225,7 +225,7 @@ func sortDispatchCandidates(cfg AppConfig, accounts []NotionAccount, now time.Ti
 		if !leftUsed.Equal(rightUsed) {
 			return leftUsed.Before(rightUsed)
 		}
-		return leftKey < rightKey
+		return dispatchWorkspaceKey(left) < dispatchWorkspaceKey(right)
 	})
 }
 
@@ -233,8 +233,10 @@ func buildDispatchCandidateOrder(cfg AppConfig, now time.Time) []NotionAccount {
 	candidates := make([]NotionAccount, 0, len(cfg.Accounts))
 	for _, account := range cfg.Accounts {
 		account = ensureAccountPaths(cfg, account)
-		if ok, _ := accountDispatchEligible(cfg, account, now); ok {
-			candidates = append(candidates, account)
+		for _, candidate := range accountWorkspaceCandidates(account) {
+			if ok, _ := accountDispatchEligible(cfg, candidate, now); ok {
+				candidates = append(candidates, candidate)
+			}
 		}
 	}
 	sortDispatchCandidates(cfg, candidates, now)
@@ -258,6 +260,7 @@ func applyAccountUpdate(cfg AppConfig, account NotionAccount, makeActive bool) A
 	cfg.UpsertAccountRuntimeState(account)
 	if makeActive {
 		cfg.ActiveAccount = account.Email
+		cfg.ActiveWorkspaceID = accountWorkspaceID(account)
 		cfg.ProbeJSON = account.ProbeJSON
 	}
 	return cfg
@@ -292,7 +295,7 @@ func (s *ServerState) startAutoRelogin(ctx context.Context, cfg AppConfig, accou
 }
 
 func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, onDelta func(string) error) (result InferenceResult, err error) {
-	if request.PinnedSpaceID != "" && request.PinnedSpaceID != session.SpaceID {
+	if pinnedWorkspace := firstNonEmpty(request.PinnedSpaceID, request.WorkspaceID); pinnedWorkspace != "" && pinnedWorkspace != session.SpaceID {
 		return InferenceResult{}, errConversationWorkspaceMismatch
 	}
 	defer func() { result.SpaceID, result.SpaceViewID = session.SpaceID, session.SpaceViewID }()
@@ -315,7 +318,7 @@ func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session S
 }
 
 func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, sink InferenceStreamSink) (result InferenceResult, err error) {
-	if request.PinnedSpaceID != "" && request.PinnedSpaceID != session.SpaceID {
+	if pinnedWorkspace := firstNonEmpty(request.PinnedSpaceID, request.WorkspaceID); pinnedWorkspace != "" && pinnedWorkspace != session.SpaceID {
 		return InferenceResult{}, errConversationWorkspaceMismatch
 	}
 	defer func() { result.SpaceID, result.SpaceViewID = session.SpaceID, session.SpaceViewID }()
@@ -375,6 +378,10 @@ func mergeSessionMetadataWithoutOverwritingConfig(account NotionAccount, session
 // counters) is deliberately excluded: it changes on every dispatch, and only a
 // concurrent edit to who the account is or where it points must block a commit.
 func accountIdentityUnchanged(started NotionAccount, current NotionAccount) bool {
+	workspaceID := accountWorkspaceID(started)
+	if selected, ok := accountForWorkspace(current, workspaceID); ok {
+		current = selected
+	}
 	return strings.TrimSpace(started.ProbeJSON) == strings.TrimSpace(current.ProbeJSON) &&
 		strings.TrimSpace(started.ProfileDir) == strings.TrimSpace(current.ProfileDir) &&
 		strings.TrimSpace(started.StorageStatePath) == strings.TrimSpace(current.StorageStatePath) &&
@@ -408,12 +415,21 @@ func (s *ServerState) saveAndApplyCommitted(cfg AppConfig) error {
 // right now, try the next candidate"; an error means the account is gone
 // entirely and the request cannot proceed.
 func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionAccount, bool, error) {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
+		return NotionAccount{}, false, fmt.Errorf("account %s not found", email)
+	}
+	return s.beginWorkspaceDispatch(email, accountWorkspaceID(account), now)
+}
+
+func (s *ServerState) beginWorkspaceDispatch(email string, workspaceID string, now time.Time) (NotionAccount, bool, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	cfg, _, _ := s.Snapshot()
-	account, index, ok := cfg.FindAccount(email)
+	account, index, ok := cfg.FindAccountWorkspace(email, workspaceID)
 	if !ok {
-		return NotionAccount{}, false, fmt.Errorf("account %s not found", email)
+		return NotionAccount{}, false, fmt.Errorf("workspace %s for account %s not found", workspaceID, email)
 	}
 	if eligible, _ := accountDispatchEligible(cfg, account, now); !eligible {
 		// Not dispatchable right now (disabled, cooldown, exhausted local
@@ -423,7 +439,9 @@ func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionA
 	}
 	account = markAccountDispatchStart(account, now)
 	cfg.Accounts = cloneAccounts(cfg.Accounts)
-	cfg.Accounts[index] = account
+	parent := cfg.Accounts[index]
+	setAccountWorkspace(&parent, workspaceFromAccountFields(account))
+	cfg.Accounts[index] = normalizeAccountWorkspaces(parent)
 	s.mu.Lock()
 	s.Config = cfg
 	s.updateSnapshotBundleLocked()
@@ -438,23 +456,36 @@ func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionA
 // one. A vanished account is not an error — the request itself already
 // succeeded, there is simply nothing left to update.
 func (s *ServerState) finishAccountDispatchSuccess(email string, session SessionInfo, now time.Time, makeActive bool) error {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
+		return nil
+	}
+	return s.finishWorkspaceDispatchSuccess(email, accountWorkspaceID(account), session, now, makeActive)
+}
+
+func (s *ServerState) finishWorkspaceDispatchSuccess(email string, workspaceID string, session SessionInfo, now time.Time, makeActive bool) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	cfg, _, _ := s.Snapshot()
-	account, index, ok := cfg.FindAccount(email)
+	account, index, ok := cfg.FindAccountWorkspace(email, workspaceID)
 	if !ok {
 		return nil
 	}
 	account = mergeSessionMetadataWithoutOverwritingConfig(account, session)
 	account = markAccountDispatchSuccess(account, now)
 	cfg.Accounts = cloneAccounts(cfg.Accounts)
-	cfg.Accounts[index] = account
+	parent := cfg.Accounts[index]
+	setAccountWorkspace(&parent, workspaceFromAccountFields(account))
+	cfg.Accounts[index] = normalizeAccountWorkspaces(parent)
 	wasActive := false
 	if active, _, activeOK := cfg.ResolveActiveAccount(); activeOK {
-		wasActive = canonicalEmailKey(active.Email) == canonicalEmailKey(account.Email)
+		wasActive = canonicalEmailKey(active.Email) == canonicalEmailKey(account.Email) &&
+			firstNonEmpty(cfg.ActiveWorkspaceID, active.DefaultWorkspaceID) == workspaceID
 	}
 	if makeActive || wasActive {
 		cfg.ActiveAccount = account.Email
+		cfg.ActiveWorkspaceID = workspaceID
 		cfg.ProbeJSON = account.ProbeJSON
 	}
 	return s.saveAndApplyCommitted(cfg)
@@ -464,16 +495,27 @@ func (s *ServerState) finishAccountDispatchSuccess(email string, session Session
 // failure counters actually persist. A vanished account is likewise not an
 // error; there is nothing left to cool down.
 func (s *ServerState) finishAccountDispatchFailure(email string, now time.Time, dispatchErr error, retryable bool) error {
+	cfg, _, _ := s.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
+		return nil
+	}
+	return s.finishWorkspaceDispatchFailure(email, accountWorkspaceID(account), now, dispatchErr, retryable)
+}
+
+func (s *ServerState) finishWorkspaceDispatchFailure(email string, workspaceID string, now time.Time, dispatchErr error, retryable bool) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	cfg, _, _ := s.Snapshot()
-	account, index, ok := cfg.FindAccount(email)
+	account, index, ok := cfg.FindAccountWorkspace(email, workspaceID)
 	if !ok {
 		return nil
 	}
 	account = markAccountDispatchFailure(account, now, dispatchErr, retryable)
 	cfg.Accounts = cloneAccounts(cfg.Accounts)
-	cfg.Accounts[index] = account
+	parent := cfg.Accounts[index]
+	setAccountWorkspace(&parent, workspaceFromAccountFields(account))
+	cfg.Accounts[index] = normalizeAccountWorkspaces(parent)
 	return s.saveAndApplyCommitted(cfg)
 }
 
@@ -483,9 +525,14 @@ func (s *ServerState) finishAccountDispatchFailure(email string, now time.Time, 
 // silently clobbered by this commit. On divergence the live configuration is
 // returned with an error so the caller falls back instead of persisting.
 func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount, refreshedCfg AppConfig) (AppConfig, error) {
-	started, _, ok := cfg.FindAccount(account.Email)
+	startedParent, _, ok := cfg.FindAccount(account.Email)
 	if !ok {
 		return cfg, fmt.Errorf("account %s not found in dispatch snapshot", account.Email)
+	}
+	workspaceID := accountWorkspaceID(account)
+	started, ok := accountForWorkspace(startedParent, workspaceID)
+	if !ok {
+		return cfg, fmt.Errorf("workspace %s not found in dispatch snapshot", workspaceID)
 	}
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -497,16 +544,24 @@ func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount,
 	if !accountIdentityUnchanged(started, current) {
 		return live, fmt.Errorf("account %s changed concurrently; refresh not committed", account.Email)
 	}
-	refreshed, _, ok := refreshedCfg.FindAccount(account.Email)
+	refreshedParent, _, ok := refreshedCfg.FindAccount(account.Email)
 	if !ok {
 		return live, fmt.Errorf("account %s missing from refreshed configuration", account.Email)
 	}
+	refreshed, ok := accountForWorkspace(refreshedParent, workspaceID)
+	if !ok {
+		return live, fmt.Errorf("workspace %s missing from refreshed configuration", workspaceID)
+	}
 	live.Accounts = cloneAccounts(live.Accounts)
-	live.Accounts[index] = refreshed
+	parent := live.Accounts[index]
+	setAccountWorkspace(&parent, workspaceFromAccountFields(refreshed))
+	live.Accounts[index] = normalizeAccountWorkspaces(parent)
 	wasActive := canonicalEmailKey(live.ActiveAccount) == canonicalEmailKey(refreshed.Email)
-	makeActive := canonicalEmailKey(refreshedCfg.ActiveAccount) == canonicalEmailKey(refreshed.Email)
+	makeActive := canonicalEmailKey(refreshedCfg.ActiveAccount) == canonicalEmailKey(refreshed.Email) &&
+		firstNonEmpty(refreshedCfg.ActiveWorkspaceID, refreshedParent.DefaultWorkspaceID) == workspaceID
 	if wasActive || makeActive {
 		live.ActiveAccount = refreshed.Email
+		live.ActiveWorkspaceID = workspaceID
 		live.ProbeJSON = refreshed.ProbeJSON
 	}
 	if err := s.saveAndApplyCommitted(live); err != nil {

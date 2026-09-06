@@ -111,6 +111,7 @@ func (s *SQLiteStore) init() error {
 			email TEXT PRIMARY KEY,
 			position INTEGER NOT NULL,
 			active INTEGER NOT NULL DEFAULT 0,
+			active_workspace_id TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL,
 			data_json TEXT NOT NULL
 		);`,
@@ -188,6 +189,7 @@ func (s *SQLiteStore) init() error {
 		`ALTER TABLE responses ADD COLUMN account_email TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE conversation_sessions ADD COLUMN space_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE conversation_sessions ADD COLUMN space_view_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE accounts ADD COLUMN active_workspace_id TEXT NOT NULL DEFAULT ''`,
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
 			lower := strings.ToLower(err.Error())
@@ -232,6 +234,7 @@ func (s *SQLiteStore) SaveAccounts(cfg AppConfig) error {
 	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	activeKey := canonicalEmailKey(cfg.ActiveAccount)
+	activeWorkspaceID := strings.TrimSpace(cfg.ActiveWorkspaceID)
 	for i, account := range cfg.Accounts {
 		account = ensureAccountPaths(cfg, account)
 		body, marshalErr := json.Marshal(account)
@@ -243,11 +246,16 @@ func (s *SQLiteStore) SaveAccounts(cfg AppConfig) error {
 		if getAccountEmailKey(account) == activeKey {
 			active = 1
 		}
+		workspaceID := ""
+		if active == 1 {
+			workspaceID = activeWorkspaceID
+		}
 		if _, err = tx.Exec(
-			`INSERT INTO accounts(email, position, active, updated_at, data_json) VALUES(?, ?, ?, ?, ?)`,
+			`INSERT INTO accounts(email, position, active, active_workspace_id, updated_at, data_json) VALUES(?, ?, ?, ?, ?, ?)`,
 			account.Email,
 			i,
 			active,
+			workspaceID,
 			now,
 			string(body),
 		); err != nil {
@@ -260,39 +268,47 @@ func (s *SQLiteStore) SaveAccounts(cfg AppConfig) error {
 	return nil
 }
 
-func (s *SQLiteStore) LoadAccounts() ([]NotionAccount, string, bool, error) {
+func (s *SQLiteStore) LoadAccountsWithWorkspace() ([]NotionAccount, string, string, bool, error) {
 	startedAt := time.Now()
 	defer observeSQLiteDuration("load_accounts", startedAt)
 	db := s.readDB()
 	if db == nil {
-		return nil, "", false, nil
+		return nil, "", "", false, nil
 	}
-	rows, err := db.Query(`SELECT data_json, active FROM accounts ORDER BY position ASC, email ASC`)
+	rows, err := db.Query(`SELECT data_json, active, active_workspace_id FROM accounts ORDER BY position ASC, email ASC`)
 	if err != nil {
-		return nil, "", false, err
+		return nil, "", "", false, err
 	}
 	defer rows.Close()
 	accounts := []NotionAccount{}
 	activeAccount := ""
+	activeWorkspaceID := ""
 	for rows.Next() {
 		var body string
 		var active int
-		if err := rows.Scan(&body, &active); err != nil {
-			return nil, "", false, err
+		var workspaceID string
+		if err := rows.Scan(&body, &active, &workspaceID); err != nil {
+			return nil, "", "", false, err
 		}
 		var account NotionAccount
 		if err := json.Unmarshal([]byte(body), &account); err != nil {
-			return nil, "", false, err
+			return nil, "", "", false, err
 		}
 		accounts = append(accounts, account)
 		if active > 0 && activeAccount == "" {
 			activeAccount = account.Email
+			activeWorkspaceID = strings.TrimSpace(workspaceID)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, "", false, err
+		return nil, "", "", false, err
 	}
-	return accounts, activeAccount, len(accounts) > 0, nil
+	return accounts, activeAccount, activeWorkspaceID, len(accounts) > 0, nil
+}
+
+func (s *SQLiteStore) LoadAccounts() ([]NotionAccount, string, bool, error) {
+	accounts, activeAccount, _, ok, err := s.LoadAccountsWithWorkspace()
+	return accounts, activeAccount, ok, err
 }
 
 func (s *SQLiteStore) SaveConversation(entry ConversationEntry) error {

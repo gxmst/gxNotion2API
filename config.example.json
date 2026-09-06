@@ -101,6 +101,23 @@
       "resin_url": "http://127.0.0.1:2260/your-resin-token",
       "resin_platform": "Default",
       "resin_mode": "forward",
+      "default_workspace_id": "alice-business-workspace",
+      "workspaces": [
+        {
+          "id": "alice-business-workspace",
+          "view_id": "alice-business-view",
+          "name": "Alice Business",
+          "subscription_tier": "business",
+          "max_concurrency": 2
+        },
+        {
+          "id": "alice-personal-workspace",
+          "view_id": "alice-personal-view",
+          "name": "Alice Personal",
+          "subscription_tier": "free",
+          "max_concurrency": 1
+        }
+      ],
       "priority": 100,
       "disabled": false
     },

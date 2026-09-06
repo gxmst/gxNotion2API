@@ -13,16 +13,17 @@ import (
 )
 
 type manualAccountImportRequest struct {
-	Email         string `json:"email"`
-	UserID        string `json:"user_id"`
-	UserName      string `json:"user_name"`
-	SpaceID       string `json:"space_id"`
-	SpaceViewID   string `json:"space_view_id"`
-	SpaceName     string `json:"space_name"`
-	ClientVersion string `json:"client_version"`
-	CookieHeader  string `json:"cookie_header"`
-	ProbeJSONText string `json:"probe_json_text"`
-	Active        bool   `json:"active"`
+	Email              string `json:"email"`
+	UserID             string `json:"user_id"`
+	UserName           string `json:"user_name"`
+	SpaceID            string `json:"space_id"`
+	SpaceViewID        string `json:"space_view_id"`
+	SpaceName          string `json:"space_name"`
+	DefaultWorkspaceID string `json:"default_workspace_id"`
+	ClientVersion      string `json:"client_version"`
+	CookieHeader       string `json:"cookie_header"`
+	ProbeJSONText      string `json:"probe_json_text"`
+	Active             bool   `json:"active"`
 }
 
 func parseManualImportProbeJSON(raw string) (probePayload, error) {
@@ -46,6 +47,7 @@ func parseManualImportProbeJSON(raw string) (probePayload, error) {
 
 func (a *App) accountRuntimeSummary(cfg AppConfig, account NotionAccount) map[string]any {
 	account = ensureAccountPaths(cfg, account)
+	account = normalizeAccountWorkspaces(account)
 	now := time.Now()
 	remainingQuota, quotaLimited := accountRemainingQuota(account, now)
 	cooldownUntil := parseOptionalRFC3339(account.CooldownUntil)
@@ -65,6 +67,7 @@ func (a *App) accountRuntimeSummary(cfg AppConfig, account NotionAccount) map[st
 		"space_view_id":           account.SpaceViewID,
 		"space_name":              account.SpaceName,
 		"plan_type":               account.PlanType,
+		"default_workspace_id":    account.DefaultWorkspaceID,
 		"client_version":          account.ClientVersion,
 		"status":                  account.Status,
 		"last_error":              account.LastError,
@@ -90,6 +93,31 @@ func (a *App) accountRuntimeSummary(cfg AppConfig, account NotionAccount) map[st
 		"total_failures":          account.TotalFailures,
 		"active":                  canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(account),
 	}
+	workspaceItems := make([]map[string]any, 0, len(account.Workspaces))
+	for _, workspace := range account.Workspaces {
+		workspace = normalizeWorkspace(workspace)
+		selected, _ := accountForWorkspace(account, workspace.ID)
+		remaining, limited := accountRemainingQuota(selected, now)
+		cooldownUntil := parseOptionalRFC3339(workspace.CooldownUntil)
+		workspaceItems = append(workspaceItems, map[string]any{
+			"id": workspace.ID, "view_id": workspace.ViewID, "name": workspace.Name,
+			"plan_type": workspace.PlanType, "subscription_tier": workspace.SubscriptionTier,
+			"ai_enabled": workspace.AIEnabled, "status": workspace.Status,
+			"last_error": workspace.LastError, "priority": workspace.Priority,
+			"hourly_quota": workspace.HourlyQuota, "max_concurrency": workspace.MaxConcurrency,
+			"quota_limited": limited, "remaining_quota": remaining,
+			"window_started_at": workspace.WindowStartedAt, "window_request_count": workspace.WindowRequestCount,
+			"cooldown_until": workspace.CooldownUntil, "cooldown_active": accountCooldownActive(selected, now),
+			"cooldown_remaining_sec": maxInt(int(time.Until(cooldownUntil).Seconds()), 0),
+			"last_used_at":           workspace.LastUsedAt, "last_success_at": workspace.LastSuccessAt,
+			"last_refresh_at": workspace.LastRefreshAt, "last_quota_exhausted_at": workspace.LastQuotaExhaustedAt,
+			"consecutive_failures": workspace.ConsecutiveFailures, "total_successes": workspace.TotalSuccesses,
+			"total_failures": workspace.TotalFailures,
+			"default":        workspace.ID == account.DefaultWorkspaceID,
+			"active":         canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(account) && firstNonEmpty(cfg.ActiveWorkspaceID, account.DefaultWorkspaceID) == workspace.ID,
+		})
+	}
+	item["workspaces"] = workspaceItems
 	if status, err := readLoginStatusFile(account.PendingStatePath); err == nil {
 		item["login_status"] = status
 		if text := firstNonEmpty(status.Status, account.Status); text != "" {
@@ -135,10 +163,11 @@ func (a *App) buildAccountsPayload() map[string]any {
 		items = append(items, a.accountRuntimeSummary(cfg, account))
 	}
 	return map[string]any{
-		"success":        true,
-		"items":          items,
-		"active_account": cfg.ActiveAccount,
-		"session_ready":  sessionReady,
+		"success":             true,
+		"items":               items,
+		"active_account":      cfg.ActiveAccount,
+		"active_workspace_id": cfg.ActiveWorkspaceID,
+		"session_ready":       sessionReady,
 		"session": map[string]any{
 			"user_email":    session.UserEmail,
 			"user_id":       session.UserID,
@@ -215,7 +244,7 @@ func intFromPayloadValue(value any) (int, error) {
 }
 
 func mergeEditableAccountFields(existing NotionAccount, payload map[string]any) (NotionAccount, bool, error) {
-	next := existing
+	next := normalizeAccountWorkspaces(existing)
 	accountPayload := accountPayloadMap(payload)
 	if raw, ok := accountPayload["disabled"]; ok {
 		disabled, ok := raw.(bool)
@@ -251,6 +280,40 @@ func mergeEditableAccountFields(existing NotionAccount, payload map[string]any) 
 		}
 		next.MaxConcurrency = limit
 	}
+	workspaceID := firstNonEmpty(
+		strings.TrimSpace(stringValue(accountPayload["workspace_id"])),
+		strings.TrimSpace(stringValue(accountPayload["space_id"])),
+		strings.TrimSpace(stringValue(accountPayload["default_workspace_id"])),
+		next.DefaultWorkspaceID,
+	)
+	target, ok := accountForWorkspace(next, workspaceID)
+	if !ok {
+		return NotionAccount{}, false, fmt.Errorf("workspace %s not found for account %s", workspaceID, next.Email)
+	}
+	if raw, ok := accountPayload["priority"]; ok {
+		priority, _ := intFromPayloadValue(raw)
+		target.Priority = priority
+	}
+	if raw, ok := accountPayload["hourly_quota"]; ok {
+		quota, _ := intFromPayloadValue(raw)
+		target.HourlyQuota = quota
+	}
+	if raw, ok := accountPayload["max_concurrency"]; ok {
+		limit, _ := intFromPayloadValue(raw)
+		target.MaxConcurrency = limit
+	}
+	setAccountWorkspace(&next, workspaceFromAccountFields(target))
+	if raw, ok := accountPayload["default_workspace_id"]; ok {
+		workspaceID := strings.TrimSpace(stringValue(raw))
+		if workspaceID == "" {
+			return NotionAccount{}, false, fmt.Errorf("default_workspace_id is required")
+		}
+		if _, ok := accountForWorkspace(next, workspaceID); !ok {
+			return NotionAccount{}, false, fmt.Errorf("workspace %s not found for account %s", workspaceID, next.Email)
+		}
+		next.DefaultWorkspaceID = workspaceID
+	}
+	next = normalizeAccountWorkspaces(next)
 	makeActive, _ := payload["active"].(bool)
 	return next, makeActive, nil
 }
@@ -281,6 +344,7 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			cfg.ActiveAccount = account.Email
+			cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
 			cfg.ProbeJSON = account.ProbeJSON
 		}
 		if err := a.State.SaveAndApply(cfg); err != nil {
@@ -326,6 +390,7 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			cfg.ActiveAccount = next.Email
+			cfg.ActiveWorkspaceID = next.DefaultWorkspaceID
 			cfg.ProbeJSON = next.ProbeJSON
 		}
 		if err := a.State.SaveAndApply(cfg); err != nil {
@@ -400,6 +465,12 @@ func (a *App) handleAdminAccountsRefreshModels(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
 		return
 	}
+	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), account.DefaultWorkspaceID)
+	if workspaceID != "" {
+		if selected, _, selectedOK := cfg.FindAccountWorkspace(email, workspaceID); selectedOK {
+			account = selected
+		}
+	}
 	account = ensureAccountPaths(cfg, account)
 	if !fileExists(account.ProbeJSON) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "probe_json not found for account"})
@@ -468,12 +539,22 @@ func (a *App) handleAdminAccountsActivate(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
 		return
 	}
+	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), account.DefaultWorkspaceID)
+	if workspaceID != "" {
+		if selected, _, selectedOK := cfg.FindAccountWorkspace(email, workspaceID); selectedOK {
+			account = selected
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "workspace not found"})
+			return
+		}
+	}
 	account = ensureAccountPaths(cfg, account)
 	if !fileExists(account.ProbeJSON) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "probe_json not found for account"})
 		return
 	}
 	cfg.ActiveAccount = account.Email
+	cfg.ActiveWorkspaceID = workspaceID
 	cfg.ProbeJSON = account.ProbeJSON
 	if err := a.State.SaveAndApply(cfg); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
@@ -513,11 +594,12 @@ func (a *App) handleAdminAccountsTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	email := strings.TrimSpace(stringValue(payload["email"]))
+	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])))
 	probePath, userName, spaceName, activeEmail := cfg.ResolveSessionTarget()
 	if email != "" {
-		account, _, ok := cfg.FindAccount(email)
+		account, _, ok := cfg.FindAccountWorkspace(email, workspaceID)
 		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account or workspace not found"})
 			return
 		}
 		account = ensureAccountPaths(cfg, account)
@@ -525,6 +607,23 @@ func (a *App) handleAdminAccountsTest(w http.ResponseWriter, r *http.Request) {
 		userName = firstNonEmpty(account.UserName, cfg.UserName)
 		spaceName = firstNonEmpty(account.SpaceName, cfg.SpaceName)
 		activeEmail = account.Email
+		workspaceID = account.SpaceID
+	} else if workspaceID != "" {
+		found := false
+		for _, candidate := range cfg.Accounts {
+			if account, _, ok := cfg.FindAccountWorkspace(candidate.Email, workspaceID); ok {
+				probePath = ensureAccountPaths(cfg, account).ProbeJSON
+				userName = firstNonEmpty(account.UserName, cfg.UserName)
+				spaceName = firstNonEmpty(account.SpaceName, cfg.SpaceName)
+				activeEmail = account.Email
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "workspace not found"})
+			return
+		}
 	}
 	if strings.TrimSpace(probePath) == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "no probe_json configured for target account"})
@@ -534,6 +633,13 @@ func (a *App) handleAdminAccountsTest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
+	}
+	if workspaceID != "" {
+		if selected, _, ok := cfg.FindAccountWorkspace(activeEmail, workspaceID); ok {
+			session.SpaceID = selected.SpaceID
+			session.SpaceViewID = selected.SpaceViewID
+			session.SpaceName = selected.SpaceName
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), adminSyncRequestTimeout(cfg))
 	defer cancel()
@@ -545,6 +651,7 @@ func (a *App) handleAdminAccountsTest(w http.ResponseWriter, r *http.Request) {
 		UseWebSearch:                      requestedWebSearch(payload, cfg.Features.UseWebSearch),
 		Attachments:                       attachments,
 		SuppressUpstreamThreadPersistence: true,
+		WorkspaceID:                       workspaceID,
 	}
 	conversationID := a.beginConversation("", "admin_account_test", "account_test", prompt, request)
 	result, err := a.runPromptWithSession(ctx, cfg, session, activeEmail, request, nil)
@@ -576,6 +683,10 @@ func mergeAccountWithStatus(cfg AppConfig, account NotionAccount, status LoginSt
 	account.SpaceID = firstNonEmpty(status.SpaceID, account.SpaceID)
 	account.SpaceViewID = firstNonEmpty(status.SpaceViewID, account.SpaceViewID)
 	account.SpaceName = firstNonEmpty(status.SpaceName, account.SpaceName)
+	if len(status.Workspaces) > 0 {
+		account.Workspaces = status.Workspaces
+		account.DefaultWorkspaceID = firstNonEmpty(status.SpaceID, account.DefaultWorkspaceID)
+	}
 	account.ClientVersion = firstNonEmpty(status.ClientVersion, account.ClientVersion)
 	account.Status = firstNonEmpty(status.Status, account.Status)
 	account.LastError = firstNonEmpty(status.Error, status.Message, account.LastError)
@@ -645,6 +756,7 @@ func decodeManualImportRequest(payload map[string]any) (manualAccountImportReque
 	req.SpaceID = strings.TrimSpace(req.SpaceID)
 	req.SpaceViewID = strings.TrimSpace(req.SpaceViewID)
 	req.SpaceName = strings.TrimSpace(req.SpaceName)
+	req.DefaultWorkspaceID = strings.TrimSpace(req.DefaultWorkspaceID)
 	req.ClientVersion = strings.TrimSpace(req.ClientVersion)
 	req.CookieHeader = strings.TrimSpace(req.CookieHeader)
 	req.ProbeJSONText = strings.TrimSpace(req.ProbeJSONText)
@@ -815,6 +927,43 @@ func (a *App) handleAdminAccountManualImport(w http.ResponseWriter, r *http.Requ
 	account.Status = "ready"
 	account.LastError = ""
 	account.LastLoginAt = status.LastLoginAt
+	requestedDefaultWorkspaceID := strings.TrimSpace(req.DefaultWorkspaceID)
+	account.DefaultWorkspaceID = firstNonEmpty(requestedDefaultWorkspaceID, account.DefaultWorkspaceID, probe.SpaceID)
+	if len(discovered.Workspaces) > 0 {
+		for _, candidate := range discovered.Workspaces {
+			workspace := NotionWorkspace{
+				ID:               candidate.ID,
+				ViewID:           candidate.ViewID,
+				Name:             candidate.Name,
+				PlanType:         candidate.PlanType,
+				SubscriptionTier: candidate.SubscriptionTier,
+				AIEnabled:        candidate.AIEnabled,
+				Status:           "ready",
+			}
+			if existing, ok := accountWorkspace(account, workspace.ID); ok {
+				workspace = mergeWorkspaceValues(existing, workspace)
+			}
+			setAccountWorkspace(&account, workspace)
+		}
+	} else if probe.SpaceID != "" {
+		workspace := NotionWorkspace{
+			ID:       probe.SpaceID,
+			ViewID:   probe.SpaceViewID,
+			Name:     probe.SpaceName,
+			PlanType: account.PlanType,
+			Status:   "ready",
+		}
+		if existing, ok := accountWorkspace(account, workspace.ID); ok {
+			workspace = mergeWorkspaceValues(existing, workspace)
+		}
+		setAccountWorkspace(&account, workspace)
+	}
+	if account.DefaultWorkspaceID == "" {
+		account.DefaultWorkspaceID = probe.SpaceID
+	}
+	if _, ok := accountForWorkspace(account, account.DefaultWorkspaceID); !ok {
+		account.DefaultWorkspaceID = probe.SpaceID
+	}
 	account.PlanType = firstNonEmpty(account.PlanType, discovered.PlanType)
 	account.UserName = firstNonEmpty(account.UserName, discovered.UserName)
 	account.SpaceName = firstNonEmpty(account.SpaceName, discovered.SpaceName)
@@ -824,6 +973,7 @@ func (a *App) handleAdminAccountManualImport(w http.ResponseWriter, r *http.Requ
 	cfg.UpsertAccount(account)
 	if req.Active {
 		cfg.ActiveAccount = account.Email
+		cfg.ActiveWorkspaceID = probe.SpaceID
 		cfg.ProbeJSON = account.ProbeJSON
 	}
 	if err := a.State.SaveAndApply(cfg); err != nil {
@@ -968,6 +1118,7 @@ func (a *App) handleAdminAccountLoginVerify(w http.ResponseWriter, r *http.Reque
 			account.LastLoginAt = time.Now().Format(time.RFC3339)
 		}
 		cfg.ActiveAccount = account.Email
+		cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
 		cfg.ProbeJSON = account.ProbeJSON
 	}
 	cfg.UpsertAccount(account)
