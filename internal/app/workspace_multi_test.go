@@ -242,3 +242,69 @@ func TestNormalizeConfigKeepsActiveWorkspaceSelection(t *testing.T) {
 func nowForWorkspaceTest() time.Time {
 	return time.Now()
 }
+
+// A request that finishes while the workspace it ran on is being edited away
+// must still return its slot to the old key. A dropped release would keep the
+// in-flight counter raised and leak the workspace's concurrency capacity, and
+// the fallback must never touch a bare email key belonging to another
+// workspace's slot.
+func TestWorkspaceSlotReleaseSurvivesWorkspaceRemoval(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.APIKey = "test-key"
+	cfg.Storage.SQLitePath = ""
+	cfg.Accounts = []NotionAccount{{
+		Email:              "user@example.com",
+		DefaultWorkspaceID: "one",
+		Workspaces: []NotionWorkspace{
+			{ID: "one", MaxConcurrency: 1, Status: "ready"},
+			{ID: "two", MaxConcurrency: 1, Status: "ready"},
+		},
+	}}
+	state, err := newServerState(cfg)
+	if err != nil {
+		t.Fatalf("newServerState: %v", err)
+	}
+	defer state.Close()
+
+	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+		t.Fatal("workspace slot was not acquired")
+	}
+
+	// Simulate the race window: the workspace disappears from the live config
+	// while the request is still in flight and before the slot map is rebuilt.
+	state.mu.Lock()
+	edited := state.Config.Accounts[0]
+	edited.Workspaces = []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}}
+	edited.DefaultWorkspaceID = "one"
+	state.Config.Accounts[0] = edited
+	state.mu.Unlock()
+
+	// The lookup no longer finds the workspace, but the release must still
+	// land on the old key.
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
+	oldTwoKey := canonicalEmailKey("user@example.com") + "\x00" + "two"
+	if slot := state.loadAccountSlots()[oldTwoKey]; slot == nil {
+		t.Fatal("old slot key vanished without a rebuild")
+	} else if inflight := slot.inflight.Load(); inflight != 0 {
+		t.Fatalf("slot leaked after the workspace was edited away: inflight=%d", inflight)
+	}
+
+	// The fallback must not touch any other key: the surviving workspace's
+	// slot keeps its pre-rebuild key and stays idle.
+	if slot := state.loadAccountSlots()[canonicalEmailKey("user@example.com")+"\x00one"]; slot == nil {
+		t.Fatal("surviving workspace slot vanished without a rebuild")
+	} else if inflight := slot.inflight.Load(); inflight != 0 {
+		t.Fatalf("unrelated workspace slot was disturbed: inflight=%d", inflight)
+	}
+
+	// Once the slot map is rebuilt for the edited configuration, a late
+	// release for the removed workspace is a no-op and must not touch the
+	// surviving workspace's slot.
+	state.mu.Lock()
+	state.rebuildAccountSlotsLocked()
+	state.mu.Unlock()
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
+	if remaining := state.remainingDispatchSlotKey(canonicalEmailKey("user@example.com")); remaining != 1 {
+		t.Fatalf("late release disturbed the rebuilt slot map: remaining=%d", remaining)
+	}
+}

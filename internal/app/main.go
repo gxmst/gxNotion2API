@@ -265,12 +265,24 @@ func (s *ServerState) TryAcquireAccountDispatchSlot(email string) bool {
 	return s.TryAcquireWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
 }
 
+// workspaceSlotKey resolves the slot key for an account/workspace pair from a
+// consistent configuration snapshot. The key must be derived under s.mu: a
+// bare s.Config lookup races ApplyConfig, and on the release path a spurious
+// lookup failure would drop the slot and leak the workspace's capacity.
+func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string, bool) {
+	cfg, _, _ := s.Snapshot()
+	if account, _, ok := cfg.FindAccountWorkspace(email, workspaceID); ok {
+		return dispatchWorkspaceKey(account), true
+	}
+	return "", false
+}
+
 func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
-	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
+	key, ok := s.workspaceSlotKey(email, workspaceID)
 	if !ok {
 		return false
 	}
-	return s.tryAcquireDispatchSlotKey(dispatchWorkspaceKey(account))
+	return s.tryAcquireDispatchSlotKey(key)
 }
 
 func (s *ServerState) tryAcquireDispatchSlotKey(key string) bool {
@@ -308,11 +320,22 @@ func (s *ServerState) ReleaseAccountDispatchSlot(email string) {
 }
 
 func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID string) {
-	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
-	if !ok {
+	if key, ok := s.workspaceSlotKey(email, workspaceID); ok {
+		s.releaseDispatchSlotKey(key)
 		return
 	}
-	s.releaseDispatchSlotKey(dispatchWorkspaceKey(account))
+	// The workspace may have been edited away while the request was in flight.
+	// Until the slot map is rebuilt under the same lock, the old key still
+	// gates capacity and the slot must be returned to it; once rebuilt, the key
+	// no longer exists and there is nothing left to release. Never fall back to
+	// a bare email key: that could decrement a different workspace's slot.
+	if emailKey := canonicalEmailKey(email); emailKey != "" {
+		if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
+			if key := emailKey + "\x00" + workspaceID; s.loadAccountSlots()[key] != nil {
+				s.releaseDispatchSlotKey(key)
+			}
+		}
+	}
 }
 
 func (s *ServerState) releaseDispatchSlotKey(key string) {
@@ -347,11 +370,11 @@ func (s *ServerState) RemainingAccountDispatchSlots(email string) int {
 }
 
 func (s *ServerState) RemainingWorkspaceDispatchSlots(email string, workspaceID string) int {
-	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
+	key, ok := s.workspaceSlotKey(email, workspaceID)
 	if !ok {
 		return 0
 	}
-	return s.remainingDispatchSlotKey(dispatchWorkspaceKey(account))
+	return s.remainingDispatchSlotKey(key)
 }
 
 func (s *ServerState) remainingDispatchSlotKey(key string) int {

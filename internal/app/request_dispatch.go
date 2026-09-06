@@ -200,6 +200,12 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 	}
 	account, _, ok := cfg.FindAccountWorkspace(pinnedEmail, pinnedWorkspace)
 	if !ok {
+		// The account existing but its pinned workspace being gone (a removed
+		// or expired workspace) is a different problem from a missing account
+		// and needs a different answer from the operator.
+		if _, _, found := cfg.FindAccount(pinnedEmail); found {
+			return nil, fmt.Errorf("workspace %s is no longer available for account %s; switch workspace or start a new conversation", pinnedWorkspace, pinnedEmail)
+		}
 		return nil, fmt.Errorf("account %s not found", pinnedEmail)
 	}
 	account = ensureAccountPaths(cfg, account)
