@@ -238,6 +238,19 @@ func (s *ServerState) rebuildAccountSlotsLocked() {
 			next[key] = slot
 		}
 	}
+	// Slots for keys that vanish while requests are still in flight on them
+	// must survive the rebuild: the late release has to decrement the same
+	// object it acquired, and a workspace that is added back later inherits
+	// its real in-flight count instead of a fresh zero. Idle leftovers are
+	// dropped so the map does not grow with removed workspaces.
+	for key, slot := range previous {
+		if _, ok := next[key]; ok {
+			continue
+		}
+		if slot.inflight.Load() > 0 {
+			next[key] = slot
+		}
+	}
 	s.slots.Store(&next)
 	syncDispatchSlotInflightFromSlots(next)
 }

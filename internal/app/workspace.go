@@ -376,13 +376,19 @@ func mergeWorkspaceValues(existing NotionWorkspace, incoming NotionWorkspace) No
 	return normalizeWorkspace(merged)
 }
 
+// dispatchWorkspaceKey is the concurrency-slot identity of one account
+// workspace. It must be a pure function of (email, workspaceID): deriving it
+// from the workspace-list length made the key flip between email and
+// email\0workspace when workspaces were added or removed, which reset the
+// in-flight counter mid-request and let concurrent dispatches exceed
+// MaxConcurrency. Accounts without any recorded workspace keep the bare email
+// key.
 func dispatchWorkspaceKey(account NotionAccount) string {
 	email := getAccountEmailKey(account)
-	workspaceID := accountWorkspaceID(account)
-	if workspaceID == "" || len(account.Workspaces) <= 1 {
-		return email
+	if workspaceID := accountWorkspaceID(account); workspaceID != "" {
+		return email + "\x00" + workspaceID
 	}
-	return email + "\x00" + workspaceID
+	return email
 }
 
 func accountWorkspaceCandidates(account NotionAccount) []NotionAccount {

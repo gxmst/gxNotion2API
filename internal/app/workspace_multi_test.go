@@ -243,68 +243,111 @@ func nowForWorkspaceTest() time.Time {
 	return time.Now()
 }
 
-// A request that finishes while the workspace it ran on is being edited away
-// must still return its slot to the old key. A dropped release would keep the
-// in-flight counter raised and leak the workspace's concurrency capacity, and
-// the fallback must never touch a bare email key belonging to another
-// workspace's slot.
-func TestWorkspaceSlotReleaseSurvivesWorkspaceRemoval(t *testing.T) {
+// workspaceSlotTestState builds a single-account server state with the given
+// workspace list and no storage, for slot-key regression tests.
+func workspaceSlotTestState(t *testing.T, workspaces []NotionWorkspace) *ServerState {
+	t.Helper()
+	state, err := newServerState(workspaceSlotTestConfig(workspaces))
+	if err != nil {
+		t.Fatalf("newServerState: %v", err)
+	}
+	t.Cleanup(func() { _ = state.Close() })
+	return state
+}
+
+func workspaceSlotTestConfig(workspaces []NotionWorkspace) AppConfig {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-key"
 	cfg.Storage.SQLitePath = ""
 	cfg.Accounts = []NotionAccount{{
 		Email:              "user@example.com",
-		DefaultWorkspaceID: "one",
-		Workspaces: []NotionWorkspace{
-			{ID: "one", MaxConcurrency: 1, Status: "ready"},
-			{ID: "two", MaxConcurrency: 1, Status: "ready"},
-		},
+		DefaultWorkspaceID: workspaces[0].ID,
+		Workspaces:         workspaces,
 	}}
-	state, err := newServerState(cfg)
-	if err != nil {
-		t.Fatalf("newServerState: %v", err)
+	return cfg
+}
+
+func applyWorkspaceList(t *testing.T, state *ServerState, workspaces []NotionWorkspace) {
+	t.Helper()
+	if err := state.ApplyConfig(workspaceSlotTestConfig(workspaces)); err != nil {
+		t.Fatalf("ApplyConfig: %v", err)
 	}
-	defer state.Close()
+}
+
+// The slot key must be a pure function of (email, workspaceID). If the
+// workspace-list length influenced it, shrinking an account from two
+// workspaces to one would move the surviving workspace onto a fresh slot and
+// reset its in-flight count, letting a second dispatch run in parallel and
+// exceed MaxConcurrency.
+func TestWorkspaceSlotSurvivesWorkspaceListShrink(t *testing.T) {
+	state := workspaceSlotTestState(t, []NotionWorkspace{
+		{ID: "one", MaxConcurrency: 1, Status: "ready"},
+		{ID: "two", MaxConcurrency: 1, Status: "ready"},
+	})
+
+	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("slot was not acquired")
+	}
+	applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
+
+	if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("in-flight count was reset by the config change; a second dispatch would exceed MaxConcurrency")
+	}
+	if remaining := state.RemainingWorkspaceDispatchSlots("user@example.com", "one"); remaining != 0 {
+		t.Fatalf("remaining = %d, want 0 while the first request is still running", remaining)
+	}
+
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "one")
+	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("slot was not returned after the release")
+	}
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "one")
+}
+
+// Removing a workspace while a request is still running on it and then adding
+// it back must not let the stale release decrement a fresh slot: the
+// carried-over slot keeps the real in-flight count across the whole cycle, and
+// the fallback release path (the config no longer lists the workspace) lands
+// on that carried-over object. Idle removed slots are dropped by the next
+// rebuild instead of growing the map forever.
+func TestWorkspaceSlotReleaseSurvivesRemoveAndReAdd(t *testing.T) {
+	state := workspaceSlotTestState(t, []NotionWorkspace{
+		{ID: "one", MaxConcurrency: 1, Status: "ready"},
+		{ID: "two", MaxConcurrency: 1, Status: "ready"},
+	})
+	removedKey := canonicalEmailKey("user@example.com") + string(rune(0)) + "two"
 
 	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
-		t.Fatal("workspace slot was not acquired")
+		t.Fatal("slot was not acquired")
+	}
+	applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
+	if slot := state.loadAccountSlots()[removedKey]; slot == nil || slot.inflight.Load() != 1 {
+		t.Fatalf("removed workspace slot was not carried over: %+v", slot)
 	}
 
-	// Simulate the race window: the workspace disappears from the live config
-	// while the request is still in flight and before the slot map is rebuilt.
-	state.mu.Lock()
-	edited := state.Config.Accounts[0]
-	edited.Workspaces = []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}}
-	edited.DefaultWorkspaceID = "one"
-	state.Config.Accounts[0] = edited
-	state.mu.Unlock()
-
-	// The lookup no longer finds the workspace, but the release must still
-	// land on the old key.
+	// The config no longer lists the workspace, so this release exercises the
+	// fallback lookup rather than the regular snapshot path.
 	state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
-	oldTwoKey := canonicalEmailKey("user@example.com") + "\x00" + "two"
-	if slot := state.loadAccountSlots()[oldTwoKey]; slot == nil {
-		t.Fatal("old slot key vanished without a rebuild")
-	} else if inflight := slot.inflight.Load(); inflight != 0 {
-		t.Fatalf("slot leaked after the workspace was edited away: inflight=%d", inflight)
+	if slot := state.loadAccountSlots()[removedKey]; slot == nil || slot.inflight.Load() != 0 {
+		t.Fatalf("fallback release did not land on the carried-over slot: %+v", slot)
 	}
 
-	// The fallback must not touch any other key: the surviving workspace's
-	// slot keeps its pre-rebuild key and stays idle.
-	if slot := state.loadAccountSlots()[canonicalEmailKey("user@example.com")+"\x00one"]; slot == nil {
-		t.Fatal("surviving workspace slot vanished without a rebuild")
-	} else if inflight := slot.inflight.Load(); inflight != 0 {
-		t.Fatalf("unrelated workspace slot was disturbed: inflight=%d", inflight)
+	applyWorkspaceList(t, state, []NotionWorkspace{
+		{ID: "one", MaxConcurrency: 1, Status: "ready"},
+		{ID: "two", MaxConcurrency: 1, Status: "ready"},
+	})
+	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+		t.Fatal("re-added workspace slot was not usable")
 	}
-
-	// Once the slot map is rebuilt for the edited configuration, a late
-	// release for the removed workspace is a no-op and must not touch the
-	// surviving workspace's slot.
-	state.mu.Lock()
-	state.rebuildAccountSlotsLocked()
-	state.mu.Unlock()
+	if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+		t.Fatal("re-added workspace exceeded its concurrency limit")
+	}
 	state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
-	if remaining := state.remainingDispatchSlotKey(canonicalEmailKey("user@example.com")); remaining != 1 {
-		t.Fatalf("late release disturbed the rebuilt slot map: remaining=%d", remaining)
+
+	// With nothing in flight on the removed workspace, the next rebuild drops
+	// its slot instead of growing the map forever.
+	applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
+	if slot := state.loadAccountSlots()[removedKey]; slot != nil {
+		t.Fatalf("idle removed slot was not dropped: %+v", slot)
 	}
 }
