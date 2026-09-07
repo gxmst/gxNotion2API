@@ -1,7 +1,11 @@
 package app
 
 import (
+	"fmt"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -349,5 +353,128 @@ func TestWorkspaceSlotReleaseSurvivesRemoveAndReAdd(t *testing.T) {
 	applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
 	if slot := state.loadAccountSlots()[removedKey]; slot != nil {
 		t.Fatalf("idle removed slot was not dropped: %+v", slot)
+	}
+}
+
+func TestWorkspaceSlotLimitDecreaseKeepsInflightRequests(t *testing.T) {
+	state := workspaceSlotTestState(t, []NotionWorkspace{{ID: "one", MaxConcurrency: 2, Status: "ready"}})
+	for i := 0; i < 2; i++ {
+		if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+			t.Fatal("initial slot was not acquired")
+		}
+	}
+	applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
+	key := dispatchWorkspaceKey(NotionAccount{Email: "user@example.com", SpaceID: "one"})
+	if got := state.AccountDispatchSnapshot()[key]; got.InFlight != 2 || got.MaxConcurrency != 1 {
+		t.Errorf("dispatch state after lowering limit = %+v, want InFlight=2 MaxConcurrency=1", got)
+	}
+	if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("lowered limit admitted a request before either old request finished")
+	}
+
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "one")
+	if remaining := state.RemainingWorkspaceDispatchSlots("user@example.com", "one"); remaining != 0 {
+		t.Errorf("remaining = %d, want 0 while the second request is still running", remaining)
+	}
+	if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("lowered limit admitted a request while the second request was still running")
+	}
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "one")
+	if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "one") {
+		t.Fatal("slot remained unavailable after both old requests finished")
+	}
+	state.ReleaseWorkspaceDispatchSlot("user@example.com", "one")
+}
+
+func TestWorkspaceSlotReAddWhileRequestIsRunning(t *testing.T) {
+	for _, limit := range []int{1, 2} {
+		t.Run(fmt.Sprint(limit), func(t *testing.T) {
+			state := workspaceSlotTestState(t, []NotionWorkspace{
+				{ID: "one", MaxConcurrency: 1, Status: "ready"},
+				{ID: "two", MaxConcurrency: 2, Status: "ready"},
+			})
+			for i := 0; i < 2; i++ {
+				if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+					t.Fatal("initial slot was not acquired")
+				}
+			}
+			applyWorkspaceList(t, state, []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}})
+			if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+				t.Fatal("removed workspace admitted a new request")
+			}
+			applyWorkspaceList(t, state, []NotionWorkspace{
+				{ID: "one", MaxConcurrency: 1, Status: "ready"},
+				{ID: "two", MaxConcurrency: limit, Status: "ready"},
+			})
+			if state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+				t.Fatal("re-added workspace lost the running requests")
+			}
+			state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
+			if got := state.RemainingWorkspaceDispatchSlots("user@example.com", "two"); got != limit-1 {
+				t.Errorf("remaining after one release = %d, want %d", got, limit-1)
+			}
+			state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
+			if got := state.RemainingWorkspaceDispatchSlots("user@example.com", "two"); got != limit {
+				t.Errorf("remaining after both releases = %d, want %d", got, limit)
+			}
+		})
+	}
+}
+
+func TestWorkspaceSlotsConcurrentConfigChanges(t *testing.T) {
+	state := workspaceSlotTestState(t, []NotionWorkspace{
+		{ID: "one", MaxConcurrency: 1, Status: "ready"},
+		{ID: "two", MaxConcurrency: 1, Status: "ready"},
+	})
+	key := dispatchWorkspaceKey(NotionAccount{Email: "user@example.com", SpaceID: "two"})
+	var running atomic.Int32
+	var workers sync.WaitGroup
+	start := make(chan struct{})
+	for worker := 0; worker < 4; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			<-start
+			for i := 0; i < 1000; i++ {
+				if !state.TryAcquireWorkspaceDispatchSlot("user@example.com", "two") {
+					runtime.Gosched()
+					continue
+				}
+				if count := running.Add(1); count > 1 {
+					t.Errorf("workspace admitted %d concurrent requests, limit is 1", count)
+				}
+				runtime.Gosched()
+				if slot := state.loadAccountSlots()[key]; slot == nil || slot.inflight.Load() < 1 {
+					t.Error("running request lost its slot during config rebuild")
+				}
+				running.Add(-1)
+				state.ReleaseWorkspaceDispatchSlot("user@example.com", "two")
+			}
+		}()
+	}
+	workers.Add(1)
+	go func() {
+		defer workers.Done()
+		<-start
+		for i := 0; i < 500; i++ {
+			workspaces := []NotionWorkspace{{ID: "one", MaxConcurrency: 1, Status: "ready"}}
+			if i%2 == 1 {
+				workspaces = append(workspaces, NotionWorkspace{ID: "two", MaxConcurrency: 1, Status: "ready"})
+			}
+			if err := state.ApplyConfig(workspaceSlotTestConfig(workspaces)); err != nil {
+				t.Errorf("ApplyConfig: %v", err)
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+	close(start)
+	workers.Wait()
+	applyWorkspaceList(t, state, []NotionWorkspace{
+		{ID: "one", MaxConcurrency: 1, Status: "ready"},
+		{ID: "two", MaxConcurrency: 1, Status: "ready"},
+	})
+	if got := state.RemainingWorkspaceDispatchSlots("user@example.com", "two"); got != 1 {
+		t.Fatalf("remaining after all requests finished = %d, want 1", got)
 	}
 }

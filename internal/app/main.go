@@ -187,30 +187,7 @@ func normalizeAccountMaxConcurrency(raw int) int {
 	return raw
 }
 
-func clampSlotInFlight(slot *accountSlot, max int32) int32 {
-	if slot == nil {
-		return 0
-	}
-	if max <= 0 {
-		max = 1
-	}
-	for {
-		current := slot.inflight.Load()
-		if current < 0 {
-			if slot.inflight.CompareAndSwap(current, 0) {
-				return 0
-			}
-			continue
-		}
-		if current <= max {
-			return current
-		}
-		if slot.inflight.CompareAndSwap(current, max) {
-			return max
-		}
-	}
-}
-
+// The caller holds s.mu exclusively, including against slot acquisition.
 func (s *ServerState) rebuildAccountSlotsLocked() {
 	if s == nil {
 		return
@@ -228,8 +205,8 @@ func (s *ServerState) rebuildAccountSlotsLocked() {
 			}
 			maxConcurrency := int32(normalizeAccountMaxConcurrency(candidate.MaxConcurrency))
 			if existing := previous[key]; existing != nil {
+				// Lowering the limit blocks new work until real in-flight requests drain.
 				existing.max.Store(maxConcurrency)
-				clampSlotInFlight(existing, maxConcurrency)
 				next[key] = existing
 				continue
 			}
@@ -278,10 +255,8 @@ func (s *ServerState) TryAcquireAccountDispatchSlot(email string) bool {
 	return s.TryAcquireWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
 }
 
-// workspaceSlotKey resolves the slot key for an account/workspace pair from a
-// consistent configuration snapshot. The key must be derived under s.mu: a
-// bare s.Config lookup races ApplyConfig, and on the release path a spurious
-// lookup failure would drop the slot and leak the workspace's capacity.
+// workspaceSlotKey resolves an account/workspace pair from a config snapshot.
+// Acquisition uses the live config under s.mu together with the slot update.
 func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string, bool) {
 	cfg, _, _ := s.Snapshot()
 	if account, _, ok := cfg.FindAccountWorkspace(email, workspaceID); ok {
@@ -291,14 +266,22 @@ func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string
 }
 
 func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
-	key, ok := s.workspaceSlotKey(email, workspaceID)
+	if s == nil {
+		return false
+	}
+	// Keep lookup and acquisition in the same read-side critical section so a
+	// rebuild cannot retire an idle slot before its in-flight count is raised.
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
 	if !ok {
 		return false
 	}
-	return s.tryAcquireDispatchSlotKey(key)
+	return s.tryAcquireDispatchSlotKeyLocked(dispatchWorkspaceKey(account))
 }
 
-func (s *ServerState) tryAcquireDispatchSlotKey(key string) bool {
+// The caller holds s.mu for reading or writing through the entire acquisition.
+func (s *ServerState) tryAcquireDispatchSlotKeyLocked(key string) bool {
 	key = strings.TrimSpace(key)
 	if key == "" {
 		return false
@@ -337,11 +320,8 @@ func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID str
 		s.releaseDispatchSlotKey(key)
 		return
 	}
-	// The workspace may have been edited away while the request was in flight.
-	// Until the slot map is rebuilt under the same lock, the old key still
-	// gates capacity and the slot must be returned to it; once rebuilt, the key
-	// no longer exists and there is nothing left to release. Never fall back to
-	// a bare email key: that could decrement a different workspace's slot.
+	// Removed workspaces retain their slot until in-flight requests drain.
+	// Return it using the original workspace identity, even without a config entry.
 	if emailKey := canonicalEmailKey(email); emailKey != "" {
 		if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
 			if key := emailKey + "\x00" + workspaceID; s.loadAccountSlots()[key] != nil {
@@ -353,9 +333,11 @@ func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID str
 
 func (s *ServerState) releaseDispatchSlotKey(key string) {
 	key = strings.TrimSpace(key)
-	if key == "" {
+	if s == nil || key == "" {
 		return
 	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	slot := s.loadAccountSlots()[key]
 	if slot == nil {
 		return
@@ -469,9 +451,6 @@ func (s *ServerState) AccountDispatchSnapshot() map[string]accountDispatchState 
 		inflight := int(slot.inflight.Load())
 		if inflight < 0 {
 			inflight = 0
-		}
-		if inflight > maxConcurrency {
-			inflight = maxConcurrency
 		}
 		out[key] = accountDispatchState{
 			MaxConcurrency: maxConcurrency,
