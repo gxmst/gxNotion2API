@@ -275,6 +275,9 @@ func TestDispatchPoolFailsOverContinuationOnQuotaExhausted(t *testing.T) {
 		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
 		{PlanType: "business", Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
 	}
+	for i := range cfg.Accounts {
+		cfg.Accounts[i].Workspaces = []NotionWorkspace{{ID: cfg.Accounts[i].SpaceID, PlanType: "business", ModelCapabilities: &WorkspaceModelCapabilities{Mode: "manual", Models: []ModelDefinition{{ID: "gpt-5.4", NotionModel: "notion-model-synthetic", Enabled: true}}}}}
+	}
 	state, err := newServerState(cfg)
 	if err != nil {
 		t.Fatal(err)

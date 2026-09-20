@@ -18,15 +18,22 @@ type ModelRegistry struct {
 
 type probeModelsEnvelope struct {
 	Models []struct {
-		Model        string `json:"model"`
-		ModelMessage string `json:"modelMessage"`
-		ModelFamily  string `json:"modelFamily"`
-		DisplayGroup string `json:"displayGroup"`
-		IsDisabled   bool   `json:"isDisabled"`
+		Model              string `json:"model"`
+		ModelMessage       string `json:"modelMessage"`
+		ModelFamily        string `json:"modelFamily"`
+		DisplayGroup       string `json:"displayGroup"`
+		IsDisabled         bool   `json:"isDisabled"`
+		DisabledReason     string `json:"disabledReason"`
+		ModelConfiguration struct {
+			DefaultReasoningEffort    string   `json:"defaultReasoningEffort"`
+			SupportedReasoningEfforts []string `json:"supportedReasoningEfforts"`
+		} `json:"modelConfiguration"`
 		MarkdownChat struct {
 			Beta bool `json:"beta"`
 		} `json:"markdownChat"`
 		Workflow struct {
+			IsDisabled     bool   `json:"isDisabled"`
+			DisabledReason string `json:"disabledReason"`
 			FinalModelName string `json:"finalModelName"`
 			Beta           bool   `json:"beta"`
 		} `json:"workflow"`
@@ -60,6 +67,20 @@ func buildModelRegistry(cfg AppConfig) ModelRegistry {
 	if probeEntries := extractProbeModelDefinitions(collectProbeModelPaths(cfg)); len(probeEntries) > 0 {
 		entries = mergeModelDefinitions(entries, probeEntries)
 	}
+	for _, account := range cfg.Accounts {
+		for _, workspace := range account.Workspaces {
+			if capability := workspace.ModelCapabilities; capability != nil {
+				// Catalog entries provide names and aliases, never routing authority.
+				for _, model := range append(cloneModelDefinitions(capability.Catalog), capability.Models...) {
+					if model.Enabled {
+						entries = mergeModelDefinitions(entries, []ModelDefinition{model})
+					}
+				}
+			}
+		}
+	}
+	// Explicit local enable/disable settings keep precedence. Dispatch resolves
+	// the current codename from the selected workspace's authoritative list.
 	if len(cfg.Models) > 0 {
 		entries = mergeModelDefinitions(entries, cfg.Models)
 	}
@@ -231,7 +252,7 @@ func walkProbeValues(node any, visit func(string)) {
 }
 
 func parseProbeModelsBlob(text string) []ModelDefinition {
-	if !strings.Contains(text, `"models"`) || !strings.Contains(text, `modelMessage`) {
+	if !strings.Contains(text, `"models"`) {
 		return nil
 	}
 	var payload probeModelsEnvelope
@@ -252,14 +273,17 @@ func parseProbeModelsBlob(text string) []ModelDefinition {
 			notionModel = strings.TrimSpace(model.Model)
 		}
 		entry := normalizeModelDefinition(ModelDefinition{
-			ID:          slugModelID(name),
-			Name:        name,
-			NotionModel: notionModel,
-			Family:      strings.TrimSpace(model.ModelFamily),
-			Group:       strings.TrimSpace(model.DisplayGroup),
-			Beta:        model.MarkdownChat.Beta || model.Workflow.Beta || model.CustomAgent.Beta,
-			Enabled:     !model.IsDisabled,
-			Aliases:     []string{model.Model, notionModel},
+			ID:                        slugModelID(name),
+			Name:                      name,
+			NotionModel:               notionModel,
+			Family:                    strings.TrimSpace(model.ModelFamily),
+			Group:                     strings.TrimSpace(model.DisplayGroup),
+			Beta:                      model.MarkdownChat.Beta || model.Workflow.Beta || model.CustomAgent.Beta,
+			Enabled:                   !model.IsDisabled && !model.Workflow.IsDisabled,
+			DisabledReason:            firstNonEmpty(model.Workflow.DisabledReason, model.DisabledReason),
+			DefaultReasoningEffort:    model.ModelConfiguration.DefaultReasoningEffort,
+			SupportedReasoningEfforts: append([]string(nil), model.ModelConfiguration.SupportedReasoningEfforts...),
+			Aliases:                   []string{model.Model, notionModel},
 		})
 		if entry.ID != "" {
 			out = append(out, entry)
@@ -310,6 +334,13 @@ func mergeSingleModelDefinition(base ModelDefinition, incoming ModelDefinition) 
 	}
 	out.Beta = candidate.Beta || out.Beta
 	out.Enabled = candidate.Enabled
+	out.DisabledReason = candidate.DisabledReason
+	if candidate.DefaultReasoningEffort != "" {
+		out.DefaultReasoningEffort = candidate.DefaultReasoningEffort
+	}
+	if candidate.SupportedReasoningEfforts != nil {
+		out.SupportedReasoningEfforts = append([]string(nil), candidate.SupportedReasoningEfforts...)
+	}
 	aliasSet := map[string]struct{}{}
 	var aliases []string
 	for _, value := range append(out.Aliases, candidate.Aliases...) {

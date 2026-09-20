@@ -179,7 +179,7 @@ func TestSaveContinuationScaffoldOmitsUnretryableErrorBehavior(t *testing.T) {
 	cfg.UpstreamOrigin = server.URL
 	client := newProtocolTestClient(cfg)
 
-	if _, err := client.saveContinuationScaffold(context.Background(), "thread-1", "hello", &continuationTurnDraft{}); err != nil {
+	if _, err := client.saveContinuationScaffold(context.Background(), "thread-1", "hello", &continuationTurnDraft{}, ""); err != nil {
 		t.Fatalf("saveContinuationScaffold failed: %v", err)
 	}
 	if _, exists := gotBody["unretryable_error_behavior"]; exists {

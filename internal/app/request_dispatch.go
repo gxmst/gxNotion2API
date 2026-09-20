@@ -163,6 +163,30 @@ func resolveDispatchCandidatesFromSnapshot(bundle *snapshotBundle, request Promp
 }
 
 func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAccount, request PromptRunRequest, now time.Time) ([]NotionAccount, error) {
+	candidates, err := resolveDispatchWorkspaceCandidates(cfg, poolCandidates, request, now)
+	if err != nil {
+		return nil, err
+	}
+	filtered := make([]NotionAccount, 0, len(candidates))
+	var autoFallback []NotionAccount
+	var selectionErr error
+	for _, candidate := range candidates {
+		if selected, err := selectWorkspaceModel(cfg, candidate, request); err != nil {
+			selectionErr = err
+		} else if selected.ModelSelectionMode == "auto_fallback" {
+			autoFallback = append(autoFallback, candidate)
+		} else {
+			filtered = append(filtered, candidate)
+		}
+	}
+	filtered = append(filtered, autoFallback...)
+	if len(filtered) == 0 && selectionErr != nil {
+		return nil, selectionErr
+	}
+	return filtered, nil
+}
+
+func resolveDispatchWorkspaceCandidates(cfg AppConfig, poolCandidates []NotionAccount, request PromptRunRequest, now time.Time) ([]NotionAccount, error) {
 	pinnedEmail := strings.TrimSpace(request.PinnedAccountEmail)
 	pinnedWorkspace := firstNonEmpty(request.PinnedSpaceID, request.WorkspaceID)
 	filterWorkspace := func(candidates []NotionAccount) []NotionAccount {
@@ -676,7 +700,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			slotAcquired = false
 		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
 			return InferenceResult{}, err
 		}
 
@@ -722,7 +746,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 				}
 			}
 		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
 			if slotAcquired {
 				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			}
@@ -881,7 +905,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			slotAcquired = false
 		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
 			return InferenceResult{}, err
 		}
 
@@ -931,7 +955,7 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 				}
 			}
 		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
 			if slotAcquired {
 				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			}

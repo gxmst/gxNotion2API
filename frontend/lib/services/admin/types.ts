@@ -1,6 +1,9 @@
 export type TabKey = 'dashboard' | 'tester' | 'conversations' | 'settings' | 'accounts' | 'models';
 
 export interface ModelItem {
+  default_reasoning_effort?: string;
+  supported_reasoning_efforts?: string[];
+  disabled_reason?: string;
   id: string;
   name?: string;
   family?: string;
@@ -197,6 +200,7 @@ export interface AccountItem {
 }
 
 export interface WorkspaceItem {
+  model_capabilities?: { mode: 'manual' | 'auto_only' | 'unknown'; checked_at?: string; models?: ModelItem[]; catalog?: ModelItem[] } | null;
   ai_disabled?: boolean;
   eligible?: boolean;
   eligibility_reason?: string;
@@ -301,6 +305,9 @@ export interface ConversationMessageAttachment {
 }
 
 export interface ConversationMessage {
+  requested_model?: string;
+  model_selection_mode?: string;
+  model_observations?: { model: string; provider?: string; source: string; step_id?: string }[];
   id?: string;
   role?: 'user' | 'assistant' | string;
   status?: string;

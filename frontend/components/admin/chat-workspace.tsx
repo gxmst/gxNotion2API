@@ -6,6 +6,7 @@ import { useTheme } from 'next-themes';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
+import { ModelEvidence } from '@/components/admin/model-evidence';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
@@ -65,10 +66,17 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const allTargets = accounts.flatMap((account) => (account.workspaces || [])
     .map((workspace) => ({ id: targetID(account.email || '', workspace.id), email: account.email || '', workspace: workspace.id,
       name: workspace.name || workspace.id, tier: workspace.subscription_tier || workspace.plan_type || '套餐待确认',
+      capability: workspace.model_capabilities,
       eligible: !account.disabled && workspace.eligible })));
   const targets = allTargets.filter((workspace) => workspace.eligible);
   const selectedTarget = targets.find((item) => item.id === target);
   const boundTarget = allTargets.find((item) => item.id === target);
+  const modelTargets = target === 'auto' ? targets : boundTarget ? [boundTarget] : [];
+  const availableModels: ModelItem[] = [{ id: 'auto', name: 'Auto' }, ...Array.from(new Map(modelTargets.flatMap((item) => item.capability?.mode === 'manual' ? item.capability.models || [] : [])
+    .filter((item) => item.enabled !== false && item.id !== 'auto' && models.find((model) => model.id === item.id)?.enabled !== false).map((item) => [item.id, item])).values())];
+  const modelCatalog = [...models, ...allTargets.flatMap((item) => [...(item.capability?.models || []), ...(item.capability?.catalog || [])])];
+  const modelChoiceKey = availableModels.map((item) => item.id).join('|');
+  const autoOnly = boundTarget?.capability?.mode === 'auto_only';
   const history = conversations.filter((item) => (item.title || item.preview || item.request_prompt || '新对话').toLowerCase().includes(filter.toLowerCase()));
 
   async function openConversation(id: string, draft = '') {
@@ -115,6 +123,12 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     propsRef.current.onResumeHandled();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialConversationID]);
+
+  useEffect(() => {
+    if (!running && !loading && !availableModels.some((item) => item.id === model)) setModel('auto');
+    // Model choices follow the current workspace capability snapshot.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modelChoiceKey, model, running, loading]);
 
   useEffect(() => {
     if (loading) return;
@@ -262,6 +276,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           {!message.content && message.status === 'streaming' ? <div className="chat-thinking"><span /><span /><span /><span className="sr-only">正在生成</span></div> : null}
           {message.attachments?.length ? <div className="chat-attachments">{message.attachments.map((file, i) => <span key={i}><FileText size={14} />{file.name}</span>)}</div> : null}
           </div>
+          <ModelEvidence message={message} models={modelCatalog} />
           <div className="chat-message-actions">{message.status === 'failed' ? <span>未完成</span> : null}<button className="chat-icon" aria-label="复制消息" disabled={!message.content} onClick={() => void copyText(message.content || '').then(() => { setCopied(String(index)); setTimeout(() => setCopied(''), 1600); }).catch(() => toast.error('复制失败'))}>{copied === String(index) ? <Check size={14} /> : <Copy size={14} />}</button></div>
         </article>)}</div>
       </div>
@@ -280,11 +295,12 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           <div className="chat-composer-toolbar">
             <input ref={fileRef} type="file" className="hidden" multiple disabled={running} onChange={(event) => setFiles((current) => [...current, ...Array.from(event.target.files || [])])} />
             <button type="button" className="chat-icon" aria-label="添加附件" disabled={loading || running} onClick={() => fileRef.current?.click()}><Paperclip size={18} /></button>
-            <Select value={model} onValueChange={setModel} disabled={running || remoteRunning}><SelectTrigger className="chat-model-select" aria-label="模型"><SelectValue /></SelectTrigger><SelectContent>{models.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>)}</SelectContent></Select>
+            <Select value={model} onValueChange={setModel} disabled={running || remoteRunning || availableModels.length === 1}><SelectTrigger className="chat-model-select" aria-label="模型"><SelectValue /></SelectTrigger><SelectContent>{availableModels.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>)}</SelectContent></Select>
             <button type="button" className={'chat-tool' + (useWebSearch ? ' is-active' : '')} aria-label="联网搜索" aria-pressed={useWebSearch} disabled={running} onClick={() => setUseWebSearch(!useWebSearch)}><Globe2 size={16} /><span>联网</span></button>
             {running ? <button type="button" className="chat-send" aria-label="停止" onClick={() => abortRef.current?.abort()}><Square size={15} fill="currentColor" /></button> : <button type="submit" className="chat-send" aria-label="发送" disabled={loading || loadFailed || remoteRunning || (!prompt.trim() && !files.length)}><ArrowUp size={19} /></button>}
           </div>
         </form>
+        <div className="px-2 pt-1 text-xs text-muted-foreground" role="note">{autoOnly ? "此工作区仅支持 Auto，由 Notion 分配模型。" : availableModels.length === 1 ? "模型选择能力尚未确认或没有可选模型，可先使用 Auto；在账号页刷新模型能力。" : "手动选择模型时，仅使用支持该模型的工作区。"}</div>
         <div className="chat-composer-footer">
           <Select value={target} onValueChange={setTarget} disabled={Boolean(conversationID) || loading || running}><SelectTrigger className="chat-workspace-select" aria-label="商业工作区" title={owner || boundTarget?.email}><SelectValue placeholder={conversationID ? '会话绑定工作区' : '自动选择商业工作区'} /></SelectTrigger><SelectContent><SelectItem value="auto">{conversationID ? '会话绑定工作区' : '自动选择商业工作区'}</SelectItem>{targets.map((item) => <SelectItem value={item.id} key={item.id}>{item.name} · {item.tier} · {item.email}</SelectItem>)}{target !== 'auto' && !selectedTarget ? <SelectItem value={target} disabled>{boundTarget ? `${boundTarget.name} · ${boundTarget.tier}` : '原工作区'} · 当前不可用</SelectItem> : null}</SelectContent></Select>
           <span className="chat-keyboard-hint">Enter 发送<span> · </span>Shift + Enter 换行</span>

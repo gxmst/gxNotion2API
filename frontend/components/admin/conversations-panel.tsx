@@ -1,5 +1,7 @@
 'use client';
 
+import { ModelEvidence } from '@/components/admin/model-evidence';
+
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import { MessageSquare, RefreshCcw, Trash2 } from 'lucide-react';
@@ -313,7 +315,7 @@ export function ConversationsPanel({
                   { label: '状态', value: activeConversation.status },
                   { label: '来源', value: [conversationOriginLabel(activeConversation.origin), activeConversation.source || '-', activeConversation.transport || '-'].join(' · ') },
                   { label: '创建者', value: activeConversation.created_by_display_name || '-' },
-                  { label: '模型', value: activeConversation.model || activeConversation.notion_model },
+                  { label: '请求模型', value: activeConversation.model || activeConversation.notion_model },
                   { label: '账号', value: activeConversation.account_email },
                   { label: 'Thread', value: activeConversation.thread_id },
                   { label: 'Trace', value: activeConversation.trace_id },
@@ -358,6 +360,7 @@ export function ConversationsPanel({
                           <div className="rounded-lg border bg-background px-4 py-3 text-sm leading-7 whitespace-pre-wrap break-words">
                             {message.content || '[无文本内容]'}
                           </div>
+                          <ModelEvidence message={message} />
                           {message.attachments?.length ? (
                             <div className="mt-3">
                               <FileChips items={message.attachments} />

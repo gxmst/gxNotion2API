@@ -163,18 +163,28 @@ SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书�
 
 遇到 `trust-rule-denied` 后不会切换 HTTP 客户端重发或通过登录刷新重试，同一账号的全部工作区暂停 30 分钟。HTTP 429 会保留并遵守 `Retry-After`，账号至少暂停 2 分钟；上游要求更长时间时以其为准。已确认的 `quota-exhausted` 使用 6 小时本地退避，这不是对上游额度重置时间的预测。不同工作区共享 `dispatch.account_max_concurrency`（默认 `1`），同时仍受各工作区的并发上限约束。
 
-### 模型列表刷新
+### 工作区模型能力与刷新
 
-模型发现只在导入账号时执行，且当粘贴的 probe JSON 字段完整时会被整个跳过。要在不重新导入账号的前提下更新模型列表：
+在账号详情选择工作区，点击“刷新模型能力”，或调用以下接口。升级前的账号及新导入账号在能力尚未确认时可使用 `model: "auto"`；手动选模需先刷新确认。
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
   -H "X-Admin-Token: <token>" \
   -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com"}'
+  -d '{"email":"you@example.com","workspace_id":"<工作区 ID>"}'
 ```
 
-省略 `email` 时使用当前活动账号。与导入时相反，这个接口让上游返回的定义**覆盖**配置里的同名条目，因此上游改过代号的模型会被纠正，而不是被旧值挡住。
+省略 `email` 时使用当前活动账号；省略 `workspace_id` 时优先使用该账号的活动工作区，再使用默认工作区。显式指定不存在的工作区返回 404，不会偷偷刷新其他区。能力、可选模型和确认时间按账号与工作区保存，刷新不会覆盖全局模型配置或其他工作区。
+
+普通 `getAvailableModels` 的 `modelSelectionRestricted: true` 加空模型列表表示“仅 Auto”，不表示刷新失败。设置页的 `surface: workspace_model_settings` 能返回完整目录，甚至返回 `modelSelectionRestricted: false`，但它只用于模型名称、禁用原因和默认思考强度说明，不能授予聊天选模权限。套餐准入与选模能力分别判断。
+
+`/v1/models` 返回 Auto 和已有合资格工作区明确支持的手动模型。指定模型时，调度只选择确认支持该模型的工作区，并使用该工作区最新的上游代号；会话仍绑定原工作区。能力未知或仅支持 Auto 时，指定模型默认返回 HTTP 400、`model_selection_unavailable`，不消耗本地请求额度，也不触发登录刷新。
+
+旧客户端必须传固定模型名时，可以显式设置 `dispatch.restricted_model_fallback: true`（默认 `false`）。这样已确认“仅 Auto”的工作区允许按 Auto 兼容执行，优先使用真正支持目标模型的工作区；未知能力不会被当成 Auto 限制。客户端请求名称保留在兼容响应中，管理台每轮消息及日志会标记实际采用 Auto。建议试用区直接使用 `model: "auto"`。
+
+聊天消息和会话详情分别展示请求模型与上游报告的模型。`model_observations` 记录推理步骤的模型代号、供应商（若有）和来源；不从请求名称猜测，未报告时显示“未知”。这些信息随消息持久化，可包含同一轮的多个模型。兼容 API 的 `model` 字段及旧会话表 `model_used` 仍是请求标识，不作为实际模型证据。默认思考强度只作目录说明，本轮不自动构造或发送推测的强度参数。
+
+线程读取优先沿用当前网页的 `syncRecordValuesSpaceInitial`，仅对缺失的记录通过 `syncRecordValues` 补读一次；鉴权、限流和传输错误不触发这个接口回退。正常回答不会为了查询模型再增加轮询请求。
 
 ### 多账号与多工作区
 

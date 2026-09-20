@@ -311,6 +311,11 @@ func (s *ServerState) startAutoRelogin(ctx context.Context, cfg AppConfig, accou
 }
 
 func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, onDelta func(string) error) (result InferenceResult, err error) {
+	request, err = a.prepareWorkspaceModelRequest(cfg, session, accountEmail, request)
+	if err != nil {
+		return result, err
+	}
+	defer func() { result.ModelSelectionMode = request.ModelSelectionMode }()
 	if pinnedWorkspace := firstNonEmpty(request.PinnedSpaceID, request.WorkspaceID); pinnedWorkspace != "" && pinnedWorkspace != session.SpaceID {
 		return InferenceResult{}, errConversationWorkspaceMismatch
 	}
@@ -334,6 +339,11 @@ func (a *App) runPromptWithSession(ctx context.Context, cfg AppConfig, session S
 }
 
 func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, session SessionInfo, accountEmail string, request PromptRunRequest, sink InferenceStreamSink) (result InferenceResult, err error) {
+	request, err = a.prepareWorkspaceModelRequest(cfg, session, accountEmail, request)
+	if err != nil {
+		return result, err
+	}
+	defer func() { result.ModelSelectionMode = request.ModelSelectionMode }()
 	if pinnedWorkspace := firstNonEmpty(request.PinnedSpaceID, request.WorkspaceID); pinnedWorkspace != "" && pinnedWorkspace != session.SpaceID {
 		return InferenceResult{}, errConversationWorkspaceMismatch
 	}
@@ -378,6 +388,9 @@ func cloneAccounts(accounts []NotionAccount) []NotionAccount {
 	copy(cloned, accounts)
 	for i := range cloned {
 		cloned[i].Workspaces = append([]NotionWorkspace(nil), accounts[i].Workspaces...)
+		for j := range cloned[i].Workspaces {
+			cloned[i].Workspaces[j].ModelCapabilities = cloneWorkspaceModelCapabilities(cloned[i].Workspaces[j].ModelCapabilities)
+		}
 	}
 	return cloned
 }
@@ -597,6 +610,7 @@ func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount,
 		workspace.SubscriptionTier = currentWorkspace.SubscriptionTier
 		workspace.AIEnabled = currentWorkspace.AIEnabled
 		workspace.AIDisabled = currentWorkspace.AIDisabled
+		workspace.ModelCapabilities = cloneWorkspaceModelCapabilities(currentWorkspace.ModelCapabilities)
 	}
 	setAccountWorkspace(&parent, workspace)
 	live.Accounts[index] = normalizeAccountWorkspaces(parent)

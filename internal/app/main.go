@@ -1005,7 +1005,8 @@ func (s *ServerState) rebuildStaticJSONCachesLocked() {
 		s.cachedHealthzStaticJSON.Store(nil)
 	}
 
-	modelsPayload := buildPublicModelsListPayload(s.ModelRegistry)
+	publicRegistry := publicWorkspaceModelRegistry(s.Config, s.ModelRegistry)
+	modelsPayload := buildPublicModelsListPayload(publicRegistry)
 	modelsBody, err := json.Marshal(modelsPayload)
 	if err == nil {
 		modelsBodyCopy := cloneBytes(modelsBody)
@@ -1015,7 +1016,7 @@ func (s *ServerState) rebuildStaticJSONCachesLocked() {
 	}
 
 	modelByID := make(map[string][]byte, len(s.ModelRegistry.Entries))
-	for _, entry := range s.ModelRegistry.Entries {
+	for _, entry := range publicRegistry.Entries {
 		if !entry.Enabled {
 			continue
 		}
@@ -1267,15 +1268,22 @@ func (a *App) serveModels(w http.ResponseWriter) {
 		writeJSONBytes(w, http.StatusOK, *cached)
 		return
 	}
-	_, _, registry := a.State.Snapshot()
-	writeJSON(w, http.StatusOK, buildPublicModelsListPayload(registry))
+	cfg, _, registry := a.State.Snapshot()
+	writeJSON(w, http.StatusOK, buildPublicModelsListPayload(publicWorkspaceModelRegistry(cfg, registry)))
 }
 
 func (a *App) serveModelByID(w http.ResponseWriter, path string) {
 	cfg, _, registry := a.State.Snapshot()
 	modelID := strings.TrimSpace(strings.TrimPrefix(path, "/v1/models/"))
 	entry, err := registry.Resolve(modelID, cfg.DefaultPublicModel())
-	if err != nil {
+	available := false
+	for _, public := range publicWorkspaceModelRegistry(cfg, registry).Entries {
+		if public.ID == entry.ID {
+			available = true
+			break
+		}
+	}
+	if err != nil || !available {
 		writeOpenAIError(w, http.StatusNotFound, "model not found", "invalid_request_error", "model_not_found")
 		return
 	}
@@ -2545,6 +2553,11 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) writeUpstreamError(w http.ResponseWriter, err error) {
+	var selectionErr *modelSelectionError
+	if errors.As(err, &selectionErr) {
+		writeModelSelectionError(w, err)
+		return
+	}
 	var apiErr *notionAPIError
 	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
 		if !apiErr.RetryAfter.IsZero() {

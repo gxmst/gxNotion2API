@@ -24,6 +24,9 @@ func newConversationRequestTestApp(t *testing.T) *App {
 		{PlanType: "business", Email: "backup@example.com", SpaceID: "space-backup", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup")},
 	}
 	cfg.ActiveAccount = "primary@example.com"
+	for i := range cfg.Accounts {
+		cfg.Accounts[i].Workspaces = []NotionWorkspace{{ID: cfg.Accounts[i].SpaceID, PlanType: "business", ModelCapabilities: &WorkspaceModelCapabilities{Mode: "manual", Models: builtinModelDefinitions()}}}
+	}
 	state, err := newServerState(cfg)
 	if err != nil {
 		t.Fatal(err)

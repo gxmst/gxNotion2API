@@ -50,6 +50,7 @@
     "auto_switch_account": true
   },
   "dispatch": {
+    "restricted_model_fallback": false,
     "probe_cache_ttl_seconds": 45,
     "account_max_concurrency": 1
   },

@@ -196,6 +196,7 @@ func TestRunPromptWithSessionIncrementsWreqClientMetric(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-api-key"
 	cfg.Storage.SQLitePath = ""
+	cfg.Accounts = []NotionAccount{{Email: "metric@example.com", SpaceID: "test-space", PlanType: "business"}}
 	state, err := newServerState(cfg)
 	if err != nil {
 		t.Fatalf("newServerState failed: %v", err)
@@ -224,11 +225,11 @@ func TestRunPromptWithSessionIncrementsWreqClientMetric(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	_, err = app.runPromptWithSession(ctx, cfg, session, "", PromptRunRequest{Prompt: "hi"}, nil)
+	_, err = app.runPromptWithSession(ctx, cfg, session, "metric@example.com", PromptRunRequest{Prompt: "hi"}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled, got %v", err)
 	}
-	_, err = app.runPromptWithSession(ctx, cfg, session, "", PromptRunRequest{Prompt: "hi"}, func(string) error { return nil })
+	_, err = app.runPromptWithSession(ctx, cfg, session, "metric@example.com", PromptRunRequest{Prompt: "hi"}, func(string) error { return nil })
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context canceled for streaming run, got %v", err)
 	}

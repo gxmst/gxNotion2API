@@ -154,6 +154,7 @@ export function AdminConsole() {
             defaultModel={defaultModel}
             onRefresh={refreshAccounts}
             onRefreshWorkspaces={async (email) => { await services.refreshWorkspaces(email); await refreshAccounts(); await refreshConfigBundle(); }}
+            onRefreshModels={async (email, workspaceID) => { await services.refreshModels(email, workspaceID); await refreshAccounts(); await refreshConfigBundle(); }}
             onStartLogin={async (email) => {
               const payload = await services.startAccountLogin(email);
               await refreshAccounts();

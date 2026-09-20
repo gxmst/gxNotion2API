@@ -268,6 +268,13 @@ func (s *ServerState) setSessionRefreshRuntime(err error) {
 }
 
 func (s *ServerState) tryRefreshAccount(ctx context.Context, cfg AppConfig, account NotionAccount) (AppConfig, error) {
+	if until := parseOptionalRFC3339(account.CredentialCooldownUntil); until.After(time.Now()) {
+		return cfg, &notionAPIError{
+			StatusCode: http.StatusTooManyRequests,
+			RetryAfter: until,
+			Message:    "account is cooling down; session refresh deferred",
+		}
+	}
 	account = ensureAccountPaths(cfg, account)
 	prior, err := loadSessionInfoForAccountRefresh(cfg, account)
 	if err != nil {

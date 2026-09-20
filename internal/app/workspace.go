@@ -3,6 +3,7 @@ package app
 import "strings"
 
 func normalizeWorkspace(workspace NotionWorkspace) NotionWorkspace {
+	workspace.ModelCapabilities = cloneWorkspaceModelCapabilities(workspace.ModelCapabilities)
 	workspace.ID = strings.TrimSpace(workspace.ID)
 	workspace.ViewID = strings.TrimSpace(workspace.ViewID)
 	workspace.Name = strings.TrimSpace(workspace.Name)
@@ -52,6 +53,7 @@ func workspaceFromAccountFields(account NotionAccount) NotionWorkspace {
 			workspace.SubscriptionTier = existing.SubscriptionTier
 			workspace.AIEnabled = existing.AIEnabled
 			workspace.AIDisabled = existing.AIDisabled
+			workspace.ModelCapabilities = cloneWorkspaceModelCapabilities(existing.ModelCapabilities)
 			break
 		}
 	}

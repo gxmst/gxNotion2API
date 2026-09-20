@@ -765,11 +765,11 @@ func TestServeModelsUsesStaticJSONCache(t *testing.T) {
 func TestServeModelByIDUsesStaticJSONCache(t *testing.T) {
 	app := newFreshThreadTestApp(t)
 	_, _, registry := app.State.Snapshot()
-	entry, err := registry.Resolve("gpt-5.4", "auto")
+	entry, err := registry.Resolve("auto", "auto")
 	if err != nil {
 		t.Fatalf("resolve model failed: %v", err)
 	}
-	body := []byte(`{"id":"gpt-5.4","object":"model","cached":true}`)
+	body := []byte(`{"id":"auto","object":"model","cached":true}`)
 	cache := map[string][]byte{
 		normalizeLookupKey(entry.ID): append([]byte(nil), body...),
 	}

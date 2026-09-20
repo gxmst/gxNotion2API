@@ -113,7 +113,30 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 	out.UpdatedAt = mergeConversationTimes(out.UpdatedAt, remote.UpdatedAt, true)
 	out.CreatedByDisplay = firstNonEmpty(strings.TrimSpace(remote.CreatedByDisplay), strings.TrimSpace(out.CreatedByDisplay))
 	if len(remote.Messages) > 0 {
-		out.Messages = remote.Messages
+		localMessages := make(map[string]ConversationMessage, len(local.Messages))
+		for _, message := range local.Messages {
+			if message.ID != "" {
+				localMessages[message.ID] = message
+			}
+		}
+		// Older local records used a synthetic assistant ID. The final upstream
+		// message ID is still available on a completed conversation.
+		if local.Status == "completed" && local.MessageID != "" && len(local.Messages) > 0 {
+			last := local.Messages[len(local.Messages)-1]
+			if last.Role == "assistant" {
+				localMessages[local.MessageID] = last
+			}
+		}
+		out.Messages = make([]ConversationMessage, len(remote.Messages))
+		for i, message := range remote.Messages {
+			message = cloneConversationMessage(message)
+			if prior, ok := localMessages[message.ID]; ok && prior.Role == message.Role {
+				message.RequestedModel = firstNonEmpty(prior.RequestedModel, message.RequestedModel)
+				message.ModelSelectionMode = firstNonEmpty(prior.ModelSelectionMode, message.ModelSelectionMode)
+				message.ModelObservations = mergeModelObservations(prior.ModelObservations, message.ModelObservations)
+			}
+			out.Messages[i] = message
+		}
 	}
 	return out
 }
@@ -145,8 +168,8 @@ func mergeAdminConversationSummaries(localItems []ConversationSummary, remoteIte
 	return merged
 }
 
-func (a *App) loadAdminRemoteConversation(ctx context.Context, threadID string, accountEmail string, summary *InferenceTranscriptSummary) (ConversationEntry, error) {
-	client, err := a.notionClientForAccount(ctx, accountEmail)
+func (a *App) loadAdminRemoteConversation(ctx context.Context, threadID string, accountEmail string, workspaceID string, summary *InferenceTranscriptSummary) (ConversationEntry, error) {
+	client, err := a.notionClientForWorkspace(ctx, accountEmail, workspaceID)
 	if err != nil {
 		return ConversationEntry{}, err
 	}
@@ -278,7 +301,7 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 				item.Origin = "local"
 			}
 			if threadID := strings.TrimSpace(item.ThreadID); threadID != "" && r.URL.Query().Get("local") != "1" {
-				remoteItem, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, item.AccountEmail, nil)
+				remoteItem, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, item.AccountEmail, item.SpaceID, nil)
 				if err == nil {
 					item = mergeConversationEntry(item, remoteItem)
 				}
@@ -294,7 +317,7 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found"})
 			return
 		}
-		item, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, "", &InferenceTranscriptSummary{ThreadID: threadID})
+		item, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, "", "", &InferenceTranscriptSummary{ThreadID: threadID})
 		if err != nil {
 			writeAdminUpstreamError(w, err, nil)
 			return

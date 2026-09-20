@@ -108,7 +108,8 @@ func (a *App) accountRuntimeSummary(cfg AppConfig, account NotionAccount) map[st
 			"plan_type": workspace.PlanType, "subscription_tier": workspace.SubscriptionTier,
 			"ai_enabled": workspace.AIEnabled, "ai_disabled": workspace.AIDisabled, "status": workspace.Status,
 			"eligible": eligible, "eligibility_reason": eligibilityReason,
-			"last_error": workspace.LastError, "priority": workspace.Priority,
+			"model_capabilities": workspace.ModelCapabilities,
+			"last_error":         workspace.LastError, "priority": workspace.Priority,
 			"hourly_quota": workspace.HourlyQuota, "max_concurrency": workspace.MaxConcurrency,
 			"quota_limited": limited, "remaining_quota": remaining,
 			"window_started_at": workspace.WindowStartedAt, "window_request_count": workspace.WindowRequestCount,
@@ -440,10 +441,8 @@ func (a *App) handleAdminAccountDelete(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, a.buildAccountsPayload())
 }
 
-// handleAdminAccountsRefreshModels re-reads the account's model list from
-// upstream. Unlike import-time discovery, the freshly fetched definitions win
-// over what is already in config, so a model whose upstream codename changed is
-// corrected instead of being shadowed by the stale entry.
+// Refresh authoritative chat capabilities for one workspace, keeping the
+// descriptive settings catalog separate from manual model selection rights.
 func (a *App) handleAdminAccountsRefreshModels(w http.ResponseWriter, r *http.Request) {
 	if !a.adminAuthOK(w, r) {
 		return
@@ -471,18 +470,22 @@ func (a *App) handleAdminAccountsRefreshModels(w http.ResponseWriter, r *http.Re
 		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
 		return
 	}
-	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), account.DefaultWorkspaceID)
+	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), preferredAccountWorkspaceID(cfg, account))
 	if workspaceID != "" {
 		if selected, _, selectedOK := cfg.FindAccountWorkspace(email, workspaceID); selectedOK {
 			account = selected
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "workspace not found"})
+			return
 		}
 	}
 	account = ensureAccountPaths(cfg, account)
-	if !fileExists(account.ProbeJSON) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "probe_json not found for account"})
+	if until := parseOptionalRFC3339(account.CredentialCooldownUntil); until.After(time.Now()) {
+		w.Header().Set("Retry-After", until.UTC().Format(http.TimeFormat))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"detail": "account is cooling down"})
 		return
 	}
-	session, err := loadSessionInfo(account.ProbeJSON, account.UserName, account.SpaceName)
+	session, err := loadSessionInfoForAccountRefresh(cfg, account)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 		return
@@ -490,34 +493,37 @@ func (a *App) handleAdminAccountsRefreshModels(w http.ResponseWriter, r *http.Re
 
 	ctx, cancel := context.WithTimeout(r.Context(), helperTimeout(cfg))
 	defer cancel()
-	models, err := refreshAccountModels(ctx, cfg, account.Email, session.Cookies, session.ClientVersion, session.UserID, session.SpaceID)
+	// Probe files can still name the original personal workspace.
+	session.SpaceID = workspaceID
+	session.SpaceViewID = account.SpaceViewID
+	client := newNotionAIClient(session, cfg, account.Email)
+	capability, err := client.fetchWorkspaceModelCapabilities(ctx)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": err.Error()})
 		return
 	}
 
-	// Discovered definitions are the incoming side here so they take precedence.
-	cfg.Models = mergeModelDefinitions(cfg.Models, models)
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := a.State.applyWorkspaceModelCapabilities(account, workspaceID, capability); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
 		return
 	}
 	a.invalidateDispatchProbeCache()
 
-	_, _, registry := a.State.Snapshot()
-	ids := make([]string, 0, len(registry.Entries))
-	for _, entry := range registry.Entries {
-		if entry.Enabled {
+	ids := []string{"auto"}
+	for _, entry := range capability.Models {
+		if entry.Enabled && capability.Mode == "manual" && entry.ID != "auto" {
 			ids = append(ids, entry.ID)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"success":          true,
-		"account":          account.Email,
-		"discovered_count": len(models),
-		"model_count":      len(ids),
-		"models":           ids,
-		"message":          "models refreshed from upstream",
+		"success":            true,
+		"account":            account.Email,
+		"workspace_id":       workspaceID,
+		"model_capabilities": capability,
+		"discovered_count":   len(capability.Models),
+		"model_count":        len(ids),
+		"models":             ids,
+		"message":            "models refreshed from upstream",
 	})
 }
 

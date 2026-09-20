@@ -3,7 +3,7 @@ import type { ChatRunInput, ConversationDetail, ConversationMessage } from '../l
 
 const businessAccount = 'test@example.com';
 
-async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: boolean; gradual?: boolean } = {}) {
+async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: boolean; gradual?: boolean; restricted?: boolean } = {}) {
   const requests: Array<ChatRunInput & { stream: boolean }> = [];
   const conversations = new Map<string, ConversationDetail>();
   let release = () => {};
@@ -15,11 +15,11 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: 
     '/healthz': { ok: true, session_ready: true },
     '/admin/accounts': { items: [
       { email: businessAccount, workspaces: [
-        { id: 'business-trial', name: '商业试用工作区', subscription_tier: 'business', plan_type: 'trial', eligible: true },
+        { id: 'business-trial', name: '商业试用工作区', subscription_tier: 'business', plan_type: 'trial', eligible: true, model_capabilities: options.restricted ? { mode: 'auto_only', models: [], catalog: [{ id: 'test-model', name: 'Test model', notion_model: 'test-codename' }] } : { mode: 'manual', models: [{ id: 'test-model', name: 'Test model', notion_model: 'test-codename', enabled: true }] } },
         { id: 'free', name: '免费工作区', subscription_tier: 'free', eligible: false },
         { id: 'plus', name: 'Plus 工作区', subscription_tier: 'plus', eligible: false },
       ] },
-      { email: 'team@example.com', workspaces: [{ id: 'enterprise', name: '企业工作区', subscription_tier: 'enterprise', eligible: true }] },
+      { email: 'team@example.com', workspaces: [{ id: 'enterprise', name: '企业工作区', subscription_tier: 'enterprise', eligible: true, model_capabilities: { mode: 'manual', models: [{ id: 'test-model', name: 'Test model', notion_model: 'test-codename', enabled: true }] } }] },
     ] },
   };
   await page.route('**/*', async (route) => {
@@ -39,7 +39,8 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: 
       const answer = `**Reply ${requests.length}**\n\n${input.prompt}`;
       const messages: ConversationMessage[] = [
         { id: `user-${requests.length}`, role: 'user', content: input.prompt, status: 'completed' },
-        { id: `answer-${requests.length}`, role: 'assistant', content: answer, status: options.truncated ? 'failed' : 'completed' },
+        { id: `answer-${requests.length}`, role: 'assistant', content: answer, status: options.truncated ? 'failed' : 'completed', requested_model: input.model,
+          model_selection_mode: input.model === 'auto' ? 'auto' : 'manual', model_observations: [{ model: 'test-codename', source: 'thread_record' }] },
       ];
       const item: ConversationDetail = conversations.get(input.conversation_id) || {
         id: input.conversation_id, messages: [], model: input.model,
@@ -200,4 +201,32 @@ test('malformed saved state and HTTP-compatible ID generation do not break chat'
   await expect(page.getByLabel('聊天记录').locator('strong')).toHaveText('Reply 1');
   expect(requests[0].conversation_id).toMatch(/^conv_[a-f0-9]{32}$/);
   expect(requests[0].model).toBe('test-model');
+});
+
+test('restricted workspace uses Auto despite its settings catalog and shows model evidence', async ({ page }) => {
+  const { requests } = await mockAdmin(page, { restricted: true });
+  await openChat(page);
+  const workspace = page.getByRole('combobox', { name: '商业工作区' });
+  await workspace.click();
+  await page.getByRole('option', { name: /商业试用工作区/ }).click();
+  const model = page.getByRole('combobox', { name: '模型', exact: true });
+  await expect(model).toBeDisabled();
+  await expect(model).toContainText('Auto');
+  await expect(page.getByRole('note')).toContainText('仅支持 Auto');
+  await send(page, 'Use the restricted workspace');
+  await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+  expect(requests[0].model).toBe('auto');
+  await expect(page.getByTestId('model-evidence').last()).toContainText('实际模型：Test model');
+  await expect(page.getByTestId('model-evidence').last()).toContainText('Auto 分配');
+  await page.reload();
+  await expect(page.getByTestId('model-evidence').last()).toContainText('实际模型：Test model');
+  await page.getByRole('button', { name: '新对话', exact: true }).click();
+  await workspace.click();
+  await page.getByRole('option', { name: /企业工作区/ }).click();
+  await expect(model).toBeEnabled();
+  await model.click();
+  await page.getByRole('option', { name: 'Test model', exact: true }).click();
+  await send(page, 'Use manual selection');
+  await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+  expect(requests[1].model).toBe('test-model');
 });

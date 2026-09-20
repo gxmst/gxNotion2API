@@ -259,25 +259,27 @@ type UploadedAttachment struct {
 }
 
 type InferenceResult struct {
-	Prompt           string               `json:"prompt"`
-	Model            string               `json:"model"`
-	NotionModel      string               `json:"notion_model"`
-	AccountEmail     string               `json:"account_email,omitempty"`
-	SpaceID          string               `json:"space_id,omitempty"`
-	SpaceViewID      string               `json:"space_view_id,omitempty"`
-	ThreadID         string               `json:"thread_id"`
-	TraceID          string               `json:"trace_id"`
-	Text             string               `json:"text"`
-	Reasoning        string               `json:"reasoning,omitempty"`
-	MessageID        string               `json:"message_id"`
-	CompletedTime    any                  `json:"completed_time,omitempty"`
-	NDJSONLineCount  int                  `json:"ndjson_line_count"`
-	RawMessageIDs    []string             `json:"raw_message_ids,omitempty"`
-	Attachments      []UploadedAttachment `json:"attachments,omitempty"`
-	ConfigID         string               `json:"config_id,omitempty"`
-	ContextID        string               `json:"context_id,omitempty"`
-	OriginalDatetime string               `json:"original_datetime,omitempty"`
-	cachedReplay     bool
+	ModelSelectionMode string               `json:"model_selection_mode,omitempty"`
+	ModelObservations  []ModelObservation   `json:"model_observations,omitempty"`
+	Prompt             string               `json:"prompt"`
+	Model              string               `json:"model"`
+	NotionModel        string               `json:"notion_model"`
+	AccountEmail       string               `json:"account_email,omitempty"`
+	SpaceID            string               `json:"space_id,omitempty"`
+	SpaceViewID        string               `json:"space_view_id,omitempty"`
+	ThreadID           string               `json:"thread_id"`
+	TraceID            string               `json:"trace_id"`
+	Text               string               `json:"text"`
+	Reasoning          string               `json:"reasoning,omitempty"`
+	MessageID          string               `json:"message_id"`
+	CompletedTime      any                  `json:"completed_time,omitempty"`
+	NDJSONLineCount    int                  `json:"ndjson_line_count"`
+	RawMessageIDs      []string             `json:"raw_message_ids,omitempty"`
+	Attachments        []UploadedAttachment `json:"attachments,omitempty"`
+	ConfigID           string               `json:"config_id,omitempty"`
+	ContextID          string               `json:"context_id,omitempty"`
+	OriginalDatetime   string               `json:"original_datetime,omitempty"`
+	cachedReplay       bool
 }
 
 type InferenceTranscriptSummary struct {
@@ -290,6 +292,7 @@ type InferenceTranscriptSummary struct {
 }
 
 type PromptRunRequest struct {
+	ModelSelectionMode                string
 	Prompt                            string
 	LatestUserPrompt                  string
 	HiddenPrompt                      string
@@ -344,11 +347,12 @@ type PromptRunRequest struct {
 }
 
 type agentMessage struct {
-	MessageID     string
-	Completed     bool
-	CompletedTime any
-	Text          string
-	Reasoning     string
+	ModelObservations []ModelObservation
+	MessageID         string
+	Completed         bool
+	CompletedTime     any
+	Text              string
+	Reasoning         string
 }
 
 type inferenceStepError struct {
@@ -444,6 +448,7 @@ type ndjsonPatchOperation struct {
 }
 
 type ndjsonStreamLine struct {
+	Model      string                      `json:"model,omitempty"`
 	Type       string                      `json:"type"`
 	V          []ndjsonPatchOperation      `json:"v,omitempty"`
 	RecordMap  map[string]any              `json:"recordMap,omitempty"`
@@ -453,12 +458,15 @@ type ndjsonStreamLine struct {
 }
 
 type ndjsonAgentInferenceValue struct {
-	Type      string `json:"type"`
-	Content   string `json:"content"`
-	Signature string `json:"signature,omitempty"`
+	NotionModelName string `json:"notionModelName,omitempty"`
+	ModelProvider   string `json:"modelProvider,omitempty"`
+	Type            string `json:"type"`
+	Content         string `json:"content"`
+	Signature       string `json:"signature,omitempty"`
 }
 
 type ndjsonAgentInferenceEvent struct {
+	Model      string                      `json:"model,omitempty"`
 	Type       string                      `json:"type"`
 	ID         string                      `json:"id"`
 	FinishedAt any                         `json:"finishedAt,omitempty"`
@@ -466,11 +474,13 @@ type ndjsonAgentInferenceEvent struct {
 }
 
 type ndjsonStepState struct {
-	ID        string
-	Type      string
-	Text      string
-	Reasoning string
-	Completed bool
+	ModelParts        map[string]ModelObservation
+	ModelObservations []ModelObservation
+	ID                string
+	Type              string
+	Text              string
+	Reasoning         string
+	Completed         bool
 }
 
 type ndjsonParseResult struct {
@@ -1871,12 +1881,13 @@ func extractConversationMessageFromThreadRecord(messageID string, rawItem any) (
 			status = "completed"
 		}
 		return ConversationMessage{
-			ID:        strings.TrimSpace(messageID),
-			Role:      "assistant",
-			Status:    status,
-			Content:   sanitizeAssistantVisibleText(extractStepText(step["value"])),
-			CreatedAt: createdAt,
-			UpdatedAt: updatedAt,
+			ID:                strings.TrimSpace(messageID),
+			Role:              "assistant",
+			ModelObservations: observeStepModels(step, messageID, "thread_record"),
+			Status:            status,
+			Content:           sanitizeAssistantVisibleText(extractStepText(step["value"])),
+			CreatedAt:         createdAt,
+			UpdatedAt:         updatedAt,
 		}, true
 	case "attachment":
 		attachment := ConversationAttachment{
@@ -2320,6 +2331,7 @@ func (s *ndjsonTranscriptState) emitFullReasoning(fullReasoning string, sink Inf
 }
 
 func (s *ndjsonTranscriptState) mergeFinalAgent(agent agentMessage, sink InferenceStreamSink) error {
+	s.FinalAgent.ModelObservations = mergeModelObservations(s.FinalAgent.ModelObservations, agent.ModelObservations)
 	if agent.MessageID != "" {
 		s.FinalAgent.MessageID = agent.MessageID
 	}
@@ -2464,6 +2476,11 @@ func (s *ndjsonTranscriptState) mergeAgentInferenceEvent(event ndjsonAgentInfere
 	index := s.ensureAgentStep(strings.TrimSpace(event.ID))
 	s.ActiveAgentIndex = index
 	step := s.Steps[index]
+	step.ModelObservations = mergeModelObservations(step.ModelObservations, []ModelObservation{{Model: event.Model, StepID: step.ID, Source: "stream"}})
+	for _, value := range event.Value {
+		step.ModelObservations = mergeModelObservations(step.ModelObservations, []ModelObservation{{Model: value.NotionModelName, Provider: value.ModelProvider, StepID: step.ID, Source: "stream"}})
+	}
+	s.Steps[index] = step
 	if step.ID != "" {
 		s.FinalAgent.MessageID = step.ID
 	}
@@ -2510,6 +2527,7 @@ func (s *ndjsonTranscriptState) applyAgentPatchField(stepIndex int, rest string,
 }
 
 func (s *ndjsonTranscriptState) applyPatchOperation(op ndjsonPatchOperation, sink InferenceStreamSink) error {
+	s.observeModelPatch(op)
 	switch op.O {
 	case "a":
 		if op.P == "/s/-" {
@@ -2524,6 +2542,7 @@ func (s *ndjsonTranscriptState) applyPatchOperation(op ndjsonPatchOperation, sin
 			if step.Type == "agent-inference" {
 				step.Text = extractStepText(item["value"])
 				step.Reasoning = extractStepReasoning(item["value"])
+				step.ModelObservations = observeStepModels(item, step.ID, "stream")
 			}
 			s.Steps = append(s.Steps, step)
 			s.registerStepValueTypes(len(s.Steps)-1, item["value"])
@@ -2607,6 +2626,7 @@ func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink In
 		}
 	case "agent-inference":
 		event := ndjsonAgentInferenceEvent{
+			Model:      streamLine.Model,
 			Type:       streamLine.Type,
 			ID:         streamLine.ID,
 			FinishedAt: streamLine.FinishedAt,
@@ -2629,6 +2649,9 @@ func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink In
 }
 
 func (s *ndjsonTranscriptState) result() ndjsonParseResult {
+	for _, step := range s.Steps {
+		s.FinalAgent.ModelObservations = mergeModelObservations(s.FinalAgent.ModelObservations, step.ModelObservations)
+	}
 	out := ndjsonParseResult{
 		LineCount:  s.LineCount,
 		MessageIDs: append([]string(nil), s.MessageIDs...),
@@ -2813,48 +2836,14 @@ func (c *NotionAIClient) loadFinalAnswerOnce(ctx context.Context, threadID strin
 }
 
 func (c *NotionAIClient) syncThread(ctx context.Context, threadID string) (map[string]any, error) {
-	payload := map[string]any{
-		"requests": []map[string]any{{
-			"pointer": map[string]any{
-				"table":   "thread",
-				"id":      threadID,
-				"spaceId": c.Session.SpaceID,
-			},
-			"version": -1,
-		}},
-	}
-	body, err := c.postJSON(ctx, c.Config.NotionUpstream().API("syncRecordValuesSpaceInitial"), payload, "application/json")
-	if err != nil {
-		return nil, err
-	}
-	var out map[string]any
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return c.syncThreadRecords(ctx, threadID, "thread", []string{threadID})
 }
 
 func (c *NotionAIClient) syncThreadMessages(ctx context.Context, threadID string, messageIDs []string) (map[string]any, error) {
-	requests := make([]map[string]any, 0, len(messageIDs))
-	for _, messageID := range messageIDs {
-		requests = append(requests, map[string]any{
-			"pointer": map[string]any{
-				"table":   "thread_message",
-				"id":      messageID,
-				"spaceId": c.Session.SpaceID,
-			},
-			"version": -1,
-		})
+	if len(messageIDs) == 0 {
+		return map[string]any{"recordMap": map[string]any{}}, nil
 	}
-	body, err := c.postJSONWithReferer(ctx, c.Config.NotionUpstream().API("syncRecordValuesSpaceInitial"), map[string]any{"requests": requests}, "application/json", c.chatReferer(threadID))
-	if err != nil {
-		return nil, err
-	}
-	var out map[string]any
-	if err := json.Unmarshal(body, &out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	return c.syncThreadRecords(ctx, threadID, "thread_message", messageIDs)
 }
 
 func mapValue(v any) map[string]any {
@@ -2972,11 +2961,12 @@ func extractAgentMessages(recordMap map[string]any) map[string]agentMessage {
 		data := mapValue(value["data"])
 		completed, _ := data["completed"].(bool)
 		out[messageID] = agentMessage{
-			MessageID:     messageID,
-			Completed:     completed,
-			CompletedTime: data["completed_time"],
-			Text:          extractStepText(step["value"]),
-			Reasoning:     extractStepReasoning(step["value"]),
+			ModelObservations: observeStepModels(step, messageID, "thread_record"),
+			MessageID:         messageID,
+			Completed:         completed,
+			CompletedTime:     data["completed_time"],
+			Text:              extractStepText(step["value"]),
+			Reasoning:         extractStepReasoning(step["value"]),
 		}
 	}
 	return out
@@ -3574,7 +3564,7 @@ func buildContinuationBaseTranscript(draft *continuationTurnDraft, configValue m
 	return out
 }
 
-func buildContinuationUpdatedConfigValue(draft *continuationTurnDraft) map[string]any {
+func buildContinuationUpdatedConfigValue(draft *continuationTurnDraft, notionModel string) map[string]any {
 	value := map[string]any{}
 	if draft != nil {
 		if len(draft.LastUpdatedConfigValue) > 0 {
@@ -3593,6 +3583,14 @@ func buildContinuationUpdatedConfigValue(draft *continuationTurnDraft) map[strin
 	}
 	if _, ok := value["customConnectorInfo"]; !ok {
 		value["customConnectorInfo"] = []any{}
+	}
+	// An old updated-config must not override this turn's model selection.
+	model := strings.TrimSpace(notionModel)
+	value["modelFromUser"] = model != ""
+	if model == "" {
+		delete(value, "model")
+	} else {
+		value["model"] = model
 	}
 	return value
 }
@@ -3658,7 +3656,7 @@ func (c *NotionAIClient) prepareContinuationDraftFromThread(ctx context.Context,
 	return draft, nil
 }
 
-func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID string, prompt string, draft *continuationTurnDraft) (*continuationTurnScaffold, error) {
+func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID string, prompt string, draft *continuationTurnDraft, notionModel string) (*continuationTurnScaffold, error) {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {
 		return nil, nil
@@ -3669,7 +3667,7 @@ func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID 
 	userStepID := randomUUID()
 	userID := strings.TrimSpace(c.Session.UserID)
 	spaceID := strings.TrimSpace(c.Session.SpaceID)
-	updatedConfigValue := buildContinuationUpdatedConfigValue(draft)
+	updatedConfigValue := buildContinuationUpdatedConfigValue(draft, notionModel)
 	payload := map[string]any{
 		"requestId": randomUUID(),
 		"transactions": []map[string]any{
@@ -3806,6 +3804,9 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 	defaultConfig := c.buildDefaultWorkflowConfigValue(threadType, req.UseWebSearch, req.NotionModel)
 	for key, value := range defaultConfig {
 		configValue[key] = value
+	}
+	if strings.TrimSpace(req.NotionModel) == "" {
+		delete(configValue, "model")
 	}
 	configID := randomUUID()
 	contextID := randomUUID()
@@ -4045,7 +4046,7 @@ func (c *NotionAIClient) preparePromptRequest(ctx context.Context, req PromptRun
 		}
 	}
 	if strings.TrimSpace(preparedReq.UpstreamThreadID) != "" {
-		scaffold, saveErr := c.saveContinuationScaffold(ctx, preparedReq.UpstreamThreadID, cleanPrompt, preparedReq.continuationDraft)
+		scaffold, saveErr := c.saveContinuationScaffold(ctx, preparedReq.UpstreamThreadID, cleanPrompt, preparedReq.continuationDraft, preparedReq.NotionModel)
 		if saveErr != nil {
 			return "", nil, "", nil, inferencePayloadMeta{}, saveErr
 		}
@@ -4177,21 +4178,23 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 		c.markInferenceTranscriptSeenBestEffort(ctx, actualThreadID)
 	}
 	return InferenceResult{
-		Prompt:           cleanPrompt,
-		Model:            strings.TrimSpace(req.PublicModel),
-		NotionModel:      strings.TrimSpace(req.NotionModel),
-		ThreadID:         actualThreadID,
-		TraceID:          traceID,
-		Text:             finalAgent.Text,
-		Reasoning:        firstNonEmpty(finalAgent.Reasoning, parsed.Reasoning),
-		MessageID:        finalAgent.MessageID,
-		CompletedTime:    finalAgent.CompletedTime,
-		NDJSONLineCount:  lineCount,
-		RawMessageIDs:    messageIDs,
-		Attachments:      uploadedAttachments,
-		ConfigID:         meta.ConfigID,
-		ContextID:        meta.ContextID,
-		OriginalDatetime: meta.OriginalDatetime,
+		Prompt:             cleanPrompt,
+		Model:              strings.TrimSpace(req.PublicModel),
+		NotionModel:        strings.TrimSpace(req.NotionModel),
+		ModelObservations:  mergeModelObservations(parsed.FinalAgent.ModelObservations, finalAgent.ModelObservations),
+		ModelSelectionMode: req.ModelSelectionMode,
+		ThreadID:           actualThreadID,
+		TraceID:            traceID,
+		Text:               finalAgent.Text,
+		Reasoning:          firstNonEmpty(finalAgent.Reasoning, parsed.Reasoning),
+		MessageID:          finalAgent.MessageID,
+		CompletedTime:      finalAgent.CompletedTime,
+		NDJSONLineCount:    lineCount,
+		RawMessageIDs:      messageIDs,
+		Attachments:        uploadedAttachments,
+		ConfigID:           meta.ConfigID,
+		ContextID:          meta.ContextID,
+		OriginalDatetime:   meta.OriginalDatetime,
 	}, nil
 }
 
@@ -4238,20 +4241,22 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 		c.markInferenceTranscriptSeenBestEffort(ctx, actualThreadID)
 	}
 	return InferenceResult{
-		Prompt:           cleanPrompt,
-		Model:            strings.TrimSpace(req.PublicModel),
-		NotionModel:      strings.TrimSpace(req.NotionModel),
-		ThreadID:         actualThreadID,
-		TraceID:          traceID,
-		Text:             finalAgent.Text,
-		Reasoning:        firstNonEmpty(finalAgent.Reasoning, parsed.Reasoning),
-		MessageID:        finalAgent.MessageID,
-		CompletedTime:    finalAgent.CompletedTime,
-		NDJSONLineCount:  parsed.LineCount,
-		RawMessageIDs:    messageIDs,
-		Attachments:      uploadedAttachments,
-		ConfigID:         meta.ConfigID,
-		ContextID:        meta.ContextID,
-		OriginalDatetime: meta.OriginalDatetime,
+		Prompt:             cleanPrompt,
+		Model:              strings.TrimSpace(req.PublicModel),
+		NotionModel:        strings.TrimSpace(req.NotionModel),
+		ModelObservations:  mergeModelObservations(parsed.FinalAgent.ModelObservations, finalAgent.ModelObservations),
+		ModelSelectionMode: req.ModelSelectionMode,
+		ThreadID:           actualThreadID,
+		TraceID:            traceID,
+		Text:               finalAgent.Text,
+		Reasoning:          firstNonEmpty(finalAgent.Reasoning, parsed.Reasoning),
+		MessageID:          finalAgent.MessageID,
+		CompletedTime:      finalAgent.CompletedTime,
+		NDJSONLineCount:    parsed.LineCount,
+		RawMessageIDs:      messageIDs,
+		Attachments:        uploadedAttachments,
+		ConfigID:           meta.ConfigID,
+		ContextID:          meta.ContextID,
+		OriginalDatetime:   meta.OriginalDatetime,
 	}, nil
 }

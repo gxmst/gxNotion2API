@@ -90,7 +90,8 @@ type SessionRefreshConfig struct {
 }
 
 type DispatchConfig struct {
-	ProbeCacheTTLSeconds int `json:"probe_cache_ttl_seconds,omitempty"`
+	RestrictedModelFallback bool `json:"restricted_model_fallback,omitempty"`
+	ProbeCacheTTLSeconds    int  `json:"probe_cache_ttl_seconds,omitempty"`
 	// Shared by all workspaces using the same credential. Zero means one.
 	AccountMaxConcurrency int `json:"account_max_concurrency,omitempty"`
 }
@@ -140,28 +141,29 @@ type PromptConfig struct {
 // account; quota, cooldown, and concurrency belong here because Notion bills
 // AI per workspace.
 type NotionWorkspace struct {
-	ID                   string `json:"id"`
-	ViewID               string `json:"view_id,omitempty"`
-	Name                 string `json:"name,omitempty"`
-	PlanType             string `json:"plan_type,omitempty"`
-	SubscriptionTier     string `json:"subscription_tier,omitempty"`
-	AIEnabled            bool   `json:"ai_enabled,omitempty"`
-	AIDisabled           bool   `json:"ai_disabled,omitempty"`
-	Priority             int    `json:"priority,omitempty"`
-	HourlyQuota          int    `json:"hourly_quota,omitempty"`
-	MaxConcurrency       int    `json:"max_concurrency,omitempty"`
-	WindowStartedAt      string `json:"window_started_at,omitempty"`
-	WindowRequestCount   int    `json:"window_request_count,omitempty"`
-	CooldownUntil        string `json:"cooldown_until,omitempty"`
-	LastUsedAt           string `json:"last_used_at,omitempty"`
-	LastSuccessAt        string `json:"last_success_at,omitempty"`
-	LastRefreshAt        string `json:"last_refresh_at,omitempty"`
-	LastQuotaExhaustedAt string `json:"last_quota_exhausted_at,omitempty"`
-	ConsecutiveFailures  int    `json:"consecutive_failures,omitempty"`
-	TotalSuccesses       int    `json:"total_successes,omitempty"`
-	TotalFailures        int    `json:"total_failures,omitempty"`
-	Status               string `json:"status,omitempty"`
-	LastError            string `json:"last_error,omitempty"`
+	ModelCapabilities    *WorkspaceModelCapabilities `json:"model_capabilities,omitempty"`
+	ID                   string                      `json:"id"`
+	ViewID               string                      `json:"view_id,omitempty"`
+	Name                 string                      `json:"name,omitempty"`
+	PlanType             string                      `json:"plan_type,omitempty"`
+	SubscriptionTier     string                      `json:"subscription_tier,omitempty"`
+	AIEnabled            bool                        `json:"ai_enabled,omitempty"`
+	AIDisabled           bool                        `json:"ai_disabled,omitempty"`
+	Priority             int                         `json:"priority,omitempty"`
+	HourlyQuota          int                         `json:"hourly_quota,omitempty"`
+	MaxConcurrency       int                         `json:"max_concurrency,omitempty"`
+	WindowStartedAt      string                      `json:"window_started_at,omitempty"`
+	WindowRequestCount   int                         `json:"window_request_count,omitempty"`
+	CooldownUntil        string                      `json:"cooldown_until,omitempty"`
+	LastUsedAt           string                      `json:"last_used_at,omitempty"`
+	LastSuccessAt        string                      `json:"last_success_at,omitempty"`
+	LastRefreshAt        string                      `json:"last_refresh_at,omitempty"`
+	LastQuotaExhaustedAt string                      `json:"last_quota_exhausted_at,omitempty"`
+	ConsecutiveFailures  int                         `json:"consecutive_failures,omitempty"`
+	TotalSuccesses       int                         `json:"total_successes,omitempty"`
+	TotalFailures        int                         `json:"total_failures,omitempty"`
+	Status               string                      `json:"status,omitempty"`
+	LastError            string                      `json:"last_error,omitempty"`
 }
 
 type NotionAccount struct {
@@ -212,14 +214,17 @@ type NotionAccount struct {
 }
 
 type ModelDefinition struct {
-	ID          string   `json:"id"`
-	Name        string   `json:"name"`
-	NotionModel string   `json:"notion_model"`
-	Family      string   `json:"family,omitempty"`
-	Group       string   `json:"group,omitempty"`
-	Beta        bool     `json:"beta,omitempty"`
-	Enabled     bool     `json:"enabled"`
-	Aliases     []string `json:"aliases,omitempty"`
+	DefaultReasoningEffort    string   `json:"default_reasoning_effort,omitempty"`
+	SupportedReasoningEfforts []string `json:"supported_reasoning_efforts,omitempty"`
+	DisabledReason            string   `json:"disabled_reason,omitempty"`
+	ID                        string   `json:"id"`
+	Name                      string   `json:"name"`
+	NotionModel               string   `json:"notion_model"`
+	Family                    string   `json:"family,omitempty"`
+	Group                     string   `json:"group,omitempty"`
+	Beta                      bool     `json:"beta,omitempty"`
+	Enabled                   bool     `json:"enabled"`
+	Aliases                   []string `json:"aliases,omitempty"`
 }
 
 type AppConfig struct {

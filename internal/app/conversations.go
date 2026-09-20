@@ -35,13 +35,16 @@ type ConversationAttachment struct {
 }
 
 type ConversationMessage struct {
-	ID          string                   `json:"id"`
-	Role        string                   `json:"role"`
-	Status      string                   `json:"status"`
-	Content     string                   `json:"content"`
-	CreatedAt   time.Time                `json:"created_at"`
-	UpdatedAt   time.Time                `json:"updated_at"`
-	Attachments []ConversationAttachment `json:"attachments,omitempty"`
+	RequestedModel     string                   `json:"requested_model,omitempty"`
+	ModelSelectionMode string                   `json:"model_selection_mode,omitempty"`
+	ModelObservations  []ModelObservation       `json:"model_observations,omitempty"`
+	ID                 string                   `json:"id"`
+	Role               string                   `json:"role"`
+	Status             string                   `json:"status"`
+	Content            string                   `json:"content"`
+	CreatedAt          time.Time                `json:"created_at"`
+	UpdatedAt          time.Time                `json:"updated_at"`
+	Attachments        []ConversationAttachment `json:"attachments,omitempty"`
 }
 
 type ConversationEntry struct {
@@ -322,6 +325,7 @@ func cloneStringAnyMap(input map[string]any) map[string]any {
 }
 
 func cloneConversationMessage(msg ConversationMessage) ConversationMessage {
+	msg.ModelObservations = append([]ModelObservation(nil), msg.ModelObservations...)
 	msg.Attachments = cloneConversationAttachments(msg.Attachments)
 	return msg
 }
@@ -773,10 +777,15 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 		next.Error = ""
 		next.OutputAttachments = cloneUploadedAttachments(result.Attachments)
 		assistant := s.ensureAssistantMessageLocked(&next, now)
+		assistant.ID = firstNonEmpty(strings.TrimSpace(result.MessageID), assistant.ID)
 		assistant.Status = "completed"
 		assistant.Content = sanitizeAssistantVisibleText(result.Text)
+		assistant.RequestedModel = firstNonEmpty(result.Model, next.Model)
+		assistant.ModelSelectionMode = result.ModelSelectionMode
+		assistant.ModelObservations = append([]ModelObservation(nil), result.ModelObservations...)
 		assistant.Attachments = summarizeUploadedAttachments(result.Attachments)
 		assistant.UpdatedAt = now
+		log.Printf("[models] conversation=%s requested=%q selection=%q observed=%+v", conversationID, assistant.RequestedModel, assistant.ModelSelectionMode, assistant.ModelObservations)
 		if len(next.Messages) > 0 {
 			next.Messages[len(next.Messages)-1] = cloneConversationMessage(*assistant)
 		}
@@ -1421,6 +1430,28 @@ func (a *App) notionClientForAccount(ctx context.Context, accountEmail string) (
 	return newNotionAIClient(session, cfg, ""), nil
 }
 
+func (a *App) notionClientForWorkspace(ctx context.Context, accountEmail, workspaceID string) (*NotionAIClient, error) {
+	workspaceID = strings.TrimSpace(workspaceID)
+	if workspaceID == "" {
+		return a.notionClientForAccount(ctx, accountEmail)
+	}
+	cfg, _, _ := a.State.Snapshot()
+	if strings.TrimSpace(accountEmail) == "" {
+		if active, _, ok := cfg.ResolveActiveAccount(); ok {
+			accountEmail = active.Email
+		}
+	}
+	account, _, ok := cfg.FindAccountWorkspace(accountEmail, workspaceID)
+	if !ok {
+		return nil, fmt.Errorf("workspace %s for account %s is no longer available", workspaceID, accountEmail)
+	}
+	session, err := loadSessionInfoForAccountRefresh(cfg, account)
+	if err != nil {
+		return nil, err
+	}
+	return newNotionAIClient(session, cfg, account.Email), nil
+}
+
 func (a *App) deleteConversation(conversationID string) error {
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" {
@@ -1445,7 +1476,7 @@ func (a *App) deleteConversation(conversationID string) error {
 		timeout := time.Duration(maxInt(cfg.TimeoutSec, 10)) * time.Second
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		client, err := a.notionClientForAccount(ctx, entry.AccountEmail)
+		client, err := a.notionClientForWorkspace(ctx, entry.AccountEmail, entry.SpaceID)
 		if err != nil {
 			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 			return err

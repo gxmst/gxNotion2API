@@ -232,6 +232,7 @@ export function AccountsPanel({
   defaultModel,
   onRefresh,
   onRefreshWorkspaces,
+  onRefreshModels,
   onStartLogin,
   onVerifyCode,
   onImportAccount,
@@ -245,6 +246,7 @@ export function AccountsPanel({
   defaultModel?: string;
   onRefresh: () => Promise<unknown>;
   onRefreshWorkspaces: (email: string) => Promise<unknown>;
+  onRefreshModels: (email: string, workspaceID: string) => Promise<unknown>;
   onStartLogin: (email: string) => Promise<unknown>;
   onVerifyCode: (email: string, code: string) => Promise<unknown>;
   onImportAccount: (payload: JsonResult) => Promise<unknown>;
@@ -264,6 +266,7 @@ export function AccountsPanel({
   const [startMessage, setStartMessage] = useState('');
   const [starting, setStarting] = useState(false);
   const [refreshingWorkspaces, setRefreshingWorkspaces] = useState(false);
+  const [refreshingModels, setRefreshingModels] = useState(false);
 
   const [verifyEmail, setVerifyEmail] = useState('');
   const [verifyCode, setVerifyCode] = useState('');
@@ -361,7 +364,11 @@ export function AccountsPanel({
     return workspaceItems(selectedAccount).find((workspace) => workspace.id === selectedWorkspaceId) || null;
   }, [selectedAccount, selectedWorkspaceId]);
 
-  const modelOptions = useMemo(() => models.filter((item) => item.id), [models]);
+  const modelOptions = useMemo(() => {
+    const capability = accountOptions.find((item) => item.email === quickTestEmail)?.workspaces?.find((item) => item.id === quickTestWorkspaceId)?.model_capabilities;
+    return [{ id: 'auto', name: 'Auto' }, ...(capability?.mode === 'manual' ? capability.models || [] : []).filter((item) => item.enabled !== false && item.id !== 'auto' && models.find((model) => model.id === item.id)?.enabled !== false)];
+  }, [accountOptions, quickTestEmail, quickTestWorkspaceId, models]);
+  useEffect(() => { if (!modelOptions.some((item) => item.id === quickTestModel)) setQuickTestModel('auto'); }, [modelOptions, quickTestModel]);
 
   const selectedEdit = selectedAccount?.email
     ? accountEdits[workspaceEditKey(selectedAccount.email, selectedWorkspace?.id)] || accountEdits[selectedAccount.email] || { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false }
@@ -424,6 +431,9 @@ export function AccountsPanel({
   }
 
   async function runQuickTest(email: string, workspaceId = quickTestWorkspaceId) {
+    const capability = accountOptions.find((item) => item.email === email)?.workspaces?.find((item) => item.id === workspaceId)?.model_capabilities;
+    const selectedModel = capability?.mode === 'manual' && capability.models?.some((item) => item.id === quickTestModel && item.enabled !== false) ? quickTestModel : 'auto';
+    setQuickTestModel(selectedModel);
     setQuickTesting(true);
     setQuickTestEmail(email);
     setQuickTestMessage('测试中...');
@@ -432,7 +442,7 @@ export function AccountsPanel({
       const payload = await onQuickTest({
         email,
         workspace_id: workspaceId,
-        model: quickTestModel,
+        model: selectedModel,
         prompt: quickTestPrompt.trim() || 'Reply with NOTION2API_ACCOUNT_OK only.',
       });
       setQuickTestOutput(JSON.stringify(payload, null, 2));
@@ -910,6 +920,15 @@ export function AccountsPanel({
                   </div>
 
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    <Button variant="outline" disabled={refreshingModels || !selectedWorkspace || selectedAccount.credential_cooldown_active} onClick={async () => {
+                      if (!selectedWorkspace) return;
+                      setRefreshingModels(true);
+                      try { await onRefreshModels(selectedAccount.email || '', selectedWorkspace.id); toast.success('已刷新模型能力'); }
+                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
+                      finally { setRefreshingModels(false); }
+                    }}>{refreshingModels ? '正在刷新…' : '刷新模型能力'}</Button>
+                    <p className="col-span-full text-xs text-muted-foreground">模型选择：{selectedWorkspace?.model_capabilities?.mode === 'auto_only' ? '仅 Auto，由 Notion 分配' : selectedWorkspace?.model_capabilities?.mode === 'manual' ? '支持手动选择' : '未知，请刷新模型能力；当前可使用 Auto'}。{selectedWorkspace?.model_capabilities?.checked_at ? ` 上次确认：${formatMaybeDate(selectedWorkspace.model_capabilities.checked_at)}` : ''}</p>
+                    {selectedWorkspace?.model_capabilities ? <details className="col-span-full text-xs text-muted-foreground"><summary>模型目录与默认思考强度</summary><p className="my-2">目录仅提供说明，不代表当前工作区可手动选择。默认强度不代表本轮实际强度。</p><ul>{(selectedWorkspace.model_capabilities.catalog || selectedWorkspace.model_capabilities.models || []).map((item) => <li key={item.id}>{item.name || item.id} · 默认 {item.default_reasoning_effort || '未知'}{item.disabled_reason ? ` · 不可用：${item.disabled_reason}` : ''}</li>)}</ul></details> : null}
                     <Button variant="outline" disabled={refreshingWorkspaces || selectedAccount.credential_cooldown_active} onClick={async () => {
                       setRefreshingWorkspaces(true);
                       try { await onRefreshWorkspaces(selectedAccount.email || ''); toast.success('已刷新工作区套餐'); }
