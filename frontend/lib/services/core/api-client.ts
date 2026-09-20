@@ -28,6 +28,13 @@ function summarizeHTMLText(raw: string): string {
   return '上游返回了 HTML 错误页';
 }
 
+export class ApiError extends Error {
+  constructor(message: string, public readonly status: number) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers || {});
   if (init?.body && !headers.has('Content-Type')) {
@@ -45,14 +52,14 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   if (!response.ok) {
     const htmlSummary = typeof payload === 'string' ? summarizeHTMLText(payload) : '';
     if (htmlSummary && !hitNation2API) {
-      throw new Error(`当前响应未命中 nation2api（status ${response.status} ${response.statusText}，url ${response.url}），而是前置代理/反代返回的 HTML 错误页: ${htmlSummary.replace(/^上游返回 HTML 错误页:\s*/, '')}`);
+      throw new ApiError(`当前响应未命中 nation2api（status ${response.status} ${response.statusText}，url ${response.url}），而是前置代理/反代返回的 HTML 错误页: ${htmlSummary.replace(/^上游返回 HTML 错误页:\s*/, '')}`, response.status);
     }
     if (typeof payload === 'object' && payload !== null) {
       const detail = (payload as { detail?: string; error?: { message?: string } }).detail;
       const message = (payload as { detail?: string; error?: { message?: string } }).error?.message;
-      throw new Error(detail || message || `${response.status} ${response.statusText}`);
+      throw new ApiError(detail || message || `${response.status} ${response.statusText}`, response.status);
     }
-    throw new Error(htmlSummary || String(payload || `${response.status} ${response.statusText}`));
+    throw new ApiError(htmlSummary || String(payload || `${response.status} ${response.statusText}`), response.status);
   }
 
   return payload as T;

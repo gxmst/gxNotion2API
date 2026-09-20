@@ -38,6 +38,7 @@ type snapshotBundle struct {
 type ServerState struct {
 	mu                         sync.RWMutex
 	refreshMu                  sync.Mutex
+	modelPolicyMu              sync.Mutex
 	Config                     AppConfig
 	Session                    SessionInfo
 	Client                     *NotionAIClient

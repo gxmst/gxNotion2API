@@ -13,6 +13,34 @@ export interface ModelItem {
   enabled?: boolean;
 }
 
+export interface WorkspaceModelPolicy {
+  disabledModels: string[];
+  disabledProviders: string[];
+}
+
+export interface ModelPolicySnapshot {
+  email: string;
+  workspace_id: string;
+  scope: 'personal' | 'custom';
+  membership_type: string;
+  can_edit: boolean;
+  policy: WorkspaceModelPolicy;
+  policy_present: boolean;
+  revision: string;
+  models: { id: string; name: string; provider: string; available: boolean; disabled_reason?: string; allowed: boolean }[];
+}
+
+export interface ModelPolicyEdit {
+  email: string;
+  workspace_id: string;
+  scope: 'personal' | 'custom';
+  revision: string;
+  action: 'lock' | 'restore';
+  model_id?: string;
+  restore_policy?: WorkspaceModelPolicy;
+  restore_present?: boolean;
+}
+
 export interface SessionSummary {
   user_email?: string;
   user_name?: string;

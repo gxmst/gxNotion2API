@@ -237,6 +237,10 @@ func dialAttachmentTarget(ctx context.Context, target string, proxyURL *url.URL,
 		return nil, errors.New("attachment proxy CONNECT response failed")
 	}
 	if response.StatusCode != http.StatusOK {
+		_, targetPort, _ := net.SplitHostPort(target)
+		if targetPort != "443" && (response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusMethodNotAllowed) {
+			return nil, fmt.Errorf("attachment proxy rejected CONNECT to port %s: HTTP %d; use an HTTPS attachment URL if available, or configure the proxy to allow CONNECT to this port", targetPort, response.StatusCode)
+		}
 		return nil, fmt.Errorf("attachment proxy CONNECT failed: HTTP %d", response.StatusCode)
 	}
 	_ = conn.SetDeadline(time.Time{})

@@ -20,6 +20,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@
 import { Switch } from '@/components/ui/switch';
 import { Textarea } from '@/components/ui/textarea';
 import { AIUsagePanel } from '@/components/admin/ai-usage-panel';
+import { WorkspaceModelPolicy } from '@/components/admin/workspace-model-policy';
 import {
   EmptyHint,
   InfoCard,
@@ -920,6 +921,7 @@ export function AccountsPanel({
                   </div>
 
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    {selectedWorkspace ? <WorkspaceModelPolicy key={workspaceEditKey(selectedAccount.email || '', selectedWorkspace.id)} email={selectedAccount.email || ''} workspaceID={selectedWorkspace.id} workspaceName={workspaceTitle(selectedWorkspace)} coolingDown={selectedAccount.credential_cooldown_active} /> : null}
                     <Button variant="outline" disabled={refreshingModels || !selectedWorkspace || selectedAccount.credential_cooldown_active} onClick={async () => {
                       if (!selectedWorkspace) return;
                       setRefreshingModels(true);

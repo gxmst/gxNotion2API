@@ -206,6 +206,9 @@ func TestAttachmentHTTPProxyTunnelsCheckedIP(t *testing.T) {
 				if strings.Contains(err.Error(), "password") {
 					t.Fatal("proxy credentials leaked")
 				}
+				if !strings.Contains(err.Error(), "CONNECT to port 80") || !strings.Contains(err.Error(), "HTTPS attachment URL") {
+					t.Fatal("proxy port restriction has no actionable explanation", err)
+				}
 			} else {
 				if err != nil {
 					t.Fatal(err)

@@ -12,6 +12,8 @@ import type {
   AIUsagePayload,
   ChatRunInput,
   ChatRunResult,
+  ModelPolicySnapshot,
+  ModelPolicyEdit,
 } from './types';
 
 export const AdminService = {
@@ -46,6 +48,13 @@ export const AdminService = {
   },
   refreshModels(email: string, workspace_id: string) {
     return apiFetch('/admin/accounts/refresh-models', { method: 'POST', body: JSON.stringify({ email, workspace_id }) });
+  },
+  getModelPolicy(email: string, workspace_id: string, scope: 'personal' | 'custom') {
+    const query = new URLSearchParams({ email, workspace_id, scope });
+    return apiFetch<ModelPolicySnapshot>(`/admin/accounts/model-policy?${query}`, { cache: 'no-store' });
+  },
+  updateModelPolicy(payload: ModelPolicyEdit) {
+    return apiFetch<ModelPolicySnapshot>('/admin/accounts/model-policy', { method: 'PUT', body: JSON.stringify(payload), redirect: 'error' });
   },
   getAIUsage(refresh = false) {
     return apiFetch<AIUsagePayload>(`/admin/accounts/ai-usage${refresh ? '?refresh=1' : ''}`);
