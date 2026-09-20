@@ -52,57 +52,62 @@ func (a *App) accountRuntimeSummary(cfg AppConfig, account NotionAccount) map[st
 	remainingQuota, quotaLimited := accountRemainingQuota(account, now)
 	cooldownUntil := parseOptionalRFC3339(account.CooldownUntil)
 	item := map[string]any{
-		"email":                   account.Email,
-		"probe_json":              account.ProbeJSON,
-		"probe_exists":            fileExists(account.ProbeJSON),
-		"profile_dir":             account.ProfileDir,
-		"profile_dir_exists":      dirExists(account.ProfileDir),
-		"storage_state_path":      account.StorageStatePath,
-		"storage_state_exists":    fileExists(account.StorageStatePath),
-		"pending_state_path":      account.PendingStatePath,
-		"pending_state_exists":    fileExists(account.PendingStatePath),
-		"user_id":                 account.UserID,
-		"user_name":               account.UserName,
-		"space_id":                account.SpaceID,
-		"space_view_id":           account.SpaceViewID,
-		"space_name":              account.SpaceName,
-		"plan_type":               account.PlanType,
-		"default_workspace_id":    account.DefaultWorkspaceID,
-		"client_version":          account.ClientVersion,
-		"status":                  account.Status,
-		"last_error":              account.LastError,
-		"last_login_at":           account.LastLoginAt,
-		"disabled":                account.Disabled,
-		"priority":                account.Priority,
-		"hourly_quota":            account.HourlyQuota,
-		"max_concurrency":         normalizeAccountMaxConcurrency(account.MaxConcurrency),
-		"quota_limited":           quotaLimited,
-		"remaining_quota":         remainingQuota,
-		"window_started_at":       account.WindowStartedAt,
-		"window_request_count":    account.WindowRequestCount,
-		"cooldown_until":          account.CooldownUntil,
-		"cooldown_active":         accountCooldownActive(account, now),
-		"cooldown_remaining_sec":  maxInt(int(time.Until(cooldownUntil).Seconds()), 0),
-		"last_used_at":            account.LastUsedAt,
-		"last_success_at":         account.LastSuccessAt,
-		"last_refresh_at":         account.LastRefreshAt,
-		"last_relogin_at":         account.LastReloginAt,
-		"last_quota_exhausted_at": account.LastQuotaExhaustedAt,
-		"consecutive_failures":    account.ConsecutiveFailures,
-		"total_successes":         account.TotalSuccesses,
-		"total_failures":          account.TotalFailures,
-		"active":                  canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(account),
+		"credential_cooldown_until":  account.CredentialCooldownUntil,
+		"credential_cooldown_active": parseOptionalRFC3339(account.CredentialCooldownUntil).After(now),
+		"account_max_concurrency":    normalizeAccountMaxConcurrency(cfg.Dispatch.AccountMaxConcurrency),
+		"email":                      account.Email,
+		"probe_json":                 account.ProbeJSON,
+		"probe_exists":               fileExists(account.ProbeJSON),
+		"profile_dir":                account.ProfileDir,
+		"profile_dir_exists":         dirExists(account.ProfileDir),
+		"storage_state_path":         account.StorageStatePath,
+		"storage_state_exists":       fileExists(account.StorageStatePath),
+		"pending_state_path":         account.PendingStatePath,
+		"pending_state_exists":       fileExists(account.PendingStatePath),
+		"user_id":                    account.UserID,
+		"user_name":                  account.UserName,
+		"space_id":                   account.SpaceID,
+		"space_view_id":              account.SpaceViewID,
+		"space_name":                 account.SpaceName,
+		"plan_type":                  account.PlanType,
+		"default_workspace_id":       account.DefaultWorkspaceID,
+		"client_version":             account.ClientVersion,
+		"status":                     account.Status,
+		"last_error":                 account.LastError,
+		"last_login_at":              account.LastLoginAt,
+		"disabled":                   account.Disabled,
+		"priority":                   account.Priority,
+		"hourly_quota":               account.HourlyQuota,
+		"max_concurrency":            normalizeAccountMaxConcurrency(account.MaxConcurrency),
+		"quota_limited":              quotaLimited,
+		"remaining_quota":            remainingQuota,
+		"window_started_at":          account.WindowStartedAt,
+		"window_request_count":       account.WindowRequestCount,
+		"cooldown_until":             account.CooldownUntil,
+		"cooldown_active":            accountCooldownActive(account, now),
+		"cooldown_remaining_sec":     maxInt(int(time.Until(cooldownUntil).Seconds()), 0),
+		"last_used_at":               account.LastUsedAt,
+		"last_success_at":            account.LastSuccessAt,
+		"last_refresh_at":            account.LastRefreshAt,
+		"last_relogin_at":            account.LastReloginAt,
+		"last_quota_exhausted_at":    account.LastQuotaExhaustedAt,
+		"consecutive_failures":       account.ConsecutiveFailures,
+		"total_successes":            account.TotalSuccesses,
+		"total_failures":             account.TotalFailures,
+		"active":                     canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(account),
 	}
 	workspaceItems := make([]map[string]any, 0, len(account.Workspaces))
 	for _, workspace := range account.Workspaces {
 		workspace = normalizeWorkspace(workspace)
 		selected, _ := accountForWorkspace(account, workspace.ID)
+		eligible, eligibilityReason := workspaceEligibility(workspace)
 		remaining, limited := accountRemainingQuota(selected, now)
 		cooldownUntil := parseOptionalRFC3339(workspace.CooldownUntil)
 		workspaceItems = append(workspaceItems, map[string]any{
 			"id": workspace.ID, "view_id": workspace.ViewID, "name": workspace.Name,
 			"plan_type": workspace.PlanType, "subscription_tier": workspace.SubscriptionTier,
-			"ai_enabled": workspace.AIEnabled, "status": workspace.Status,
+			"ai_enabled": workspace.AIEnabled, "ai_disabled": workspace.AIDisabled, "status": workspace.Status,
+			"eligible": eligible, "eligibility_reason": eligibilityReason,
 			"last_error": workspace.LastError, "priority": workspace.Priority,
 			"hourly_quota": workspace.HourlyQuota, "max_concurrency": workspace.MaxConcurrency,
 			"quota_limited": limited, "remaining_quota": remaining,
@@ -379,6 +384,7 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "disabled account cannot be activated"})
 			return
 		}
+		cfg.Accounts = cloneAccounts(cfg.Accounts)
 		cfg.Accounts[index] = ensureAccountPaths(cfg, next)
 		if canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(next) && next.Disabled {
 			cfg.ActiveAccount = ""
@@ -938,11 +944,14 @@ func (a *App) handleAdminAccountManualImport(w http.ResponseWriter, r *http.Requ
 				PlanType:         candidate.PlanType,
 				SubscriptionTier: candidate.SubscriptionTier,
 				AIEnabled:        candidate.AIEnabled,
+				AIDisabled:       candidate.AIDisabled,
 				Status:           "ready",
 			}
 			if existing, ok := accountWorkspace(account, workspace.ID); ok {
 				workspace = mergeWorkspaceValues(existing, workspace)
 			}
+			workspace.AIEnabled = candidate.AIEnabled
+			workspace.AIDisabled = candidate.AIDisabled
 			setAccountWorkspace(&account, workspace)
 		}
 	} else if probe.SpaceID != "" {

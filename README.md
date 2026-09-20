@@ -131,19 +131,24 @@ HTTP 请求优先顺序：
 
 | 字段 | 默认 | 说明 |
 | --- | --- | --- |
-| `features.force_fresh_thread_per_request` | `false` | 开启后每个请求都新建上游线程并重放全部历史，**缓存完全无法命中**。只在需要彻底隔离每次请求时才开。 |
-| `features.conversation_idle_ttl_hours` | `24` | 会话空闲这么久后连同上游线程一起删除。设 `0` 表示永不删除。留空走默认值。 |
-| `features.ephemeral_all_conversations` | `false` | 开启后**每一轮**对话结束就删线程，线程创建量翻倍且缓存归零。与省额度的目标冲突，除非你要求不留痕，否则别开。 |
+| `features.force_fresh_thread_per_request` | `false` | 开启后每个请求都新建上游线程并重放全部历史。需要隔离每次请求时再开启。 |
+| `features.conversation_idle_ttl_hours` | `0` | 默认长期保留普通会话及上游线程。显式设为正数后才按空闲小时数删除；已有配置中的正数仍然生效。 |
+| `features.ephemeral_all_conversations` | `false` | 开启后每轮结束清理线程，下次需重新创建并处理上下文。需要临时会话时再开启。 |
+| `responses.store_ttl_seconds` | `3600` | 响应正文的保留时间；正文过期后 GET 返回 404，`previous_response_id` 仍可通过保留的关联继续现有会话。 |
 | `features.ephemeral_ttl_seconds` | 未设置 | 仅作用于 `ephemeral_all_conversations` 标记的会话。不设置时该路径用 2 分钟。 |
 | `features.continuation_failover` | `true` | 绑定账号的上游 AI 额度耗尽后，将对话历史重放到备用账号的新线程；没有可用备用账号时保留原始额度错误。 |
 
-会话延续按「显式 conversation_id → `previous_response_id` → thread_id → 请求指纹 → 历史段落」逐级匹配。隐式匹配按客户端、接口、模型和指定账号划分范围；指纹还包含隐藏提示词及开头的用户、助手消息，因此每轮重发完整历史的客户端（如 SillyTavern）能自动命中同一线程。
+会话延续按「显式 conversation_id → `previous_response_id` → thread_id → 请求指纹 → 历史段落」逐级匹配。隐式匹配按客户端、接口、模型、指定账号和指定工作区划分范围；指纹还包含隐藏提示词及开头的用户、助手消息，因此每轮重发完整历史的客户端（如 SillyTavern）能自动命中同一线程。改选 `workspace_id` 后，隐式匹配会在新工作区开始独立会话；显式指定属于其他工作区的会话 ID 仍会报错。升级前未记录工作区范围的会话，可携带原 `conversation_id` 继续。
 
 客户端身份优先取 `X-Client-ID`，其次是 `X-Session-ID`、`OpenAI-Organization`；缺省使用连接 IP 和 User-Agent。同一反代或 NAT 下、使用相同 User-Agent 的不同客户端应设置不同的身份头，或显式使用独立的 `conversation_id`。提供稳定身份头后，IP 或 User-Agent 改变仍可通过历史匹配续写；旧记录缺少匹配范围时，可用显式会话 ID 继续。
 
 完全重复的最后一轮可回放已有答案，SillyTavern 的 `continue` 始终生成新内容。附件回放需要匹配持久化的内联内容 SHA-256；旧记录没有摘要、附件使用 URL 或本地路径时，会重新执行请求，避免同名文件或同一地址的内容变化后返回旧答案。
 
 SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书触发、代打），一次性使用，会独立按 10 分钟回收，不受上面两个 ephemeral 开关影响。
+
+续聊关联与会话一同删除，不能复活已删除的线程。启用默认 SQLite 持久化时，关联在重启后仍可恢复；关闭会话或响应持久化时，相应关联不会跨重启保留。`/metrics` 和 `/debug/vars` 提供 `notion2api_inference_activity_total`，区分推理尝试、增量续聊、新线程请求和历史重放次数；这些计数不是实际扣费 token。
+
+默认不因普通拒答自动增加推理请求。保留的兼容策略配置 `prompt.max_refusal_retries` 默认为 `0`，最多允许 `1`；当前推理主链不调用该拒答重试器。
 
 ### 上游指纹
 
@@ -155,6 +160,8 @@ SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书�
 | `features.accept_language` | 跟随时区推导 | `Accept-Language` 头。留空时按时区推导匹配值，避免出现「Windows/en-US 浏览器却报 Asia/Shanghai」这类组合。账号 cookie 里的 `NEXT_LOCALE` / `notion_locale` 优先级更高。 |
 
 证书校验默认开启，仅在显式设置 `upstream_tls_server_name` 或 `upstream_host`（域前置场景，证书本就不匹配）时才跳过。
+
+遇到 `trust-rule-denied` 后不会切换 HTTP 客户端重发或通过登录刷新重试，同一账号的全部工作区暂停 30 分钟。HTTP 429 会保留并遵守 `Retry-After`，账号至少暂停 2 分钟；上游要求更长时间时以其为准。已确认的 `quota-exhausted` 使用 6 小时本地退避，这不是对上游额度重置时间的预测。不同工作区共享 `dispatch.account_max_concurrency`（默认 `1`），同时仍受各工作区的并发上限约束。
 
 ### 模型列表刷新
 
@@ -171,15 +178,17 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 
 ### 多账号与多工作区
 
-账号是凭证和登录态的边界，工作区是额度、冷却和并发的边界。一个账号可以保存多个工作区，多个账号也可以共同指向同一个工作区。导入或登录时会保留自动发现的全部工作区，并优先选择带付费订阅且启用 AI 的工作区作为默认值；旧配置里的 `space_id` / `space_view_id` 会自动迁移成一个 workspace。
+账号是凭证、登录态和共享并发的边界，工作区分别保存额度和运行状态。一个账号可以保存多个工作区，多个账号也可以共同指向同一个工作区。调度仅接受 Business、具备 Business 权益的商业试用和 Enterprise，排除 Free、Plus 和明确关闭 AI 的工作区。仅有 `trial`、`team`、`personal` 或 AI 开关不能证明套餐符合要求；套餐未确认时先刷新元数据。旧配置里的 `space_id` / `space_view_id` 仍会迁移成一个 workspace。
 
-`workspace_id` 是新的请求字段，`space_id` 仍作为兼容别名。请求级选择支持 JSON 字段、`X-Workspace-ID`、`X-Notion-Workspace-ID`、`X-Notion-Space-ID`；未指定时使用活动工作区，再回退到账号默认工作区。工作区选择不会改变账号的 cookie、probe、浏览器 profile 或代理身份。
+`workspace_id` 是新的请求字段，`space_id` 仍作为兼容别名。请求级选择支持 JSON 字段、`X-Workspace-ID`、`X-Notion-Workspace-ID`、`X-Notion-Space-ID`；未指定时优先使用活动工作区，再按账号默认工作区选择，首选目标不可用时仍保留账号池的回退能力。显式指定工作区时只在该区内调度；已有会话继续绑定原工作区。工作区选择不会改变账号的 cookie、probe、浏览器 profile 或代理身份。
 
 管理台的账号详情可以查看全部工作区，并分别设置本地每小时额度、最大并发、默认工作区；激活和快速测试也会携带所选工作区。AI 额度查询按“账号 + 工作区”返回，不会把同一账号下的多个区合并成一个数。
 
-### 工作区选择（免费区会静默失败）
+账号详情的“刷新工作区套餐”通过 `/admin/accounts/refresh-workspaces` 更新套餐元数据，不发起推理。它保留凭证、代理与运行计数，并撤销已移除工作区的旧准入。聊天页只列出符合要求的工作区；新对话可以切换，已有对话保持绑定。左侧历史可搜索和恢复，切换到管理页面会保留当前生成和草稿，查看旧消息时不会被流式输出强制拉到底部。
 
-`space_id` 决定推理落在哪个工作区，而 AI 额度是按工作区算的，不是按账号算的。一个账号有多个区时，probe 里记的往往是默认的个人区——如果那是免费区，试用额度用完之后的表现是：
+### 工作区选择与旧配置迁移
+
+`space_id` 决定推理落在哪个工作区。旧版本可能将请求发往 probe 记录的免费个人区，其试用额度耗尽后曾出现以下表现；当前调度会事先排除这些工作区：
 
 - 认证、模型列表、账号状态全部正常
 - 推理请求上游返回 200，消息也确实写进了 thread
@@ -194,7 +203,7 @@ curl -X POST https://www.notion.so/api/v3/getSpaces \
            | "\(.key)  \(.value.value.name)  plan=\(.value.value.plan_type) tier=\(.value.value.subscription_tier)"'
 ```
 
-挑 `tier` 不是 `free` 的那个区，导入时显式带上它的 `space_id` 和 `space_view_id`（显式字段优先于 probe 里记的值）：
+选择具有 Business／Enterprise 权益的工作区，商业试用也可；不要选择 Plus。导入时显式带上它的 `space_id` 和 `space_view_id`（显式字段优先于 probe 里记的值），导入后在账号详情刷新套餐以确认准入：
 
 ```bash
 curl -X POST http://127.0.0.1:8787/admin/accounts/manual \
@@ -243,6 +252,12 @@ curl -X PUT http://127.0.0.1:8787/admin/accounts \
 - 首次启动后先访问 `/admin`，确认账号、配置和连通性是否正常
 - 修改管理台前端后需执行 `npm --prefix ./frontend run build:static`
 - 调整会话延续与存储时，建议同步检查 `internal/app/sqlite_store.go` 的 schema 与迁移兼容性
+
+### 附件来源限制
+
+附件支持内联 Base64 / data URL，或不含账号密码的公网 HTTP(S) URL，每个附件最大 20 MiB。服务端本地路径（包括 `path`、`file://`、相对路径和网络共享路径）会被拒绝；需要发送本地文件时，请由客户端读取并转成内联数据，管理台的文件选择上传仍可正常使用。
+
+URL 下载会检查全部 DNS 解析结果及每次重定向，拒绝回环、私网、链路本地和其他非公网地址，并直接连接已校验的 IP。下载沿用账号的代理设置，不携带 Notion Cookie，始终校验证书；HTTP/HTTPS 代理必须支持向目标 IP 发起 CONNECT（HTTP 附件也使用隧道）。下载使用独立的 Go HTTP 传输，不受 Notion 主请求指纹和域前置设置影响。
 
 ## 来源与关系
 

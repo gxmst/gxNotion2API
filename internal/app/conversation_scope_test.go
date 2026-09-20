@@ -161,12 +161,12 @@ func TestContinuationFallbackClientIdentity(t *testing.T) {
 			second.RemoteAddr = tc.peer
 			second.Header.Set("User-Agent", tc.userAgent)
 			second.Header.Set("X-Client-ID", tc.secondID)
-			scope := requestClientContinuationScope(first, "openai", "", "chat_completions", "gpt-5.4", "")
+			scope := requestClientContinuationScope(first, "openai", "", "chat_completions", "gpt-5.4", "", "")
 			entry := app.State.conversations().Create(ConversationCreateRequest{Prompt: "hello", ClientScope: scope})
 			app.State.conversations().Complete(entry.ID, InferenceResult{Text: "hi", ThreadID: "thread-first-client"})
 			segments := []conversationPromptSegment{{Role: "user", Text: "hello"}, {Role: "assistant", Text: "hi"}, {Role: "user", Text: "next question"}}
-			fingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(second, "openai", "", "chat_completions", "gpt-5.4", ""), "", segments)
-			clientScope := requestClientContinuationScope(second, "openai", "", "chat_completions", "gpt-5.4", "")
+			fingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(second, "openai", "", "chat_completions", "gpt-5.4", "", ""), "", segments)
+			clientScope := requestClientContinuationScope(second, "openai", "", "chat_completions", "gpt-5.4", "", "")
 			target, matched := app.resolveContinuationConversationWithExplicit("", fingerprint, clientScope, segments, "", "")
 			if matched != tc.wantMatch || (matched && target.Conversation.ID != entry.ID) {
 				t.Fatalf("matched=%v want=%v target=%q", matched, tc.wantMatch, target.Conversation.ID)
@@ -185,7 +185,7 @@ func TestSillyTavernBindingFallbackRespectsClientScope(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
-			clientScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", "gpt-5.4", "")
+			clientScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", "gpt-5.4", "", "")
 			entryScope := clientScope
 			if scopeKind == "different" {
 				entryScope += "\nclient=another"
@@ -244,7 +244,7 @@ func TestRepeatTurnRequiresPersistedAttachmentContent(t *testing.T) {
 
 func eligibleTestAccount(t *testing.T, cfg AppConfig) NotionAccount {
 	t.Helper()
-	account := ensureAccountPaths(cfg, NotionAccount{Email: "cooldown@example.com"})
+	account := ensureAccountPaths(cfg, NotionAccount{Email: "cooldown@example.com", PlanType: "business"})
 	if err := os.MkdirAll(filepath.Dir(account.StorageStatePath), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -342,7 +342,7 @@ func TestChatCompletionsRepeatTurnRoundTripsPersistedFingerprint(t *testing.T) {
 	}
 	scopeRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	fingerprint := canonicalConversationFingerprintScoped(
-		requestClientFingerprintScope(scopeRequest, "openai", "", "chat_completions", modelID, ""),
+		requestClientFingerprintScope(scopeRequest, "openai", "", "chat_completions", modelID, "", ""),
 		"", segments,
 	)
 	app.persistConversationSession(entry.ID, PromptRunRequest{

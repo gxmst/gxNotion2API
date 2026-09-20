@@ -101,7 +101,7 @@ const DEFAULT_PROMPT_STRATEGY: Required<PromptConfig> = {
   custom_prefix: '',
   fallback_profiles: ['toolbox_capability_expansion'],
   max_escalation_steps: 1,
-  max_refusal_retries: 2,
+  max_refusal_retries: 0,
   cognitive_reframing_prefix: [
     'You are a helpful AI assistant routed through a workspace integration.',
     'The user may ask for general writing, coding, explanation, translation, brainstorming, or creative tasks.',
@@ -1042,8 +1042,8 @@ export function SettingsPanel({
                       <FieldBlock label="Max Escalation Steps" description="最多升级步数。">
                         <Input type="number" value={form.maxEscalationSteps} onChange={(event) => setForm({ ...form, maxEscalationSteps: event.target.value })} className={FIELD_CLASSNAME} />
                       </FieldBlock>
-                      <FieldBlock label="Max Refusal Retries" description="拒绝后的最大重试次数。">
-                        <Input type="number" value={form.maxRefusalRetries} onChange={(event) => setForm({ ...form, maxRefusalRetries: event.target.value })} className={FIELD_CLASSNAME} />
+                      <FieldBlock label="Max Refusal Retries" description="兼容策略的重试上限，默认 0、最多 1；当前聊天接口不会按此项自动重发。">
+                        <Input type="number" min={0} max={1} value={form.maxRefusalRetries} onChange={(event) => setForm({ ...form, maxRefusalRetries: event.target.value })} className={FIELD_CLASSNAME} />
                       </FieldBlock>
                     </div>
 

@@ -8,6 +8,26 @@ import (
 
 const responseStoreCleanupInterval = 30 * time.Second
 
+// Payload retention and continuation retention are independent. A retained
+// link can resume only its existing conversation, never a deleted thread.
+func (s *ServerState) getContinuationResponse(id string) (StoredResponse, bool) {
+	if record, ok := s.getStoredResponse(id); ok {
+		return record, true
+	}
+	s.mu.RLock()
+	var record StoredResponse
+	var ok bool
+	if s.ResponseStore != nil {
+		record, ok = s.ResponseStore.links[strings.TrimSpace(id)]
+	}
+	s.mu.RUnlock()
+	if !ok || record.ConversationID == "" {
+		return StoredResponse{}, false
+	}
+	entry, exists := s.conversations().Get(record.ConversationID)
+	return record, exists && entry.ThreadID != "" && entry.ThreadID == record.ThreadID
+}
+
 type responseExpiryEntry struct {
 	responseID string
 	createdAt  time.Time
@@ -45,6 +65,7 @@ func (h *responseExpiryHeap) Pop() any {
 type responseStore struct {
 	ttl         time.Duration
 	items       map[string]StoredResponse
+	links       map[string]StoredResponse
 	expirations responseExpiryHeap
 }
 
@@ -78,6 +99,9 @@ func (s *responseStore) ensureInitialized() {
 	if s == nil {
 		return
 	}
+	if s.links == nil {
+		s.links = map[string]StoredResponse{}
+	}
 	if s.items == nil {
 		s.items = map[string]StoredResponse{}
 	}
@@ -109,6 +133,9 @@ func (s *responseStore) save(responseID string, record StoredResponse, now time.
 	record.AccountEmail = strings.TrimSpace(record.AccountEmail)
 
 	s.items[responseID] = record
+	link := record
+	link.Payload = nil
+	s.links[responseID] = link
 	heap.Push(&s.expirations, responseExpiryEntry{
 		responseID: responseID,
 		createdAt:  createdAt,
@@ -143,6 +170,7 @@ func (s *responseStore) replaceAll(records map[string]StoredResponse) {
 	}
 	s.ensureInitialized()
 	s.items = map[string]StoredResponse{}
+	s.links = map[string]StoredResponse{}
 	s.expirations = responseExpiryHeap{}
 	heap.Init(&s.expirations)
 	for responseID, record := range records {
@@ -155,6 +183,14 @@ func (s *responseStore) replaceAll(records map[string]StoredResponse) {
 		record.ConversationID = strings.TrimSpace(record.ConversationID)
 		record.ThreadID = strings.TrimSpace(record.ThreadID)
 		record.AccountEmail = strings.TrimSpace(record.AccountEmail)
+		link := record
+		link.Payload = nil
+		s.links[cleanID] = link
+		// SQLite retains an empty payload after cleanup. A later TTL increase
+		// must not make that deleted body readable again.
+		if len(record.Payload) == 0 {
+			continue
+		}
 		s.items[cleanID] = record
 		heap.Push(&s.expirations, responseExpiryEntry{
 			responseID: cleanID,
@@ -206,10 +242,11 @@ func (s *responseStore) deleteByConversationOrThread(conversationID string, thre
 	}
 	s.ensureInitialized()
 	removed := 0
-	for responseID, record := range s.items {
+	for responseID, record := range s.links {
 		if (conversationID != "" && strings.TrimSpace(record.ConversationID) == conversationID) ||
 			(threadID != "" && strings.TrimSpace(record.ThreadID) == threadID) {
 			delete(s.items, responseID)
+			delete(s.links, responseID)
 			removed++
 		}
 	}

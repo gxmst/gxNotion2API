@@ -956,8 +956,8 @@ func TestSnapshotDispatchOrderPrecomputed(t *testing.T) {
 	cfg.APIKey = "snapshot-dispatch-order-api-key"
 	cfg.ActiveAccount = "bob@example.com"
 	cfg.Accounts = []NotionAccount{
-		{Email: "alice@example.com", Priority: 10, MaxConcurrency: 1, ProbeJSON: aliceProbe},
-		{Email: "bob@example.com", Priority: 1, MaxConcurrency: 1, ProbeJSON: bobProbe},
+		{PlanType: "business", Email: "alice@example.com", Priority: 10, MaxConcurrency: 1, ProbeJSON: aliceProbe},
+		{PlanType: "business", Email: "bob@example.com", Priority: 1, MaxConcurrency: 1, ProbeJSON: bobProbe},
 		{Email: "carol@example.com", Priority: 50, MaxConcurrency: 1, Disabled: true},
 	}
 	cfg = normalizeConfig(cfg)
@@ -1824,7 +1824,7 @@ func TestRunPromptWithAccountPoolReturnsCapacityErrorWhenAllSlotsOccupied(t *tes
 	cfg := normalizeConfig(AppConfig{
 		APIKey: "test-api-key",
 		Accounts: []NotionAccount{
-			{Email: "alice@example.com", MaxConcurrency: 1, ProbeJSON: probePath},
+			{PlanType: "business", Email: "alice@example.com", MaxConcurrency: 1, ProbeJSON: probePath},
 		},
 	})
 	state, err := newServerState(cfg)

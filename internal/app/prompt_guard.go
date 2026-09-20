@@ -206,12 +206,7 @@ func stripPromptGuardSections(text string) string {
 }
 
 func promptGuardRetryBudget(cfg AppConfig, request PromptRunRequest) int {
-	chain := promptGuardProfileChain(cfg, false)
-	profileRetries := 0
-	if len(chain) > 1 {
-		profileRetries = len(chain) - 1
-	}
-	return maxInt(cfg.Prompt.MaxRefusalRetries, profileRetries)
+	return min(max(cfg.Prompt.MaxRefusalRetries, 0), 1)
 }
 
 func promptGuardPrepareRequest(cfg AppConfig, request PromptRunRequest) PromptRunRequest {
@@ -473,14 +468,7 @@ func runPromptWithPromptGuard(ctx context.Context, cfg AppConfig, request Prompt
 				current = promptGuardBuildRetryRequest(cfg, current, attempt, false)
 				continue
 			}
-			if isPromptGuardRefusal(result.Text) {
-				recoveryRequest := promptGuardBuildRetryRequest(cfg, current, 0, true)
-				recovered, err := execute(ctx, recoveryRequest, nil)
-				if err == nil && !isPromptGuardRefusal(recovered.Text) {
-					recovered.Text = sanitizePromptGuardDeliveredText(recovered.Text)
-					return recovered, nil
-				}
-			}
+
 			lastResult.Text = sanitizePromptGuardDeliveredText(lastResult.Text)
 			return lastResult, nil
 		}
@@ -498,17 +486,7 @@ func runPromptWithPromptGuard(ctx context.Context, cfg AppConfig, request Prompt
 			current = promptGuardBuildRetryRequest(cfg, current, attempt, false)
 			continue
 		}
-		if !buffer.HasEmitted() && isPromptGuardRefusal(result.Text) {
-			recoveryRequest := promptGuardBuildRetryRequest(cfg, current, 0, true)
-			recovered, err := execute(ctx, recoveryRequest, nil)
-			if err == nil && !isPromptGuardRefusal(recovered.Text) {
-				recovered.Text = sanitizePromptGuardDeliveredText(recovered.Text)
-				if flushErr := buffer.FlushFinal(recovered.Text, chunkRunes); flushErr != nil {
-					return InferenceResult{}, flushErr
-				}
-				return recovered, nil
-			}
-		}
+
 		lastResult.Text = sanitizePromptGuardDeliveredText(lastResult.Text)
 		if err := buffer.FlushFinal(lastResult.Text, chunkRunes); err != nil {
 			return InferenceResult{}, err

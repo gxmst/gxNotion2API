@@ -956,12 +956,10 @@ func buildAttachmentFromReference(rawRef string, name string, contentType string
 		return buildAttachmentFromInlineData(ref, name, contentType)
 	}
 	if isLikelyFilePath(ref) {
-		return finalizeAttachment(InputAttachment{
-			Name:        name,
-			ContentType: contentType,
-			Source:      "file_path",
-			Path:        normalizeLocalPath(ref),
-		}, forceImage)
+		return InputAttachment{}, false, errLocalAttachmentPath
+	}
+	if _, err := parseAttachmentURL(ref); err != nil {
+		return InputAttachment{}, false, err
 	}
 	return finalizeAttachment(InputAttachment{
 		Name:        name,
@@ -1110,19 +1108,6 @@ func isLikelyFilePath(value string) bool {
 		return true
 	}
 	return false
-}
-
-func normalizeLocalPath(value string) string {
-	trimmed := strings.TrimSpace(value)
-	if strings.HasPrefix(trimmed, "file://") {
-		if parsed, err := url.Parse(trimmed); err == nil {
-			if parsed.Path != "" {
-				return filepath.Clean(strings.TrimPrefix(parsed.Path, "/"))
-			}
-		}
-		trimmed = strings.TrimPrefix(trimmed, "file://")
-	}
-	return filepath.Clean(trimmed)
 }
 
 func buildChatCompletion(result InferenceResult, modelID string, includeTrace bool) map[string]any {

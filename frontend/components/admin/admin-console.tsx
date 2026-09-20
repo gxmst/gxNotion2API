@@ -21,7 +21,7 @@ import { ACCENT_THEME_OPTIONS, useAccentTheme } from '@/components/layout/theme-
 import { LoginOverlay } from '@/components/admin/login-overlay';
 import { ModelsPanel } from '@/components/admin/models-panel';
 import { SettingsPanel } from '@/components/admin/settings-panel';
-import { TesterPanel } from '@/components/admin/tester-panel';
+import { ChatWorkspace } from '@/components/admin/chat-workspace';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -46,7 +46,7 @@ const TAB_LABEL: Record<TabKey, string> = {
 
 export function AdminConsole() {
   const consoleState = useAdminConsole();
-  const [activeTab, setActiveTab] = useState<TabKey>('dashboard');
+  const [activeTab, setActiveTab] = useState<TabKey>('tester');
   const [resumeConversationID, setResumeConversationID] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
@@ -102,22 +102,7 @@ export function AdminConsole() {
 
   const renderActivePanel = () => {
     switch (activeTab) {
-      case 'tester':
-        return (
-          <TesterPanel
-            models={models}
-            defaultModel={defaultModel}
-            defaultWebSearch={defaultWebSearch}
-            initialConversationID={resumeConversationID}
-            onResumeHandled={() => setResumeConversationID('')}
-            onLoad={(id) => services.getConversation(id, true)}
-            onRun={async (payload, onDelta, signal) => {
-              const result = await services.streamTestPrompt(payload, onDelta, signal);
-              void loadConversations().catch(() => undefined);
-              return result;
-            }}
-          />
-        );
+      case 'tester': return null;
       case 'conversations':
         return (
           <ConversationsPanel
@@ -168,6 +153,7 @@ export function AdminConsole() {
             models={models}
             defaultModel={defaultModel}
             onRefresh={refreshAccounts}
+            onRefreshWorkspaces={async (email) => { await services.refreshWorkspaces(email); await refreshAccounts(); await refreshConfigBundle(); }}
             onStartLogin={async (email) => {
               const payload = await services.startAccountLogin(email);
               await refreshAccounts();
@@ -222,7 +208,7 @@ export function AdminConsole() {
     }
   };
 
-  if (bootLoading && !verify) {
+  if (bootLoading && (!verify || (authenticated && !configPayload))) {
     return (
       <main className="console-surface flex min-h-screen items-center justify-center px-4 py-8">
         <div className="orb orb-indigo orb-animate left-[10%] top-[16%] h-72 w-72" />
@@ -249,8 +235,25 @@ export function AdminConsole() {
   }
 
   return (
-    <main className="console-surface">
-      <div className="flex min-h-screen min-w-0">
+    <main className={activeTab === 'tester' ? 'chat-root' : 'console-surface'}>
+      {authenticated && configPayload ? <div hidden={activeTab !== 'tester'}>
+        <ChatWorkspace models={models} defaultModel={defaultModel} defaultWebSearch={defaultWebSearch}
+          initialConversationID={resumeConversationID} onResumeHandled={() => setResumeConversationID('')}
+          conversations={conversations} accounts={accountsPayload?.items || []}
+          onNavigate={setActiveTab} visible={activeTab === 'tester'}
+          onLoad={(id) => services.getConversation(id, true)}
+          onRun={async (payload, onDelta, signal) => {
+            try { return await services.streamTestPrompt(payload, onDelta, signal); }
+            finally { void loadConversations().catch(() => undefined); }
+          }} />
+      </div> : null}
+      {authenticated && !configPayload && activeTab === 'tester' ? (
+        <div className="flex min-h-dvh flex-col items-center justify-center gap-4 p-6">
+          <p role="alert">{bootError || '暂时无法加载聊天配置'}</p>
+          <Button onClick={() => void refreshAll()}>重新加载</Button>
+        </div>
+      ) : null}
+      <div className={activeTab === 'tester' ? 'hidden' : 'flex min-h-screen min-w-0'}>
         <AdminSidebar
           activeTab={activeTab}
           onTabChange={setActiveTab}

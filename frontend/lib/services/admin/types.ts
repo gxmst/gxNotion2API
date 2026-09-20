@@ -146,6 +146,9 @@ export interface HealthPayload {
 }
 
 export interface AccountItem {
+  credential_cooldown_until?: string;
+  credential_cooldown_active?: boolean;
+  account_max_concurrency?: number;
   email?: string;
   active?: boolean;
   disabled?: boolean;
@@ -194,6 +197,9 @@ export interface AccountItem {
 }
 
 export interface WorkspaceItem {
+  ai_disabled?: boolean;
+  eligible?: boolean;
+  eligibility_reason?: string;
   id: string;
   view_id?: string;
   name?: string;
@@ -277,6 +283,8 @@ export interface AIUsageReport {
 export interface AIUsagePayload { accounts: AIUsageReport[]; ttl_seconds: number }
 
 export interface ChatRunInput {
+  account_email?: string;
+  workspace_id?: string;
   prompt: string;
   model: string;
   use_web_search: boolean;

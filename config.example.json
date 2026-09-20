@@ -54,7 +54,7 @@
     "writer_mode": false,
     "enable_generate_image": true,
     "enable_csv_attachment_support": true,
-    "conversation_idle_ttl_hours": 24,
+    "conversation_idle_ttl_hours": 0,
     "ephemeral_all_conversations": false,
     "use_surf_main_transport": true,
     "allow_native_transport_fallback": false,
@@ -79,7 +79,8 @@
     "auto_switch_account": true
   },
   "dispatch": {
-    "probe_cache_ttl_seconds": 45
+    "probe_cache_ttl_seconds": 45,
+    "account_max_concurrency": 1
   },
   "browser": {
     "helper_pool_size": 0

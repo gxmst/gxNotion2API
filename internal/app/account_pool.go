@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -16,7 +17,7 @@ const (
 	// upstream confirmed its workspace AI allowance is spent. Notion's
 	// reset time is not present in the captured response. This is a local retry
 	// backoff, independent of Notion's six-hour and monthly allowance windows.
-	accountQuotaExhaustedCooldown = time.Hour
+	accountQuotaExhaustedCooldown = 6 * time.Hour
 )
 
 func parseOptionalRFC3339(value string) time.Time {
@@ -77,6 +78,12 @@ func accountDispatchEligible(cfg AppConfig, account NotionAccount, now time.Time
 	account = ensureAccountPaths(cfg, account)
 	if account.Disabled {
 		return false, "disabled"
+	}
+	if parseOptionalRFC3339(account.CredentialCooldownUntil).After(now) {
+		return false, "credential_cooldown"
+	}
+	if eligible, reason := accountWorkspaceEligibility(account); !eligible {
+		return false, reason
 	}
 	if !accountHasUsableArtifacts(cfg, account) {
 		return false, "missing_artifacts"
@@ -177,6 +184,10 @@ func markAccountDispatchFailure(account NotionAccount, now time.Time, err error,
 	// incremented; without it a failing account stayed immediately dispatchable
 	// and the recorded status never matched the dispatch behaviour.
 	account.CooldownUntil = formatRFC3339OrEmpty(now.Add(computeAccountCooldown(account, retryable)))
+	var apiErr *notionAPIError
+	if errors.As(err, &apiErr) && apiErr.RetryAfter.After(parseOptionalRFC3339(account.CooldownUntil)) {
+		account.CooldownUntil = formatRFC3339OrEmpty(apiErr.RetryAfter)
+	}
 	return account
 }
 
@@ -202,6 +213,11 @@ func sortDispatchCandidates(cfg AppConfig, accounts []NotionAccount, now time.Ti
 		rightActive := rightKey == activeKey
 		if leftActive != rightActive {
 			return leftActive
+		}
+		leftPreferred := accountWorkspaceID(left) == preferredAccountWorkspaceID(cfg, left)
+		rightPreferred := accountWorkspaceID(right) == preferredAccountWorkspaceID(cfg, right)
+		if leftPreferred != rightPreferred {
+			return leftPreferred
 		}
 		if left.Priority != right.Priority {
 			return left.Priority > right.Priority
@@ -355,7 +371,15 @@ func (a *App) runPromptWithSessionWithSink(ctx context.Context, cfg AppConfig, s
 // their backing arrays, so writing an entry into a snapshot's slice in place
 // would leak the change into every other reader of that snapshot.
 func cloneAccounts(accounts []NotionAccount) []NotionAccount {
-	return append([]NotionAccount(nil), accounts...)
+	if accounts == nil {
+		return nil
+	}
+	cloned := make([]NotionAccount, len(accounts))
+	copy(cloned, accounts)
+	for i := range cloned {
+		cloned[i].Workspaces = append([]NotionWorkspace(nil), accounts[i].Workspaces...)
+	}
+	return cloned
 }
 
 // mergeSessionMetadataWithoutOverwritingConfig folds session-reported metadata
@@ -507,14 +531,26 @@ func (s *ServerState) finishWorkspaceDispatchFailure(email string, workspaceID s
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
 	cfg, _, _ := s.Snapshot()
-	account, index, ok := cfg.FindAccountWorkspace(email, workspaceID)
+	parent, index, ok := cfg.FindAccount(email)
 	if !ok {
 		return nil
 	}
-	account = markAccountDispatchFailure(account, now, dispatchErr, retryable)
+	account, workspaceExists := accountForWorkspace(parent, workspaceID)
+	until := credentialBackoff(dispatchErr, now)
+	if !workspaceExists && until.IsZero() {
+		return nil
+	}
 	cfg.Accounts = cloneAccounts(cfg.Accounts)
-	parent := cfg.Accounts[index]
-	setAccountWorkspace(&parent, workspaceFromAccountFields(account))
+	parent = cfg.Accounts[index]
+	// Removing a workspace while its request is in flight does not remove
+	// the upstream backoff imposed on the shared credential.
+	if until.After(parseOptionalRFC3339(parent.CredentialCooldownUntil)) {
+		parent.CredentialCooldownUntil = formatRFC3339OrEmpty(until)
+	}
+	if workspaceExists {
+		account = markAccountDispatchFailure(account, now, dispatchErr, retryable)
+		setAccountWorkspace(&parent, workspaceFromAccountFields(account))
+	}
 	cfg.Accounts[index] = normalizeAccountWorkspaces(parent)
 	return s.saveAndApplyCommitted(cfg)
 }
@@ -554,7 +590,15 @@ func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount,
 	}
 	live.Accounts = cloneAccounts(live.Accounts)
 	parent := live.Accounts[index]
-	setAccountWorkspace(&parent, workspaceFromAccountFields(refreshed))
+	workspace := workspaceFromAccountFields(refreshed)
+	// Session refresh does not discover subscription entitlements. Keep the
+	// latest metadata, including any revocation published while it ran.
+	if currentWorkspace, ok := accountWorkspace(parent, workspaceID); ok {
+		workspace.SubscriptionTier = currentWorkspace.SubscriptionTier
+		workspace.AIEnabled = currentWorkspace.AIEnabled
+		workspace.AIDisabled = currentWorkspace.AIDisabled
+	}
+	setAccountWorkspace(&parent, workspace)
 	live.Accounts[index] = normalizeAccountWorkspaces(parent)
 	wasActive := canonicalEmailKey(live.ActiveAccount) == canonicalEmailKey(refreshed.Email)
 	makeActive := canonicalEmailKey(refreshedCfg.ActiveAccount) == canonicalEmailKey(refreshed.Email) &&

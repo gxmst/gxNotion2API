@@ -120,10 +120,9 @@ const (
 	sillyTavernQuietConversationTTL       = 10 * time.Minute
 	defaultConfigEphemeralConversationTTL = 2 * time.Minute
 	// Conversations idle this long are swept along with their upstream thread.
-	// Long enough that a normal chat resumed the next day still reuses its
-	// thread (and so still hits the upstream prompt cache), short enough that
-	// finished conversations do not accumulate in the workspace indefinitely.
-	defaultConversationIdleTTLHours = 24
+	// Keep ordinary conversations until explicitly deleted. Operators can opt
+	// into idle cleanup; ephemeral conversations retain their separate policy.
+	defaultConversationIdleTTLHours = 0
 	corsAllowOrigin                 = "*"
 	corsAllowHeaders                = "Authorization, Content-Type, X-Admin-Token"
 	corsAllowMethods                = "GET, POST, PUT, DELETE, OPTIONS"
@@ -198,6 +197,13 @@ func (s *ServerState) rebuildAccountSlotsLocked() {
 	}
 	next := make(map[string]*accountSlot, len(s.Config.Accounts))
 	for _, account := range s.Config.Accounts {
+		credentialKey := credentialSlotKey(account.Email)
+		credential := previous[credentialKey]
+		if credential == nil {
+			credential = &accountSlot{}
+		}
+		credential.max.Store(int32(normalizeAccountMaxConcurrency(s.Config.Dispatch.AccountMaxConcurrency)))
+		next[credentialKey] = credential
 		for _, candidate := range accountWorkspaceCandidates(account) {
 			key := dispatchWorkspaceKey(candidate)
 			if key == "" {
@@ -266,6 +272,10 @@ func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string
 }
 
 func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
+	return s.tryAcquireWorkspaceDispatchSlot(email, workspaceID, false)
+}
+
+func (s *ServerState) tryAcquireWorkspaceDispatchSlot(email string, workspaceID string, forRetry bool) bool {
 	if s == nil {
 		return false
 	}
@@ -277,7 +287,24 @@ func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID 
 	if !ok {
 		return false
 	}
-	return s.tryAcquireDispatchSlotKeyLocked(dispatchWorkspaceKey(account))
+	if forRetry {
+		// The first attempt already consumed the logical request's quota.
+		// Recheck mutable admission rules without charging it a second time.
+		eligible, _ := accountWorkspaceEligibility(account)
+		now := time.Now()
+		if account.Disabled || !eligible || accountCooldownActive(account, now) || parseOptionalRFC3339(account.CredentialCooldownUntil).After(now) {
+			return false
+		}
+	}
+	credentialKey := credentialSlotKey(email)
+	if !s.tryAcquireDispatchSlotKeyLocked(credentialKey) {
+		return false
+	}
+	if !s.tryAcquireDispatchSlotKeyLocked(dispatchWorkspaceKey(account)) {
+		s.releaseDispatchSlotKeyLocked(credentialKey)
+		return false
+	}
+	return true
 }
 
 // The caller holds s.mu for reading or writing through the entire acquisition.
@@ -308,7 +335,10 @@ func (s *ServerState) tryAcquireDispatchSlotKeyLocked(key string) bool {
 
 func (s *ServerState) ReleaseAccountDispatchSlot(email string) {
 	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
+	account, _, ok := cfg.ResolveActiveAccount()
+	if !ok || canonicalEmailKey(account.Email) != canonicalEmailKey(email) {
+		account, _, ok = cfg.FindAccount(email)
+	}
 	if !ok {
 		return
 	}
@@ -316,41 +346,47 @@ func (s *ServerState) ReleaseAccountDispatchSlot(email string) {
 }
 
 func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID string) {
-	if key, ok := s.workspaceSlotKey(email, workspaceID); ok {
-		s.releaseDispatchSlotKey(key)
+	if s == nil || canonicalEmailKey(email) == "" {
 		return
 	}
-	// Removed workspaces retain their slot until in-flight requests drain.
-	// Return it using the original workspace identity, even without a config entry.
-	if emailKey := canonicalEmailKey(email); emailKey != "" {
-		if workspaceID = strings.TrimSpace(workspaceID); workspaceID != "" {
-			if key := emailKey + "\x00" + workspaceID; s.loadAccountSlots()[key] != nil {
-				s.releaseDispatchSlotKey(key)
-			}
+	key := canonicalEmailKey(email)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if workspaceID = strings.TrimSpace(workspaceID); workspaceID == "" {
+		if account, _, ok := s.Config.FindAccountWorkspace(email, ""); ok {
+			workspaceID = accountWorkspaceID(account)
 		}
+	}
+	if workspaceID != "" {
+		key += "\x00" + workspaceID
+	}
+	if s.releaseDispatchSlotKeyLocked(key) {
+		s.releaseDispatchSlotKeyLocked(credentialSlotKey(email))
 	}
 }
 
 func (s *ServerState) releaseDispatchSlotKey(key string) {
-	key = strings.TrimSpace(key)
-	if s == nil || key == "" {
+	if s == nil {
 		return
 	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	s.releaseDispatchSlotKeyLocked(key)
+}
+
+func (s *ServerState) releaseDispatchSlotKeyLocked(key string) bool {
 	slot := s.loadAccountSlots()[key]
 	if slot == nil {
-		return
+		return false
 	}
 	for {
 		inflight := slot.inflight.Load()
 		if inflight <= 0 {
-			setDispatchSlotInflight(key, 0)
-			return
+			return false
 		}
 		if slot.inflight.CompareAndSwap(inflight, inflight-1) {
 			setDispatchSlotInflight(key, int(inflight-1))
-			return
+			return true
 		}
 	}
 }
@@ -1321,13 +1357,16 @@ func firstRequestValue(r *http.Request, keys ...string) string {
 
 // Without an explicit client identity, connection traits must also scope the
 // history fallback. Otherwise ordinary clients all share an empty client key.
-func requestClientContinuationScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
+func requestClientContinuationScope(r *http.Request, profile string, session string, transport string, model string, account string, workspace string) string {
 	parts := []string{
 		"profile=" + strings.TrimSpace(profile),
 		"session=" + strings.TrimSpace(session),
 		"transport=" + strings.TrimSpace(transport),
 		"model=" + strings.TrimSpace(model),
 		"account=" + canonicalEmailKey(account),
+	}
+	if workspace = strings.TrimSpace(workspace); workspace != "" {
+		parts = append(parts, "workspace="+workspace)
 	}
 	if r != nil {
 		clientID := firstRequestValue(r, "X-Client-ID", "X-Session-ID", "OpenAI-Organization")
@@ -1341,8 +1380,8 @@ func requestClientContinuationScope(r *http.Request, profile string, session str
 
 // Explicit client identities can recover through the history fallback after a
 // connection change; fingerprints still include the current connection traits.
-func requestClientFingerprintScope(r *http.Request, profile string, session string, transport string, model string, account string) string {
-	scope := requestClientContinuationScope(r, profile, session, transport, model, account)
+func requestClientFingerprintScope(r *http.Request, profile string, session string, transport string, model string, account string, workspace string) string {
+	scope := requestClientContinuationScope(r, profile, session, transport, model, account, workspace)
 	if r == nil || firstRequestValue(r, "X-Client-ID", "X-Session-ID", "OpenAI-Organization") == "" {
 		return scope
 	}
@@ -1707,7 +1746,7 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 		return continuationTarget{}, false
 	}
 	if previousResponseID != "" {
-		if stored, ok := a.State.getStoredResponse(previousResponseID); ok {
+		if stored, ok := a.State.getContinuationResponse(previousResponseID); ok {
 			if stored.ConversationID != "" {
 				if entry, found := a.State.conversations().Get(stored.ConversationID); found && strings.TrimSpace(entry.ThreadID) != "" {
 					if strings.TrimSpace(entry.AccountEmail) == "" {
@@ -2141,8 +2180,8 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
-	continuationScope := requestClientContinuationScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount)
-	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
+	continuationScope := requestClientContinuationScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount, requestedWorkspace)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "chat_completions", entry.ID, requestedAccount, requestedWorkspace), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
@@ -2252,8 +2291,8 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 
 	requestedAccount := requestedAccountEmail(r, payload)
 	requestedWorkspace := requestedWorkspaceID(r, strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), payload["metadata"])
-	continuationScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount)
-	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount), ctx.StableHidden, ctx.RequestSegments)
+	continuationScope := requestClientContinuationScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount, requestedWorkspace)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "sillytavern", ctx.ProfileKey, "chat_completions", entry.ID, requestedAccount, requestedWorkspace), ctx.StableHidden, ctx.RequestSegments)
 	originalRawMessageCount := sessionRawMessageCount(ctx.RequestSegments)
 	request := PromptRunRequest{
 		Prompt:             ctx.Normalized.Prompt,
@@ -2383,6 +2422,9 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		var ok bool
 		previousResponse, ok = a.State.getResponse(previousResponseID)
 		if !ok {
+			_, ok = a.State.getContinuationResponse(previousResponseID)
+		}
+		if !ok {
 			writeOpenAIError(w, http.StatusNotFound, "response not found", "invalid_request_error", "response_not_found")
 			return
 		}
@@ -2411,8 +2453,8 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	hiddenPrompt := strings.TrimSpace(normalized.HiddenPrompt)
 	promptText := normalized.Prompt
 	latestPrompt := resolveRequestPromptForContinuation(normalized)
-	continuationScope := requestClientContinuationScope(r, "openai", "", "responses", entry.ID, requestedAccount)
-	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "responses", entry.ID, requestedAccount), hiddenPrompt, normalized.Segments)
+	continuationScope := requestClientContinuationScope(r, "openai", "", "responses", entry.ID, requestedAccount, requestedWorkspace)
+	originalFingerprint := canonicalConversationFingerprintScoped(requestClientFingerprintScope(r, "openai", "", "responses", entry.ID, requestedAccount, requestedWorkspace), hiddenPrompt, normalized.Segments)
 	originalRawMessageCount := sessionRawMessageCount(normalized.Segments)
 	request := PromptRunRequest{
 		Prompt:             promptText,
@@ -2503,6 +2545,14 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) writeUpstreamError(w http.ResponseWriter, err error) {
+	var apiErr *notionAPIError
+	if errors.As(err, &apiErr) && apiErr.StatusCode == http.StatusTooManyRequests {
+		if !apiErr.RetryAfter.IsZero() {
+			w.Header().Set("Retry-After", apiErr.RetryAfter.UTC().Format(http.TimeFormat))
+		}
+		writeOpenAIError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error", "upstream_rate_limited")
+		return
+	}
 	message := err.Error()
 	lower := strings.ToLower(message)
 	if isDispatchCapacityExceededError(err) {

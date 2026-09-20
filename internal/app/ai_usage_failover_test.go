@@ -272,8 +272,8 @@ func TestDispatchPoolFailsOverContinuationOnQuotaExhausted(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-key"
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
-		{Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
+		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
+		{PlanType: "business", Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
 	}
 	state, err := newServerState(cfg)
 	if err != nil {
@@ -350,8 +350,8 @@ func TestDispatchPoolFailoverDisabledByFeature(t *testing.T) {
 	enabled := false
 	cfg.Features.ContinuationFailover = &enabled
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
-		{Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
+		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
+		{PlanType: "business", Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
 	}
 	state, err := newServerState(cfg)
 	if err != nil {
@@ -391,8 +391,8 @@ func TestDispatchPoolFailoverOnlyForQuotaErrors(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-key"
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
-		{Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
+		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
+		{PlanType: "business", Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
 	}
 	state, err := newServerState(cfg)
 	if err != nil {
@@ -434,7 +434,7 @@ func TestDispatchPoolFailoverPreservesQuotaErrorWithoutBackup(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-key"
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
+		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
 	}
 	state, err := newServerState(cfg)
 	if err != nil {
@@ -475,8 +475,8 @@ func TestDispatchPoolFailoverStreamVariant(t *testing.T) {
 	cfg := defaultConfig()
 	cfg.APIKey = "test-key"
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
-		{Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
+		{PlanType: "business", Email: "primary@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary"), SpaceID: "space-primary"},
+		{PlanType: "business", Email: "backup@example.com", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup"), SpaceID: "space-backup"},
 	}
 	state, err := newServerState(cfg)
 	if err != nil {

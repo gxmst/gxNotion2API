@@ -112,7 +112,7 @@ func streamRequestTimeout(cfg AppConfig) time.Duration {
 var errNoEligibleAccounts = errors.New("no usable accounts available")
 
 func noEligibleAccountsError() error {
-	return fmt.Errorf("%w; check disabled state, local artifacts, or login status", errNoEligibleAccounts)
+	return fmt.Errorf("%w; check Business workspace eligibility, disabled state, cooldown, local artifacts, or login status", errNoEligibleAccounts)
 }
 
 func isNoEligibleAccountsError(err error) bool {
@@ -184,9 +184,15 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 		}
 		return poolCandidates, nil
 	}
+	selectedWorkspace := pinnedWorkspace
+	if selectedWorkspace == "" {
+		if account, _, ok := cfg.FindAccount(pinnedEmail); ok {
+			selectedWorkspace = preferredAccountWorkspaceID(cfg, account)
+		}
+	}
 	if request.AllowPinnedAccountFallback {
 		var preferred *NotionAccount
-		if account, _, ok := cfg.FindAccountWorkspace(pinnedEmail, pinnedWorkspace); ok {
+		if account, _, ok := cfg.FindAccountWorkspace(pinnedEmail, selectedWorkspace); ok {
 			account = ensureAccountPaths(cfg, account)
 			if eligible, _ := accountDispatchEligible(cfg, account, now); eligible {
 				preferred = &account
@@ -198,7 +204,7 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 		}
 		return candidates, nil
 	}
-	account, _, ok := cfg.FindAccountWorkspace(pinnedEmail, pinnedWorkspace)
+	account, _, ok := cfg.FindAccountWorkspace(pinnedEmail, selectedWorkspace)
 	if !ok {
 		// The account existing but its pinned workspace being gone (a removed
 		// or expired workspace) is a different problem from a missing account
@@ -210,6 +216,13 @@ func resolveDispatchCandidatesWithPool(cfg AppConfig, poolCandidates []NotionAcc
 	}
 	account = ensureAccountPaths(cfg, account)
 	if eligible, reason := accountDispatchEligible(cfg, account, now); !eligible {
+		if reason == "credential_cooldown" {
+			return nil, &notionAPIError{
+				StatusCode: http.StatusTooManyRequests,
+				RetryAfter: parseOptionalRFC3339(account.CredentialCooldownUntil),
+				Message:    "account is paused after upstream rate limiting or trust rejection",
+			}
+		}
 		if reason == "cooldown" {
 			if quotaErr := accountQuotaCooldownError(account, now); quotaErr != nil {
 				return nil, quotaErr
@@ -560,7 +573,7 @@ func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRun
 func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
 	cfg, _, _ := a.State.Snapshot()
 	if len(cfg.Accounts) == 0 {
-		return a.runPromptActiveFallback(r, request, onDelta)
+		return InferenceResult{}, noEligibleAccountsError()
 	}
 
 	timeout := requestTimeout(cfg)
@@ -645,6 +658,20 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			}
 			err = runErr
 		}
+		if !isDispatchContextAbort(ctx, err) && !credentialBackoff(err, time.Now()).IsZero() {
+			// Publish account-wide backoff before releasing capacity, so another
+			// workspace cannot start while this credential is being paused.
+			saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, false)
+			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+			if saveErr != nil {
+				return InferenceResult{}, fmt.Errorf("%w; saving account cooldown: %v", err, saveErr)
+			}
+			lastErr = fmt.Errorf("%s: %w", account.Email, err)
+			if emittedAny {
+				return InferenceResult{}, lastErr
+			}
+			continue
+		}
 		if slotAcquired {
 			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			slotAcquired = false
@@ -664,26 +691,22 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 					if ok {
 						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
 						if loadErr == nil {
-							if !a.State.TryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID) {
+							if !a.State.tryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID, true) {
 								err = noDispatchCapacityError()
 								retryable = false
 							} else {
-								retrySlotAcquired := true
+								slotAcquired = true
 								result, retryErr := a.runPromptWithSession(ctx, cfg, refreshedSession, refreshedAccount.Email, request, wrappedDelta)
 								if retryErr == nil {
-									if retrySlotAcquired {
+									if slotAcquired {
 										a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-										retrySlotAcquired = false
+										slotAcquired = false
 									}
 									result.AccountEmail = refreshedAccount.Email
 									if saveErr := a.State.finishWorkspaceDispatchSuccess(refreshedAccount.Email, workspaceID, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
 										return InferenceResult{}, saveErr
 									}
 									return result, nil
-								}
-								if retrySlotAcquired {
-									a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-									retrySlotAcquired = false
 								}
 								err = retryErr
 								retryable = isSessionRetryableError(err)
@@ -700,6 +723,9 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			}
 		}
 		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+			if slotAcquired {
+				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+			}
 			return InferenceResult{}, err
 		}
 
@@ -715,7 +741,13 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 			}
 		}
 
-		_ = a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
+		saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
+		if slotAcquired {
+			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+		}
+		if saveErr != nil {
+			return InferenceResult{}, fmt.Errorf("%w; saving account failure: %v", err, saveErr)
+		}
 		lastErr = fmt.Errorf("%s: %w", account.Email, err)
 		if emittedAny {
 			return InferenceResult{}, lastErr
@@ -736,7 +768,7 @@ func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest
 func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
 	cfg, _, _ := a.State.Snapshot()
 	if len(cfg.Accounts) == 0 {
-		return a.runPromptActiveFallbackWithSink(r, request, sink)
+		return InferenceResult{}, noEligibleAccountsError()
 	}
 
 	timeout := streamRequestTimeout(cfg)
@@ -832,6 +864,19 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			}
 			err = runErr
 		}
+		if !isDispatchContextAbort(ctx, err) && !credentialBackoff(err, time.Now()).IsZero() {
+			// Keep the shared credential slot until its cooldown is committed.
+			saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, false)
+			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+			if saveErr != nil {
+				return InferenceResult{}, fmt.Errorf("%w; saving account cooldown: %v", err, saveErr)
+			}
+			lastErr = fmt.Errorf("%s: %w", account.Email, err)
+			if emittedAny {
+				return InferenceResult{}, lastErr
+			}
+			continue
+		}
 		if slotAcquired {
 			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
 			slotAcquired = false
@@ -850,11 +895,11 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 					if refreshedAccount, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
 						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
 						if loadErr == nil {
-							if !a.State.TryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID) {
+							if !a.State.tryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID, true) {
 								err = noDispatchCapacityError()
 								retryable = false
 							} else {
-								retrySlotAcquired := true
+								slotAcquired = true
 								result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshedSession, refreshedAccount.Email, request, InferenceStreamSink{
 									Text:            wrappedText,
 									Reasoning:       wrappedReasoning,
@@ -862,19 +907,15 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 									KeepAlive:       wrappedKeepAlive,
 								})
 								if retryErr == nil {
-									if retrySlotAcquired {
+									if slotAcquired {
 										a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-										retrySlotAcquired = false
+										slotAcquired = false
 									}
 									result.AccountEmail = refreshedAccount.Email
 									if saveErr := a.State.finishWorkspaceDispatchSuccess(refreshedAccount.Email, workspaceID, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
 										return InferenceResult{}, saveErr
 									}
 									return result, nil
-								}
-								if retrySlotAcquired {
-									a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-									retrySlotAcquired = false
 								}
 								err = retryErr
 								retryable = isSessionRetryableError(err)
@@ -891,6 +932,9 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			}
 		}
 		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) {
+			if slotAcquired {
+				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+			}
 			return InferenceResult{}, err
 		}
 
@@ -906,7 +950,13 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 			}
 		}
 
-		_ = a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
+		saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
+		if slotAcquired {
+			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
+		}
+		if saveErr != nil {
+			return InferenceResult{}, fmt.Errorf("%w; saving account failure: %v", err, saveErr)
+		}
 		lastErr = fmt.Errorf("%s: %w", account.Email, err)
 		if emittedAny {
 			return InferenceResult{}, lastErr

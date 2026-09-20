@@ -100,6 +100,7 @@ func TestDispatchCandidatesFilterByWorkspaceAcrossAccounts(t *testing.T) {
 
 func TestWorkspaceDispatchSlotsAreIndependent(t *testing.T) {
 	cfg := defaultConfig()
+	cfg.Dispatch.AccountMaxConcurrency = 2
 	cfg.APIKey = "test-key"
 	cfg.Storage.SQLitePath = ""
 	cfg.Accounts = []NotionAccount{{
@@ -261,6 +262,7 @@ func workspaceSlotTestState(t *testing.T, workspaces []NotionWorkspace) *ServerS
 
 func workspaceSlotTestConfig(workspaces []NotionWorkspace) AppConfig {
 	cfg := defaultConfig()
+	cfg.Dispatch.AccountMaxConcurrency = 4
 	cfg.APIKey = "test-key"
 	cfg.Storage.SQLitePath = ""
 	cfg.Accounts = []NotionAccount{{

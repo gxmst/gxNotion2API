@@ -20,8 +20,8 @@ func newConversationRequestTestApp(t *testing.T) *App {
 	cfg.Admin.Password = "test-admin-password"
 	cfg.Storage.SQLitePath = filepath.Join(dir, "state.db")
 	cfg.Accounts = []NotionAccount{
-		{Email: "primary@example.com", SpaceID: "space-primary", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary")},
-		{Email: "backup@example.com", SpaceID: "space-backup", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup")},
+		{PlanType: "business", Email: "primary@example.com", SpaceID: "space-primary", ProbeJSON: writeSyntheticProbeFile(t, dir, "primary@example.com", "space-primary")},
+		{PlanType: "business", Email: "backup@example.com", SpaceID: "space-backup", ProbeJSON: writeSyntheticProbeFile(t, dir, "backup@example.com", "space-backup")},
 	}
 	cfg.ActiveAccount = "primary@example.com"
 	state, err := newServerState(cfg)

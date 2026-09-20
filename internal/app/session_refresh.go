@@ -19,11 +19,14 @@ func sessionRefreshNowISO() string {
 }
 
 func isSessionRetryableError(err error) bool {
-	if err == nil {
+	if err == nil || isTrustRuleDeniedInferenceError(err) {
 		return false
 	}
 	var apiErr *notionAPIError
 	if errors.As(err, &apiErr) {
+		if apiErr.StatusCode == http.StatusTooManyRequests {
+			return false
+		}
 		if apiErr.StatusCode == http.StatusUnauthorized || apiErr.StatusCode == http.StatusForbidden {
 			return true
 		}

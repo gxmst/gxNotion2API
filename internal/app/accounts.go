@@ -343,6 +343,7 @@ func (cfg *AppConfig) UpsertAccountRuntimeState(account NotionAccount) (NotionAc
 }
 
 func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) {
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
 	rawSpaceID := strings.TrimSpace(account.SpaceID)
 	rawSpaceViewID := strings.TrimSpace(account.SpaceViewID)
 	rawSpaceName := strings.TrimSpace(account.SpaceName)
@@ -467,6 +468,9 @@ func (cfg *AppConfig) UpsertAccount(account NotionAccount) (NotionAccount, int) 
 		if account.CooldownUntil != "" {
 			merged.CooldownUntil = account.CooldownUntil
 		}
+		if parseOptionalRFC3339(account.CredentialCooldownUntil).After(parseOptionalRFC3339(merged.CredentialCooldownUntil)) {
+			merged.CredentialCooldownUntil = account.CredentialCooldownUntil
+		}
 		if account.WindowStartedAt != "" {
 			merged.WindowStartedAt = account.WindowStartedAt
 		}
@@ -546,6 +550,7 @@ func (cfg *AppConfig) DeleteAccount(email string) bool {
 	if !ok {
 		return false
 	}
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
 	cfg.Accounts = append(cfg.Accounts[:index], cfg.Accounts[index+1:]...)
 	if canonicalEmailKey(cfg.ActiveAccount) == target {
 		cfg.ActiveAccount = ""

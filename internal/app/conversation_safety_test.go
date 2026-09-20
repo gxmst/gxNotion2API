@@ -13,10 +13,10 @@ func TestConversationFingerprintIsScopedByClientModelAndAccount(t *testing.T) {
 	reqB := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	reqB.Header.Set("User-Agent", "client-b")
 
-	scopeA := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-a", "a@example.com")
-	scopeB := requestClientFingerprintScope(reqB, "openai", "", "chat_completions", "model-a", "a@example.com")
-	scopeOtherModel := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-b", "a@example.com")
-	scopeOtherAccount := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-a", "b@example.com")
+	scopeA := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-a", "a@example.com", "")
+	scopeB := requestClientFingerprintScope(reqB, "openai", "", "chat_completions", "model-a", "a@example.com", "")
+	scopeOtherModel := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-b", "a@example.com", "")
+	scopeOtherAccount := requestClientFingerprintScope(reqA, "openai", "", "chat_completions", "model-a", "b@example.com", "")
 
 	fingerprint := canonicalConversationFingerprintScoped(scopeA, "", segments)
 	for name, other := range map[string]string{

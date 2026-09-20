@@ -41,6 +41,9 @@ export const AdminService = {
   getAccounts() {
     return apiFetch<AccountsPayload>('/admin/accounts');
   },
+  refreshWorkspaces(email: string) {
+    return apiFetch<AccountsPayload>('/admin/accounts/refresh-workspaces', { method: 'POST', body: JSON.stringify({ email }) });
+  },
   getAIUsage(refresh = false) {
     return apiFetch<AIUsagePayload>(`/admin/accounts/ai-usage${refresh ? '?refresh=1' : ''}`);
   },

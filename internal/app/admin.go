@@ -917,6 +917,8 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.handleAdminAccountsTest(w, r)
 	case r.URL.Path == "/admin/accounts/refresh-models":
 		a.handleAdminAccountsRefreshModels(w, r)
+	case r.URL.Path == "/admin/accounts/refresh-workspaces":
+		a.handleAdminWorkspaceRefresh(w, r)
 	case r.URL.Path == "/admin/accounts/ai-usage":
 		a.handleAdminAccountsAIUsage(w, r)
 	case r.URL.Path == "/admin/accounts/login/start":

@@ -231,6 +231,7 @@ export function AccountsPanel({
   models,
   defaultModel,
   onRefresh,
+  onRefreshWorkspaces,
   onStartLogin,
   onVerifyCode,
   onImportAccount,
@@ -243,6 +244,7 @@ export function AccountsPanel({
   models: ModelItem[];
   defaultModel?: string;
   onRefresh: () => Promise<unknown>;
+  onRefreshWorkspaces: (email: string) => Promise<unknown>;
   onStartLogin: (email: string) => Promise<unknown>;
   onVerifyCode: (email: string, code: string) => Promise<unknown>;
   onImportAccount: (payload: JsonResult) => Promise<unknown>;
@@ -261,6 +263,7 @@ export function AccountsPanel({
   const [startEmail, setStartEmail] = useState('');
   const [startMessage, setStartMessage] = useState('');
   const [starting, setStarting] = useState(false);
+  const [refreshingWorkspaces, setRefreshingWorkspaces] = useState(false);
 
   const [verifyEmail, setVerifyEmail] = useState('');
   const [verifyCode, setVerifyCode] = useState('');
@@ -876,6 +879,8 @@ export function AccountsPanel({
                     <Subsection eyebrow="Runtime" title="运行态摘要" description="最近登录、使用与失败记录。">
                       <div className="grid gap-3 sm:grid-cols-2">
                         <MetaTile label="本地请求限速" value={quotaText(selectedWorkspace || selectedAccount)} />
+                        <MetaTile label="账号总并发上限" value={selectedAccount.account_max_concurrency || 1} />
+                        {selectedAccount.credential_cooldown_active ? <MetaTile label="账号暂停至" value={formatMaybeDate(selectedAccount.credential_cooldown_until)} /> : null}
                           <MetaTile
                             label="Cooldown"
                             value={selectedWorkspace?.cooldown_active ? `${selectedWorkspace.cooldown_remaining_sec || 0}s` : 'ready'}
@@ -905,6 +910,13 @@ export function AccountsPanel({
                   </div>
 
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+                    <Button variant="outline" disabled={refreshingWorkspaces || selectedAccount.credential_cooldown_active} onClick={async () => {
+                      setRefreshingWorkspaces(true);
+                      try { await onRefreshWorkspaces(selectedAccount.email || ''); toast.success('已刷新工作区套餐'); }
+                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
+                      finally { setRefreshingWorkspaces(false); }
+                    }}>{refreshingWorkspaces ? '正在刷新…' : '刷新工作区套餐'}</Button>
+                    <p className="col-span-full text-xs text-muted-foreground">{selectedWorkspace?.eligible ? '商业工作区 · 已通过套餐准入' : selectedWorkspace?.ai_disabled ? '此工作区已关闭 AI 功能。' : selectedWorkspace?.eligibility_reason?.startsWith('workspace_plan_excluded') ? '此套餐不支持聊天，请选择商业试用、Business 或 Enterprise 工作区。' : '套餐尚未确认，请刷新工作区套餐。'} · 套餐准入不代表所有模型均有额度。</p>
                     <Button className="w-full" onClick={() => void saveAccount(selectedAccount.email, selectedEdit)}>
                       保存工作区设置
                     </Button>

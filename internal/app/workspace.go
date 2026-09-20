@@ -24,7 +24,7 @@ func normalizeWorkspace(workspace NotionWorkspace) NotionWorkspace {
 }
 
 func workspaceFromAccountFields(account NotionAccount) NotionWorkspace {
-	return normalizeWorkspace(NotionWorkspace{
+	workspace := NotionWorkspace{
 		ID:                   account.SpaceID,
 		ViewID:               account.SpaceViewID,
 		Name:                 account.SpaceName,
@@ -44,7 +44,18 @@ func workspaceFromAccountFields(account NotionAccount) NotionWorkspace {
 		TotalFailures:        account.TotalFailures,
 		Status:               account.Status,
 		LastError:            account.LastError,
-	})
+	}
+	// These discovery fields have no legacy top-level account equivalent.
+	// Runtime updates must retain them from the workspace being projected.
+	for _, existing := range account.Workspaces {
+		if strings.TrimSpace(existing.ID) == strings.TrimSpace(workspace.ID) {
+			workspace.SubscriptionTier = existing.SubscriptionTier
+			workspace.AIEnabled = existing.AIEnabled
+			workspace.AIDisabled = existing.AIDisabled
+			break
+		}
+	}
+	return normalizeWorkspace(workspace)
 }
 
 func projectWorkspaceToAccount(account *NotionAccount, workspace NotionWorkspace) {
@@ -183,6 +194,7 @@ func setAccountWorkspace(account *NotionAccount, workspace NotionWorkspace) {
 	if workspace.ID == "" {
 		return
 	}
+	account.Workspaces = append([]NotionWorkspace(nil), account.Workspaces...)
 	for i := range account.Workspaces {
 		if strings.TrimSpace(account.Workspaces[i].ID) == workspace.ID {
 			account.Workspaces[i] = workspace
@@ -325,8 +337,9 @@ func mergeWorkspaceValues(existing NotionWorkspace, incoming NotionWorkspace) No
 	if incoming.SubscriptionTier != "" {
 		merged.SubscriptionTier = incoming.SubscriptionTier
 	}
-	if incoming.AIEnabled {
-		merged.AIEnabled = true
+	if incoming.SubscriptionTier != "" || incoming.AIEnabled || incoming.AIDisabled {
+		merged.AIEnabled = incoming.AIEnabled
+		merged.AIDisabled = incoming.AIDisabled
 	}
 	if incoming.Priority != 0 {
 		merged.Priority = incoming.Priority
@@ -403,4 +416,13 @@ func accountWorkspaceCandidates(account NotionAccount) []NotionAccount {
 		}
 	}
 	return out
+}
+
+func preferredAccountWorkspaceID(cfg AppConfig, account NotionAccount) string {
+	if strings.TrimSpace(cfg.ActiveWorkspaceID) != "" && canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(account) {
+		if workspace, ok := accountWorkspace(account, cfg.ActiveWorkspaceID); ok {
+			return workspace.ID
+		}
+	}
+	return firstNonEmpty(account.DefaultWorkspaceID, account.SpaceID)
 }

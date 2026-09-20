@@ -1496,6 +1496,9 @@ func (a *App) preparePromptExecutionTarget(request *PromptRunRequest, accountEma
 	}
 	if strings.TrimSpace(request.preparedThreadID) == "" {
 		request.preparedThreadID = randomUUID()
+		if len(request.HistorySegments) > 1 || request.ForceLocalConversationContinue || request.continuationFailoverAttempted {
+			inferenceActivity.Add("history_replays", 1)
+		}
 	}
 	conversationID := strings.TrimSpace(request.ConversationID)
 	if conversationID == "" {

@@ -442,7 +442,7 @@ func (s *SQLiteStore) DeleteExpiredResponses(ttl time.Duration) error {
 		return nil
 	}
 	cutoff := time.Now().UTC().Add(-ttl).Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`DELETE FROM responses WHERE created_at < ?`, cutoff)
+	_, err := s.db.Exec(`UPDATE responses SET payload_json = '{}' WHERE created_at < ? AND payload_json != '{}'`, cutoff)
 	return err
 }
 

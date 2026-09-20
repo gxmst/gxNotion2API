@@ -771,7 +771,7 @@ func VerifyEmailLogin(ctx context.Context, cfg AppConfig, req LoginVerifyRequest
 		pending.Workspaces = append(pending.Workspaces, NotionWorkspace{
 			ID: candidate.ID, ViewID: candidate.ViewID, Name: candidate.Name,
 			PlanType: candidate.PlanType, SubscriptionTier: candidate.SubscriptionTier,
-			AIEnabled: candidate.AIEnabled, Status: "ready",
+			AIEnabled: candidate.AIEnabled, AIDisabled: candidate.AIDisabled, Status: "ready",
 		})
 	}
 	pending.ClientVersion = clientVersion

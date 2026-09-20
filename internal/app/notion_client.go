@@ -403,6 +403,7 @@ type uploadDescriptor struct {
 }
 
 type notionAPIError struct {
+	RetryAfter time.Time
 	URL        string
 	StatusCode int
 	Message    string
@@ -1279,6 +1280,7 @@ func (c *NotionAIClient) postJSONResponseWithReferer(ctx context.Context, url st
 		return nil, &notionAPIError{
 			URL:        url,
 			StatusCode: resp.StatusCode,
+			RetryAfter: upstreamRetryAfter(resp.Header.Get("Retry-After"), time.Now()),
 			Message:    strings.TrimSpace(string(respBody)),
 		}
 	}
@@ -1290,13 +1292,20 @@ func isTrustRuleDeniedInferenceError(err error) bool {
 		return false
 	}
 	var stepErr *inferenceStepError
-	if !errors.As(err, &stepErr) {
-		return false
+	if errors.As(err, &stepErr) {
+		return strings.EqualFold(strings.TrimSpace(stepErr.SubType), "trust-rule-denied")
 	}
-	return strings.EqualFold(strings.TrimSpace(stepErr.SubType), "trust-rule-denied")
+	var apiErr *notionAPIError
+	return errors.As(err, &apiErr) && strings.Contains(strings.ToLower(apiErr.Message), "trust-rule-denied")
 }
 
 func (c *NotionAIClient) runInferenceTranscriptHTTP(ctx context.Context, payload map[string]any, threadID string, sink InferenceStreamSink) (ndjsonParseResult, error) {
+	inferenceActivity.Add("inference_calls", 1)
+	if boolValue(payload["isPartialTranscript"]) {
+		inferenceActivity.Add("continuation_calls", 1)
+	} else {
+		inferenceActivity.Add("fresh_thread_calls", 1)
+	}
 	resp, err := c.postJSONResponse(ctx, c.Config.NotionUpstream().API("runInferenceTranscript"), payload, "application/x-ndjson")
 	if err != nil {
 		return ndjsonParseResult{}, err
@@ -1339,17 +1348,13 @@ func (c *NotionAIClient) runInferenceTranscriptWithFallback(ctx context.Context,
 	if c.Config.DebugUpstream {
 		log.Printf("[debug_upstream] runInferenceTranscript http done thread_id=%s line_count=%d message_ids=%d err=%v", threadID, parsed.LineCount, len(parsed.MessageIDs), err)
 	}
-	if !isTrustRuleDeniedInferenceError(err) {
+	// A trust rejection requires operator attention. Do not resend it through
+	// another HTTP client. An injected fallback is reserved for transport tests.
+	if !isTrustRuleDeniedInferenceError(err) || c.browserRunInferenceFallback == nil {
 		return parsed, err
 	}
 
 	runFallback := c.browserRunInferenceFallback
-	if runFallback == nil && !c.supportsBrowserRunInferenceFallback() {
-		return parsed, err
-	}
-	if runFallback == nil {
-		runFallback = c.runInferenceTranscriptInBrowser
-	}
 	fallbackTimeout := browserFallbackTimeoutForPayload(ctx, payload)
 	payloadBytes := browserFallbackPayloadBytes(payload)
 	fallbackCtx := ctx
@@ -3203,7 +3208,13 @@ func (c *NotionAIClient) pollFinalAnswer(ctx context.Context, threadID string) (
 func (c *NotionAIClient) loadAttachmentData(ctx context.Context, input InputAttachment) ([]byte, string, string, error) {
 	name := strings.TrimSpace(input.Name)
 	contentType := normalizeContentType(input.ContentType)
+	if strings.TrimSpace(input.Path) != "" {
+		return nil, "", "", errLocalAttachmentPath
+	}
 	if len(input.Data) > 0 {
+		if len(input.Data) > maxAttachmentBytes {
+			return nil, "", "", fmt.Errorf("attachment too large")
+		}
 		if name == "" {
 			name = inferAttachmentName(input.URL, input.Path, strings.HasPrefix(contentType, "image/"))
 		}
@@ -3212,32 +3223,12 @@ func (c *NotionAIClient) loadAttachmentData(ctx context.Context, input InputAtta
 		}
 		return input.Data, name, contentType, nil
 	}
-	if strings.TrimSpace(input.Path) != "" {
-		absPath, err := filepath.Abs(input.Path)
-		if err != nil {
-			return nil, "", "", err
-		}
-		data, err := os.ReadFile(absPath)
-		if err != nil {
-			return nil, "", "", err
-		}
-		if len(data) > maxAttachmentBytes {
-			return nil, "", "", fmt.Errorf("attachment too large: %s", absPath)
-		}
-		if name == "" {
-			name = filepath.Base(absPath)
-		}
-		if contentType == "" {
-			contentType = inferContentTypeFromName(name, false)
-		}
-		return data, name, contentType, nil
-	}
 	if strings.TrimSpace(input.URL) != "" {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, input.URL, nil)
 		if err != nil {
 			return nil, "", "", err
 		}
-		resp, err := c.HTTPClient.Do(req)
+		resp, err := c.attachmentHTTPClient().Do(req)
 		if err != nil {
 			return nil, "", "", err
 		}

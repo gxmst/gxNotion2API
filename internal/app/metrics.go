@@ -57,6 +57,8 @@ var transportCallDurationBuckets = []float64{0.001, 0.005, 0.01, 0.025, 0.05, 0.
 var sqliteOpDurationBuckets = []float64{0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1}
 
 var (
+	inferenceActivity = expvar.NewMap("notion2api_inference_activity_total")
+
 	requestDurationMu     sync.Mutex
 	requestDurationSeries = map[requestDurationKey]*histogramSeries{}
 
@@ -270,6 +272,16 @@ func writePrometheusMetrics(w http.ResponseWriter) {
 	_, _ = fmt.Fprintln(w, "# HELP notion2api_response_store_prune_total Total number of pruned in-memory response entries by reason.")
 	_, _ = fmt.Fprintln(w, "# TYPE notion2api_response_store_prune_total counter")
 	writeResponseStorePruneCounter(w)
+
+	_, _ = fmt.Fprintln(w, "# HELP notion2api_inference_activity_total Inference attempts and context reuse; not billed tokens.")
+	_, _ = fmt.Fprintln(w, "# TYPE notion2api_inference_activity_total counter")
+	for _, activity := range []string{"inference_calls", "continuation_calls", "fresh_thread_calls", "history_replays"} {
+		var count int64
+		if value, ok := inferenceActivity.Get(activity).(*expvar.Int); ok {
+			count = value.Value()
+		}
+		_, _ = fmt.Fprintf(w, "notion2api_inference_activity_total{activity=%q} %d\n", activity, count)
+	}
 }
 
 func writeRequestDurationHistogram(w http.ResponseWriter) {

@@ -27,6 +27,7 @@ type discoveredSpaceCandidate struct {
 	PlanType         string
 	SubscriptionTier string
 	AIEnabled        bool
+	AIDisabled       bool
 }
 
 // paidSubscriptionTier reports whether a workspace carries a subscription that
@@ -37,12 +38,7 @@ type discoveredSpaceCandidate struct {
 // it exactly as high as a paid team workspace. subscription_tier is the field
 // that actually separates them ("free" vs "business"/"enterprise"/"plus").
 func paidSubscriptionTier(tier string) bool {
-	switch strings.ToLower(strings.TrimSpace(tier)) {
-	case "", "free", "trial":
-		return false
-	default:
-		return true
-	}
+	return commercialWorkspaceTier(tier, "")
 }
 
 func unwrapRecordValue(raw any) map[string]any {
@@ -106,7 +102,8 @@ func discoverSpaceCandidates(recordMap map[string]any, userID string) []discover
 			Name:             strings.TrimSpace(stringValue(value["name"])),
 			PlanType:         strings.TrimSpace(stringValue(value["plan_type"])),
 			SubscriptionTier: strings.TrimSpace(stringValue(value["subscription_tier"])),
-			AIEnabled:        enabledAI || !disabledAI,
+			AIEnabled:        !disabledAI && (enabledAI || settings["enable_ai_feature"] == nil),
+			AIDisabled:       disabledAI,
 		}
 		candidates = append(candidates, candidate)
 	}
@@ -114,6 +111,9 @@ func discoverSpaceCandidates(recordMap map[string]any, userID string) []discover
 }
 
 func spaceCandidateScore(candidate discoveredSpaceCandidate) int {
+	if ok, _ := workspaceEligibility(NotionWorkspace{SubscriptionTier: candidate.SubscriptionTier, PlanType: candidate.PlanType, AIDisabled: candidate.AIDisabled}); !ok {
+		return -1
+	}
 	// A paid subscription outweighs everything else: AI quota is billed per
 	// workspace, and a free workspace accepts messages then silently never
 	// answers once its trial allowance is gone. Weight it above AIEnabled,
@@ -147,6 +147,10 @@ func chooseBestSpace(recordMap map[string]any, userID string) discoveredSpaceCan
 }
 
 func parseLoadUserContentMetadata(payload map[string]any) discoveredAccountMetadata {
+	return parseLoadUserContentMetadataForUser(payload, "")
+}
+
+func parseLoadUserContentMetadataForUser(payload map[string]any, activeUserID string) discoveredAccountMetadata {
 	recordMap := mapValue(payload["recordMap"])
 	if recordMap == nil {
 		return discoveredAccountMetadata{}
@@ -154,6 +158,9 @@ func parseLoadUserContentMetadata(payload map[string]any) discoveredAccountMetad
 	users := mapValue(recordMap["notion_user"])
 	var meta discoveredAccountMetadata
 	for userID, rawUser := range users {
+		if activeUserID != "" && userID != activeUserID {
+			continue
+		}
 		value := unwrapRecordValue(rawUser)
 		if value == nil {
 			continue
@@ -184,7 +191,7 @@ func fetchLoadUserContentMetadata(ctx context.Context, session *loginHTTPSession
 	if err != nil {
 		return discoveredAccountMetadata{}, err
 	}
-	meta := parseLoadUserContentMetadata(payload)
+	meta := parseLoadUserContentMetadataForUser(payload, activeUserID)
 	if meta.UserID == "" && meta.Email == "" && meta.SpaceID == "" {
 		return discoveredAccountMetadata{}, fmt.Errorf("loadUserContent returned no account metadata")
 	}

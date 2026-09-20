@@ -85,8 +85,8 @@ func TestVerifyIdleSweep(t *testing.T) {
 
 func TestVerifyIdleTTLConfigDefaults(t *testing.T) {
 	cfg := normalizeConfig(defaultConfig())
-	if got := configuredConversationIdleTTL(cfg); got != 24*time.Hour {
-		t.Errorf("absent config ttl = %v, want 24h", got)
+	if got := configuredConversationIdleTTL(cfg); got != 0 {
+		t.Errorf("absent config ttl = %v, want disabled", got)
 	}
 	zero := 0
 	cfg.Features.ConversationIdleTTLHours = &zero

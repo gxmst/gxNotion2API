@@ -69,7 +69,7 @@ func TestPaidSubscriptionTier(t *testing.T) {
 		"business":   true,
 		"Business":   true,
 		"enterprise": true,
-		"plus":       true,
+		"plus":       false,
 	} {
 		if got := paidSubscriptionTier(tier); got != want {
 			t.Errorf("paidSubscriptionTier(%q) = %v, want %v", tier, got, want)
