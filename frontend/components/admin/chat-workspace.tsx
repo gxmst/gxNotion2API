@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, Copy, FileText, Gauge, Globe2, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, Copy, Download, FileText, Gauge, Globe2, ImageIcon, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, Trash2, X } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -19,6 +19,118 @@ const SESSION_KEY = 'notion2api-chat-session';
 // forced reads at 30s globally, so this only keeps a busy client from spending
 // the whole allowance on the indicator.
 const QUOTA_FORCE_MIN_INTERVAL_MS = 60_000;
+
+// Attachments travel inside the JSON request body as base64 data URLs, so the
+// limit a browser actually hits is the server's *body* cap, not the larger
+// per-attachment cap it also enforces. A 4 MiB body leaves roughly 3 MiB of raw
+// file once base64 (4/3) and the surrounding JSON are accounted for. Guarding
+// here turns a late, opaque server rejection into an immediate, specific one.
+const MAX_REQUEST_BODY_BYTES = 4 * 1024 * 1024;
+const JSON_ENVELOPE_BYTES = 2048;
+const BASE64_PREFIX_BYTES = 64;
+
+function encodedAttachmentBytes(file: File): number {
+  return Math.ceil((file.size * 4) / 3) + BASE64_PREFIX_BYTES;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+// Notion-shared files report a content type, but a pasted screenshot may only
+// carry a name, so fall back to the extension.
+function attachmentIsImage(file: { content_type?: string; contentType?: string; name?: string }): boolean {
+  const type = (file.content_type || file.contentType || '').toLowerCase();
+  if (type.startsWith('image/')) return true;
+  return /\.(png|jpe?g|gif|webp|avif|bmp|svg)$/i.test(file.name || '');
+}
+
+// Upstream never reports a token count for a bridged turn, so the numbers shown
+// are a local estimate: CJK characters land near one token each while Latin text
+// runs closer to four characters per token. Every place it appears is labelled
+// as an estimate, so it is never read as billing data.
+function isCJKIdeograph(code: number): boolean {
+  return (code >= 0x2e80 && code <= 0x9fff) || (code >= 0xf900 && code <= 0xfaff)
+    || (code >= 0xac00 && code <= 0xd7af) || (code >= 0xff00 && code <= 0xffef);
+}
+
+function estimateTokens(text?: string): number {
+  const value = text || '';
+  if (!value) return 0;
+  let cjk = 0;
+  let other = 0;
+  for (const char of value) {
+    if (isCJKIdeograph(char.codePointAt(0) || 0)) cjk += 1;
+    else other += 1;
+  }
+  return cjk + Math.ceil(other / 4);
+}
+
+function formatTokens(count: number): string {
+  return count >= 10000 ? `${(count / 1000).toFixed(1)}k` : String(count);
+}
+
+// Step names come from upstream verbatim, so they are mapped onto a readable
+// label when the family is recognisable and printed as-is otherwise. An
+// unknown step still renders with its own name rather than as a blank row.
+const STEP_LABELS: Array<[RegExp, string]> = [
+  [/search/, '联网搜索'],
+  [/tool/, '调用工具'],
+  [/think|reason/, '思考'],
+  [/read|file|attach/, '读取文件'],
+  [/title/, '生成标题'],
+];
+
+function stepLabel(raw?: string): string {
+  const type = (raw || '').trim();
+  if (!type) return '处理步骤';
+  const lower = type.toLowerCase();
+  for (const [pattern, label] of STEP_LABELS) if (pattern.test(lower)) return label;
+  return type;
+}
+
+function conversationMarkdown(title: string, messages: ConversationMessage[], meta: { model?: string; account?: string } = {}): string {
+  const lines: string[] = [`# ${title || '对话'}`, ''];
+  const facts = [meta.model ? `模型：${meta.model}` : '', meta.account ? `账号：${meta.account}` : '', `导出时间：${new Date().toLocaleString()}`].filter(Boolean);
+  lines.push(`> ${facts.join(' · ')}`, '');
+  for (const message of messages) {
+    const role = (message.role || '').toLowerCase();
+    if (role === 'step') {
+      lines.push(`> 过程 · ${stepLabel(message.step_type)}${message.content ? `：${message.content}` : ''}`);
+      continue;
+    }
+    lines.push(role === 'user' ? '## 用户' : '## Notion AI', '');
+    if (message.content) lines.push(message.content, '');
+    if (message.attachments?.length) {
+      lines.push('附件：');
+      message.attachments.forEach((file, index) => {
+        const name = file.name || `附件 ${index + 1}`;
+        lines.push(file.url ? `- [${name}](${file.url})` : `- ${name}`);
+      });
+      lines.push('');
+    }
+    if (message.edited_at) lines.push('_（此条内容已被手动编辑）_', '');
+  }
+  return lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+}
+
+function safeFileName(name: string): string {
+  const cleaned = (name || '').replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ').replace(/\s+/g, ' ').trim();
+  return (cleaned || 'conversation').slice(0, 80);
+}
+
+function downloadTextFile(filename: string, text: string) {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/markdown;charset=utf-8' }));
+  const anchor = document.createElement('a');
+  anchor.href = url; anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  // Revoked on the next tick so the browser has already taken the URL.
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
 
 function newID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID().replace(/-/g, '');
@@ -70,7 +182,7 @@ function formatQuotaAmount(window: AIUsageRateLimitWindow): string {
   return `已用 ${used} / ${limit}${periodEnd ? ` · 至 ${periodEnd}` : ''}`;
 }
 
-export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun, conversations, accounts, onNavigate, visible }: {
+export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun, conversations, accounts, onNavigate, onDeleteConversation, onRefreshConversations, visible }: {
   models: ModelItem[];
   defaultModel?: string;
   defaultWebSearch: boolean;
@@ -81,6 +193,10 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   conversations: ConversationSummary[];
   accounts: AccountItem[];
   onNavigate: (tab: TabKey) => void;
+  /** Deletes a conversation and refreshes the list; owned by the console. */
+  onDeleteConversation: (id: string) => Promise<unknown>;
+  /** Re-reads the sidebar list after a rename or a delete. */
+  onRefreshConversations: () => Promise<unknown>;
   visible: boolean;
 }) {
   const [prompt, setPrompt] = useState('');
@@ -89,6 +205,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const [conversationID, setConversationID] = useState('');
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [files, setFiles] = useState<File[]>([]);
+  const [dragging, setDragging] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadFailed, setLoadFailed] = useState(false);
   const [remoteRunning, setRemoteRunning] = useState(false);
@@ -102,6 +219,15 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [atBottom, setAtBottom] = useState(true);
   const [copied, setCopied] = useState('');
+  // Inline rename in the sidebar, and per-message editing in the transcript.
+  const [renamingID, setRenamingID] = useState('');
+  const [renameValue, setRenameValue] = useState('');
+  const [editingID, setEditingID] = useState('');
+  const [editValue, setEditValue] = useState('');
+  // One shared busy flag would freeze every row while a single request is in
+  // flight, so the pending action is tracked per conversation.
+  const [busyID, setBusyID] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
   const [quota, setQuota] = useState<AIUsageReport | null>(null);
   // The workspace the stored report was fetched for. A report is only rendered
   // while it still matches the workspace the next turn would use, so switching
@@ -120,14 +246,17 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const quotaForceNext = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // dragenter/dragleave fire for every child element, so a depth counter is what
+  // keeps the drop overlay from flickering as the pointer moves inside it.
+  const dragDepth = useRef(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const historyRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
   const mounted = useRef(false);
   const loadRevision = useRef(0);
   const followBottom = useRef(true);
-  const propsRef = useRef({ onLoad, onResumeHandled });
-  propsRef.current = { onLoad, onResumeHandled };
+  const propsRef = useRef({ onLoad, onResumeHandled, onDeleteConversation, onRefreshConversations });
+  propsRef.current = { onLoad, onResumeHandled, onDeleteConversation, onRefreshConversations };
   const { resolvedTheme, setTheme } = useTheme();
 
   const allTargets = accounts.flatMap((account) => (account.workspaces || [])
@@ -200,6 +329,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     setConversationID(id); setMessages([]); setFiles([]); setPrompt(draft); setOwner(''); setTarget('auto');
     setTitle('加载对话…');
     setMobileOpen(false); followBottom.current = true;
+    cancelRename(); cancelEdit();
     try {
       const { item } = await propsRef.current.onLoad(id);
       if (!mounted.current || revision !== loadRevision.current) return;
@@ -312,10 +442,156 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     loadRevision.current++;
     setConversationID(''); setMessages([]); setOwner(''); setTitle('新对话'); setError(''); setPrompt(''); setFiles([]);
     setLoading(false); setLoadFailed(false); setRemoteRunning(false); setMobileOpen(false); setQuotaOpen(false);
+    cancelRename(); cancelEdit();
     if (!targets.some((item) => item.id === target)) setTarget('auto');
     followBottom.current = true;
     if (fileRef.current) fileRef.current.value = '';
     inputRef.current?.focus();
+  }
+
+  // Attachments arrive from the picker, a drop, or a paste, and all three go
+  // through here so the size budget is enforced in one place. Rejections are
+  // reported per file: silently dropping a screenshot is worse than saying no.
+  function addFiles(incoming: File[]) {
+    if (!incoming.length) return;
+    if (running) { toast.info('正在生成，暂时不能添加附件'); return; }
+    const accepted: File[] = [];
+    const rejected: string[] = [];
+    const seen = new Set(files.map((file) => `${file.name}\u0000${file.size}`));
+    let total = files.reduce((sum, file) => sum + encodedAttachmentBytes(file), 0);
+    const budget = MAX_REQUEST_BODY_BYTES - JSON_ENVELOPE_BYTES;
+    for (const file of incoming) {
+      if (!file.size) { rejected.push(`${file.name || '未命名文件'}（空文件）`); continue; }
+      const key = `${file.name}\u0000${file.size}`;
+      if (seen.has(key)) continue;
+      const size = encodedAttachmentBytes(file);
+      if (total + size > budget) {
+        rejected.push(`${file.name}（${formatBytes(file.size)}，单次发送上限约 ${formatBytes(Math.round(budget * 3 / 4))}）`);
+        continue;
+      }
+      seen.add(key);
+      accepted.push(file);
+      total += size;
+    }
+    if (accepted.length) setFiles((current) => [...current, ...accepted]);
+    if (rejected.length) toast.error(`已跳过 ${rejected.length} 个文件：${rejected.join('；')}`);
+  }
+
+  function onDragEnter(event: React.DragEvent) {
+    if (!event.dataTransfer?.types?.includes('Files')) return;
+    event.preventDefault();
+    dragDepth.current += 1;
+    setDragging(true);
+  }
+
+  function onDragOver(event: React.DragEvent) {
+    if (!event.dataTransfer?.types?.includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }
+
+  function onDragLeave() {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (!dragDepth.current) setDragging(false);
+  }
+
+  function onDrop(event: React.DragEvent) {
+    if (!event.dataTransfer?.types?.includes('Files')) return;
+    event.preventDefault();
+    dragDepth.current = 0;
+    setDragging(false);
+    if (running) { toast.info('正在生成，暂时不能添加附件'); return; }
+    addFiles(Array.from(event.dataTransfer.files || []));
+  }
+
+  const conversationLabel = (item: ConversationSummary) => item.title || item.request_prompt || item.preview || '新对话';
+
+  function startRename(item: ConversationSummary) {
+    setRenamingID(item.id); setRenameValue(conversationLabel(item));
+  }
+
+  function cancelRename() { setRenamingID(''); setRenameValue(''); }
+
+  async function commitRename(id: string) {
+    const next = renameValue.trim();
+    const item = conversations.find((entry) => entry.id === id);
+    if (!next || !item || next === conversationLabel(item)) { cancelRename(); return; }
+    setBusyID(id);
+    try {
+      await AdminService.renameConversation(id, next);
+      await propsRef.current.onRefreshConversations();
+      if (id === conversationID) setTitle(next);
+      cancelRename();
+      toast.success('已重命名');
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '重命名失败');
+    } finally { setBusyID(''); }
+  }
+
+  async function removeConversation(item: ConversationSummary) {
+    // Deleting removes the stored transcript, so the confirmation names the
+    // conversation and says plainly that it cannot be undone.
+    if (!window.confirm(`删除「${conversationLabel(item)}」？该对话的记录会一并移除，且不可恢复。`)) return;
+    if (item.status === 'running' || item.status === 'queued') { toast.info('此对话正在生成，完成后再删除'); return; }
+    setBusyID(item.id);
+    try {
+      await propsRef.current.onDeleteConversation(item.id);
+      if (item.id === conversationID) startNew();
+      toast.success('已删除');
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '删除失败');
+    } finally { setBusyID(''); }
+  }
+
+  // The open conversation is exported from what is on screen; any other one is
+  // read first. Using the local snapshot keeps export offline and instant.
+  async function exportConversation(id: string, label: string) {
+    setBusyID(id);
+    try {
+      let items = id === conversationID ? messages : null;
+      let exportTitle = label;
+      let exportModel: string | undefined = id === conversationID ? model : undefined;
+      let exportAccount: string | undefined = id === conversationID ? owner : undefined;
+      if (!items) {
+        const { item } = await propsRef.current.onLoad(id);
+        items = item.messages || [];
+        exportTitle = item.title || label;
+        exportModel = item.model;
+        exportAccount = item.account_email;
+      }
+      downloadTextFile(`${safeFileName(exportTitle)}.md`, conversationMarkdown(exportTitle, items, { model: exportModel, account: exportAccount }));
+      toast.success('已导出 Markdown');
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '导出失败');
+    } finally { setBusyID(''); }
+  }
+
+  function startEdit(message: ConversationMessage) {
+    if (!message.id) return;
+    if (running) { toast.info('正在生成，暂时不能编辑'); return; }
+    setEditingID(message.id); setEditValue(message.content || '');
+  }
+
+  function cancelEdit() { setEditingID(''); setEditValue(''); }
+
+  async function commitEdit(message: ConversationMessage) {
+    const next = editValue.trim();
+    if (!conversationID || !message.id) return;
+    if (next === (message.content || '').trim()) { cancelEdit(); return; }
+    if (!next) { toast.error('内容不能为空'); return; }
+    setSavingEdit(true);
+    try {
+      // The response carries the whole conversation, so the transcript is
+      // replaced with the server's own view instead of a local guess.
+      const { item } = await AdminService.editConversationMessage(conversationID, message.id, next);
+      setMessages(item.messages || []);
+      if (item.title) setTitle(item.title);
+      cancelEdit();
+      await propsRef.current.onRefreshConversations();
+      toast.success('已保存');
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : '保存失败');
+    } finally { setSavingEdit(false); }
   }
 
   async function performRun() {
@@ -363,6 +639,11 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       if (!controller.signal.aborted) setPrompt((current) => current || sentPrompt);
     } finally { abortRef.current = null; if (mounted.current) setRunning(false); }
   }
+
+  // Totals cover the conversation on screen. Process steps are excluded: their
+  // text is upstream tool chatter, not something the turn actually billed for.
+  const inputTokens = messages.filter((message) => message.role === 'user').reduce((sum, message) => sum + estimateTokens(message.content), 0);
+  const outputTokens = messages.filter((message) => message.role === 'assistant').reduce((sum, message) => sum + estimateTokens(message.content), 0);
 
   const quotaWindows = [
     shortWindow ? { key: 'short', window: shortWindow, fallback: '短窗口' } : null,
@@ -416,9 +697,28 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     <label className="chat-search"><Search size={15} /><input aria-label="搜索对话" placeholder="搜索对话" value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
     <div className="chat-history-label">最近对话</div>
     <nav className="chat-conversations" aria-label="历史会话">
-      {history.map((item) => <button key={item.id} title={item.title || item.request_prompt || item.preview || '新对话'} aria-current={item.id === conversationID ? 'page' : undefined} disabled={running} onClick={() => void openConversation(item.id)}>
-        <MessageSquare size={14} /><span>{item.title || item.request_prompt || item.preview || '新对话'}</span>{item.status === 'running' ? <LoaderCircle size={12} className="animate-spin" /> : null}
-      </button>)}
+      {history.map((item) => {
+        const label = conversationLabel(item);
+        const busy = busyID === item.id;
+        if (renamingID === item.id) return <form key={item.id} className="chat-conversation is-renaming"
+          onSubmit={(event) => { event.preventDefault(); void commitRename(item.id); }}>
+          <input autoFocus aria-label="对话标题" value={renameValue} maxLength={72} disabled={busy}
+            onChange={(event) => setRenameValue(event.target.value)}
+            onKeyDown={(event) => { if (event.key === 'Escape') cancelRename(); }} />
+          <button type="submit" className="chat-icon" aria-label="保存标题" disabled={busy || !renameValue.trim()}>{busy ? <LoaderCircle size={13} className="animate-spin" /> : <Check size={13} />}</button>
+          <button type="button" className="chat-icon" aria-label="取消重命名" disabled={busy} onClick={cancelRename}><X size={13} /></button>
+        </form>;
+        return <div className="chat-conversation" key={item.id} data-active={item.id === conversationID ? 'true' : undefined}>
+          <button className="chat-conversation-open" title={label} aria-current={item.id === conversationID ? 'page' : undefined} disabled={running} onClick={() => void openConversation(item.id)}>
+            <MessageSquare size={14} /><span>{label}</span>{item.status === 'running' ? <LoaderCircle size={12} className="animate-spin" /> : null}
+          </button>
+          <div className="chat-conversation-actions">
+            <button className="chat-icon" aria-label={`重命名 ${label}`} disabled={busy || running} onClick={() => startRename(item)}><Pencil size={13} /></button>
+            <button className="chat-icon" aria-label={`导出 ${label}`} disabled={busy} onClick={() => void exportConversation(item.id, label)}>{busy ? <LoaderCircle size={13} className="animate-spin" /> : <Download size={13} />}</button>
+            <button className="chat-icon" aria-label={`删除 ${label}`} disabled={busy || running} onClick={() => void removeConversation(item)}><Trash2 size={13} /></button>
+          </div>
+        </div>;
+      })}
       {!history.length ? <p className="px-3 py-2 text-xs leading-6 text-muted-foreground">{filter ? '没有匹配的对话' : '对话会保存在这里，随时继续。'}</p> : null}
     </nav>
     <div className="chat-sidebar-footer">
@@ -447,6 +747,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
             </button>
             {quotaPanel}
           </div> : null}
+          {conversationID ? <button className="chat-icon" aria-label="导出 Markdown" title="导出为 Markdown" disabled={loading || busyID === conversationID} onClick={() => void exportConversation(conversationID, title)}>{busyID === conversationID ? <LoaderCircle size={17} className="animate-spin" /> : <Download size={17} />}</button> : null}
           <button className="chat-icon" aria-label="切换明暗主题" onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}>{resolvedTheme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}</button>
           <button className="chat-icon lg:hidden" aria-label="新对话" disabled={running} onClick={startNew}><Plus size={18} /></button>
         </div>
@@ -463,18 +764,56 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           <p className="chat-eyebrow">你的 AI 工作空间</p><h2>今天想推进什么？</h2><p>从一个问题、一份文档，或一个想法开始。</p>
           <div className="chat-starters">{['梳理思路与行动计划', '分析文档中的关键信息', '一起打磨一段文字'].map((text) => <button key={text} onClick={() => { setPrompt(text); inputRef.current?.focus(); }}>{text}<ArrowUp size={14} /></button>)}</div>
         </div> : null}
-        <div className="chat-transcript">{messages.map((message, index) => <article key={message.id || index} className={message.role === 'user' ? 'chat-message chat-user' : 'chat-message chat-assistant'}>
-          {message.role !== 'user' ? <div className="chat-assistant-label"><Sparkles size={15} />Notion AI</div> : null}
-          <div className="chat-message-content">{message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content}</p> : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-            ...safeMarkdownComponents,
-            table: ({ children }) => <div className="chat-table"><table>{children}</table></div>,
-          }}>{message.content || ''}</ReactMarkdown>}
-          {!message.content && message.status === 'streaming' ? <div className="chat-thinking"><span /><span /><span /><span className="sr-only">正在生成</span></div> : null}
-          {message.attachments?.length ? <div className="chat-attachments">{message.attachments.map((file, i) => <span key={i}><FileText size={14} />{file.name}</span>)}</div> : null}
-          </div>
-          <ModelEvidence message={message} models={modelCatalog} />
-          <div className="chat-message-actions">{message.status === 'failed' ? <span>未完成</span> : null}<button className="chat-icon" aria-label="复制消息" disabled={!message.content} onClick={() => void copyText(message.content || '').then(() => { setCopied(String(index)); setTimeout(() => setCopied(''), 1600); }).catch(() => toast.error('复制失败'))}>{copied === String(index) ? <Check size={14} /> : <Copy size={14} />}</button></div>
-        </article>)}</div>
+        <div className="chat-transcript">{messages.map((message, index) => {
+          // A process step is Notion's own trail (search, tool call, thinking).
+          // It is rendered as a slim marker instead of a chat bubble so it
+          // reads as context for the answer rather than as a turn of its own.
+          if ((message.role || '').toLowerCase() === 'step') return <div className="chat-step" key={message.id || index}>
+            <span className="chat-step-label">{stepLabel(message.step_type)}</span>
+            {message.content ? <span className="chat-step-text">{message.content}</span> : null}
+          </div>;
+          const isUser = message.role === 'user';
+          const editing = Boolean(message.id) && editingID === message.id;
+          return <article key={message.id || index} className={isUser ? 'chat-message chat-user' : 'chat-message chat-assistant'}>
+            {!isUser ? <div className="chat-assistant-label"><Sparkles size={15} />Notion AI</div> : null}
+            {editing ? <div className="chat-message-edit">
+              <textarea autoFocus aria-label="编辑消息内容" value={editValue} disabled={savingEdit} onChange={(event) => setEditValue(event.target.value)}
+                onKeyDown={(event) => { if (event.key === 'Escape') cancelEdit(); }} />
+              <div className="chat-message-edit-actions">
+                <button className="chat-icon" aria-label="保存修改" disabled={savingEdit || !editValue.trim()} onClick={() => void commitEdit(message)}>{savingEdit ? <LoaderCircle size={14} className="animate-spin" /> : <Check size={14} />}</button>
+                <button className="chat-icon" aria-label="取消修改" disabled={savingEdit} onClick={cancelEdit}><X size={14} /></button>
+              </div>
+            </div> : <div className="chat-message-content">
+              {isUser
+                ? (message.content ? <p className="whitespace-pre-wrap">{message.content}</p> : null)
+                : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
+                  ...safeMarkdownComponents,
+                  table: ({ children }) => <div className="chat-table"><table>{children}</table></div>,
+                }}>{message.content || ''}</ReactMarkdown>}
+              {!message.content && message.status === 'streaming' ? <div className="chat-thinking"><span /><span /><span /><span className="sr-only">正在生成</span></div> : null}
+              {message.attachments?.length ? <div className="chat-attachments">{message.attachments.map((file, i) => {
+                const label = file.name || `附件 ${i + 1}`;
+                const isImage = attachmentIsImage(file);
+                const icon = isImage ? <ImageIcon size={14} /> : <FileText size={14} />;
+                // Files Notion itself shared carry a URL; earlier this rendered
+                // as plain text, so the hello.py-style card was visible but inert.
+                if (!file.url) return <span key={i} title={label}>{icon}<span>{label}</span></span>;
+                return <a key={i} className="chat-attachment-link" href={file.url} target="_blank" rel="noreferrer noopener" title={`打开 ${label}`}>
+                  {isImage ? <img src={file.url} alt="" loading="lazy" referrerPolicy="no-referrer" onError={(event) => { event.currentTarget.style.display = 'none'; }} /> : null}
+                  {icon}<span>{label}</span>
+                </a>;
+              })}</div> : null}
+            </div>}
+            <ModelEvidence message={message} models={modelCatalog} />
+            <div className="chat-message-actions">
+              {message.edited_at ? <span className="chat-edited">已编辑</span> : null}
+              {message.status === 'failed' ? <span>未完成</span> : null}
+              {message.content ? <span className="chat-token-hint" title="按字符数估算，非上游计数">≈ {formatTokens(estimateTokens(message.content))} tokens</span> : null}
+              <button className="chat-icon" aria-label="编辑消息" disabled={running || !message.id} onClick={() => startEdit(message)}><Pencil size={14} /></button>
+              <button className="chat-icon" aria-label="复制消息" disabled={!message.content} onClick={() => void copyText(message.content || '').then(() => { setCopied(String(index)); setTimeout(() => setCopied(''), 1600); }).catch(() => toast.error('复制失败'))}>{copied === String(index) ? <Check size={14} /> : <Copy size={14} />}</button>
+            </div>
+          </article>;
+        })}</div>
       </div>
       <div className="chat-composer-area">
         {!atBottom && messages.length ? <button className="chat-latest" onClick={() => {
@@ -484,12 +823,23 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         }}><ArrowDown size={15} />回到最新</button> : null}
         {error ? <div className="chat-error" role="status">{error}{loadFailed ? <button onClick={() => void openConversation(conversationID)}>重新加载</button> : null}</div> : null}
         {remoteRunning ? <div className="chat-remote"><LoaderCircle size={14} className="animate-spin" />此对话正在生成，完成后会自动更新。</div> : null}
-        <form className="chat-composer" onSubmit={(event) => { event.preventDefault(); void performRun(); }}>
-          {files.length ? <div className="chat-attachments">{files.map((file, index) => <span key={index}><FileText size={14} /><span>{file.name}</span><button type="button" aria-label={'移除 ' + file.name} disabled={running} onClick={() => setFiles((current) => current.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div> : null}
-          <textarea ref={inputRef} aria-label="消息" placeholder="发送消息，或添加文件一起讨论…" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={loading || loadFailed || remoteRunning} rows={2}
+        <form className={'chat-composer' + (dragging ? ' is-dragging' : '')}
+          onSubmit={(event) => { event.preventDefault(); void performRun(); }}
+          onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+          {dragging ? <div className="chat-dropzone" aria-hidden="true"><Paperclip size={18} /><span>松开即可添加文件</span></div> : null}
+          {files.length ? <div className="chat-attachments">{files.map((file, index) => <span key={index} title={`${file.name} · ${formatBytes(file.size)}`}>{attachmentIsImage({ content_type: file.type, name: file.name }) ? <ImageIcon size={14} /> : <FileText size={14} />}<span>{file.name}</span><em className="chat-attachment-size">{formatBytes(file.size)}</em><button type="button" aria-label={'移除 ' + file.name} disabled={running} onClick={() => setFiles((current) => current.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div> : null}
+          <textarea ref={inputRef} aria-label="消息" placeholder="发送消息，或拖入 / 粘贴文件一起讨论…" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={loading || loadFailed || remoteRunning} rows={2}
+            onPaste={(event) => {
+              // A pasted screenshot arrives as a file, not as text. Let text
+              // paste through untouched so the composer still behaves normally.
+              const pasted = Array.from(event.clipboardData?.files || []);
+              if (!pasted.length) return;
+              event.preventDefault();
+              addFiles(pasted);
+            }}
             onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); void performRun(); } }} />
           <div className="chat-composer-toolbar">
-            <input ref={fileRef} type="file" className="hidden" multiple disabled={running} onChange={(event) => setFiles((current) => [...current, ...Array.from(event.target.files || [])])} />
+            <input ref={fileRef} type="file" className="hidden" multiple disabled={running} onChange={(event) => { addFiles(Array.from(event.target.files || [])); event.target.value = ''; }} />
             <button type="button" className="chat-icon" aria-label="添加附件" disabled={loading || running} onClick={() => fileRef.current?.click()}><Paperclip size={18} /></button>
             <Select value={model} onValueChange={setModel} disabled={running || remoteRunning || availableModels.length === 1}><SelectTrigger className="chat-model-select" aria-label="模型"><SelectValue /></SelectTrigger><SelectContent>{availableModels.map((item) => <SelectItem key={item.id} value={item.id}>{item.name || item.id}</SelectItem>)}</SelectContent></Select>
             <button type="button" className={'chat-tool' + (useWebSearch ? ' is-active' : '')} aria-label="联网搜索" aria-pressed={useWebSearch} disabled={running} onClick={() => setUseWebSearch(!useWebSearch)}><Globe2 size={16} /><span>联网</span></button>
@@ -499,6 +849,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         <div className="px-2 pt-1 text-xs text-muted-foreground" role="note">{autoOnly ? "此工作区仅支持 Auto，由 Notion 分配模型。" : availableModels.length === 1 ? "模型选择能力尚未确认或没有可选模型，可先使用 Auto；在账号页刷新模型能力。" : "手动选择模型时，仅使用支持该模型的工作区。"}</div>
         <div className="chat-composer-footer">
           <Select value={target} onValueChange={setTarget} disabled={Boolean(conversationID) || loading || running}><SelectTrigger className="chat-workspace-select" aria-label="商业工作区" title={owner || boundTarget?.email}><SelectValue placeholder={conversationID ? '会话绑定工作区' : '自动选择商业工作区'} /></SelectTrigger><SelectContent><SelectItem value="auto">{conversationID ? '会话绑定工作区' : '自动选择商业工作区'}</SelectItem>{targets.map((item) => <SelectItem value={item.id} key={item.id}>{item.name} · {item.tier} · {item.email}</SelectItem>)}{target !== 'auto' && !selectedTarget ? <SelectItem value={target} disabled>{boundTarget ? `${boundTarget.name} · ${boundTarget.tier}` : '原工作区'} · 当前不可用</SelectItem> : null}</SelectContent></Select>
+          {messages.length ? <span className="chat-token-total" role="note" title="按字符数估算，非上游计数">≈ 输入 {formatTokens(inputTokens)} · 输出 {formatTokens(outputTokens)} tokens（估算）</span> : null}
           <span className="chat-keyboard-hint">Enter 发送<span> · </span>Shift + Enter 换行</span>
         </div>
       </div>

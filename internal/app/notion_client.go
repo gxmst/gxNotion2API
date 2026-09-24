@@ -1953,11 +1953,64 @@ func extractConversationMessageFromThreadRecord(messageID string, rawItem any) (
 			Status:      "completed",
 			CreatedAt:   createdAt,
 			UpdatedAt:   updatedAt,
+			StepType:    "attachment",
 			Attachments: []ConversationAttachment{attachment},
 		}, true
 	default:
-		return ConversationMessage{}, false
+		// Structural steps describe how the thread is wired up (its config and
+		// context) and have nothing to show a reader, so they stay out of the
+		// transcript. Everything else is an intermediate agent step — the
+		// search/read/think trail Notion renders above the answer — and is kept
+		// in order as a role="step" entry.
+		if stepType == "" || isStructuralStepType(stepType) {
+			return ConversationMessage{}, false
+		}
+		return ConversationMessage{
+			ID:        strings.TrimSpace(messageID),
+			Role:      "step",
+			Status:    "completed",
+			StepType:  stepType,
+			Content:   stepVisibleText(step),
+			CreatedAt: createdAt,
+			UpdatedAt: updatedAt,
+		}, true
 	}
+}
+
+// structuralStepTypes wire a thread together rather than narrate it. They are
+// observed values, not a closed set: an unlisted type is treated as visible,
+// which fails toward showing a step the reader could have seen anyway.
+func isStructuralStepType(stepType string) bool {
+	switch strings.ToLower(strings.TrimSpace(stepType)) {
+	case "config", "context", "workflow", "updated-config", "agent-config", "transcript-config":
+		return true
+	default:
+		return false
+	}
+}
+
+// stepVisibleText returns only the text a step explicitly labels as text. The
+// step's own value can also carry reasoning or tool payloads, and those must
+// not be promoted into a transcript as if a person had written them.
+func stepVisibleText(step map[string]any) string {
+	value := step["value"]
+	parts := sliceValue(value)
+	if len(parts) == 0 {
+		if wrapper := mapValue(value); len(wrapper) > 0 {
+			parts = sliceValue(wrapper["value"])
+		}
+	}
+	texts := make([]string, 0, len(parts))
+	for _, raw := range parts {
+		item := mapValue(raw)
+		if strings.ToLower(strings.TrimSpace(stringValue(item["type"]))) != "text" {
+			continue
+		}
+		if content := strings.TrimSpace(extractAssistantPartContent(item)); content != "" {
+			texts = append(texts, content)
+		}
+	}
+	return truncateRunes(strings.Join(texts, ""), 400)
 }
 
 func messageIDsFromRecordMap(recordMap map[string]any, threadID string) []string {

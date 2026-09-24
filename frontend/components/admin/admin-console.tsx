@@ -251,6 +251,8 @@ export function AdminConsole() {
           conversations={conversations} accounts={accountsPayload?.items || []}
           onNavigate={setActiveTab} visible={activeTab === 'tester'}
           onLoad={(id) => services.getConversation(id, true)}
+          onDeleteConversation={deleteConversation}
+          onRefreshConversations={loadConversations}
           onRun={async (payload, onDelta, signal) => {
             try { return await services.streamTestPrompt(payload, onDelta, signal); }
             finally { void loadConversations().catch(() => undefined); }

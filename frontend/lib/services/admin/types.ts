@@ -359,6 +359,9 @@ export interface ConversationMessageAttachment {
   name?: string;
   content_type?: string;
   contentType?: string;
+  /** Set for files Notion itself shared, so the transcript can link to them. */
+  url?: string;
+  source?: string;
 }
 
 export interface ConversationMessage {
@@ -371,7 +374,21 @@ export interface ConversationMessage {
   content?: string;
   created_at?: string;
   updated_at?: string;
+  /** Set when an operator rewrote the text, so the UI can mark it as edited. */
+  edited_at?: string;
+  /**
+   * Set on process entries (role "step") and on attachment steps. The raw
+   * upstream type is passed through, so the UI labels it without depending on
+   * a fixed list of step names.
+   */
+  step_type?: string;
   attachments?: ConversationMessageAttachment[];
+}
+
+/** Response of the conversation PATCH routes: the whole updated conversation. */
+export interface ConversationMutationPayload {
+  success: boolean;
+  item: ConversationDetail;
 }
 
 export interface ConversationSummary {

@@ -23,10 +23,23 @@
 .chat-search input { min-width: 0; width: 100%; background: transparent; font-size: 12px; outline: none; }
 .chat-history-label { margin: 20px 10px 4px; color: var(--chat-soft); font-size: 11px; font-weight: 500; }
 .chat-conversations { flex: 1; min-height: 0; overflow-y: auto; }
-.chat-conversations button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 10px; text-align: left; font-size: 12px; border-radius: 7px; color: var(--chat-soft); }
-.chat-conversations button span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--chat-ink); }
-.chat-conversations button svg { flex-shrink: 0; opacity: .7; }
-.chat-conversations button:hover, .chat-conversations button[aria-current] { background: var(--chat-hover); }
+/* The row is the hover target: the title keeps the whole width, while the
+   actions stay hidden until the row is hovered or focused so a long list still
+   reads as a list of names rather than a wall of buttons. */
+.chat-conversation { display: flex; align-items: center; gap: 2px; border-radius: 7px; padding-right: 2px; }
+.chat-conversation:hover, .chat-conversation:focus-within, .chat-conversation[data-active='true'] { background: var(--chat-hover); }
+.chat-conversation-open { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; padding: 10px; text-align: left; font-size: 12px; border-radius: 7px; color: var(--chat-soft); }
+.chat-conversation-open span { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--chat-ink); }
+.chat-conversation-open svg { flex-shrink: 0; opacity: .7; }
+.chat-conversation-actions { display: flex; align-items: center; gap: 1px; flex-shrink: 0; opacity: 0; }
+/* Keyboard focus is matched with :focus-visible rather than :focus-within: a
+   mouse click leaves the row focused, which would pin its buttons open for the
+   rest of the session. */
+.chat-conversation:hover .chat-conversation-actions, .chat-conversation:has(:focus-visible) .chat-conversation-actions { opacity: 1; }
+.chat-conversation-actions .chat-icon { width: 26px; height: 26px; }
+.chat-conversation.is-renaming { display: flex; align-items: center; gap: 2px; padding: 3px 3px 3px 6px; background: var(--chat-hover); }
+.chat-conversation.is-renaming input { flex: 1; min-width: 0; background: var(--chat-bg); border: 1px solid var(--chat-line); border-radius: 6px; padding: 5px 7px; font-size: 12px; color: var(--chat-ink); outline: none; }
+.chat-conversation.is-renaming .chat-icon { width: 26px; height: 26px; }
 .chat-sidebar-footer { display: grid; gap: 2px; padding-top: 10px; border-top: 1px solid var(--chat-line); }
 .chat-sidebar-footer button { display: flex; align-items: center; gap: 10px; padding: 10px; font-size: 12px; border-radius: 7px; text-align: left; }
 .chat-status-dot { height: 6px; width: 6px; border-radius: 100%; background: #75917b; margin: 0 5px; }
@@ -99,10 +112,24 @@
 .chat-table { overflow-x: auto; margin: 18px 0; }.chat-table table { border-collapse: collapse; width: 100%; font-size: 13px; }.chat-table th, .chat-table td { border: 1px solid var(--chat-line); padding: 8px 13px; text-align: left; }.chat-table th { background: var(--chat-side); }
 .chat-message-actions { display: flex; align-items: center; gap: 8px; margin-top: 7px; color: var(--chat-soft); font-size: 11px; }
 .chat-user .chat-message-actions { opacity: 0; }.chat-user:hover .chat-message-actions, .chat-user:focus-within .chat-message-actions { opacity: 1; }
+.chat-message-actions .chat-icon { width: 26px; height: 26px; }
+.chat-edited, .chat-token-hint { color: var(--chat-soft); opacity: .85; white-space: nowrap; }
+.chat-token-total { color: var(--chat-soft); font-size: 10px; white-space: nowrap; opacity: .8; }
+/* An inline edit replaces the rendered bubble in place, so the transcript keeps
+   its shape and the reader never loses their position in the thread. */
+.chat-message-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; min-width: 0; }
+.chat-message-edit textarea { width: 100%; min-height: 96px; max-height: 320px; resize: vertical; border: 1px solid var(--chat-line); border-radius: 10px; background: var(--chat-bg); color: var(--chat-ink); padding: 11px 13px; font-size: 14px; line-height: 1.7; outline: none; }
+.chat-message-edit-actions { display: flex; align-items: center; gap: 6px; }
+.chat-user .chat-message-edit { max-width: 100%; }
+/* A process step is context, not a turn: it stays slim and unboxed so the
+   answer keeps visual priority over the trail that produced it. */
+.chat-step { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 4px 0; padding-left: 2px; color: var(--chat-soft); font-size: 11px; line-height: 1.6; }
+.chat-step-label { flex-shrink: 0; border: 1px solid var(--chat-line); border-radius: 999px; padding: 1px 8px; font-size: 10px; }
+.chat-step-text { overflow-wrap: anywhere; opacity: .85; }
 .chat-thinking { display: flex; gap: 5px; padding: 7px 0; }.chat-thinking > span:not(.sr-only) { width: 5px; height: 5px; background: var(--chat-soft); border-radius: 50%; animation: chat-pulse 1.3s infinite; }.chat-thinking > span:nth-child(2) { animation-delay: .15s; }.chat-thinking > span:nth-child(3) { animation-delay: .3s; }
 @keyframes chat-pulse { 50% { opacity: .25; } }
 .chat-composer-area { position: relative; flex-shrink: 0; width: 100%; max-width: 854px; margin: 0 auto; padding: 13px 32px max(15px, env(safe-area-inset-bottom)); }
-.chat-composer { border: 1px solid var(--chat-line); border-radius: 21px; background: var(--chat-bg); box-shadow: 0 5px 22px #00000005; padding: 15px 15px 11px; }
+.chat-composer { position: relative; border: 1px solid var(--chat-line); border-radius: 21px; background: var(--chat-bg); box-shadow: 0 5px 22px #00000005; padding: 15px 15px 11px; }
 .chat-composer:focus-within { border-color: color-mix(in srgb, var(--chat-soft) 40%, var(--chat-line)); }
 .chat-composer textarea { display: block; width: 100%; min-height: 62px; max-height: 180px; resize: none; overflow-y: auto; border: 0; background: transparent; outline: none; padding: 0 5px 8px; font-size: 14px; line-height: 1.7; color: var(--chat-ink); }
 .chat-composer textarea::placeholder { color: var(--chat-soft); opacity: .8; }
@@ -111,10 +138,16 @@
 .chat-model-select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-tool { display: flex; align-items: center; gap: 5px; height: 30px; padding: 0 8px; border-radius: 7px; color: var(--chat-soft); font-size: 12px; }.chat-tool:hover, .chat-tool.is-active { background: var(--chat-hover); color: var(--chat-ink); }
 .chat-send { display: grid; place-items: center; margin-left: auto; height: 32px; width: 32px; border-radius: 50%; background: var(--chat-ink); color: var(--chat-bg); flex-shrink: 0; }.chat-send:disabled { opacity: .25 !important; }
-.chat-composer-footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 7px 5px 0; min-width: 0; }
+.chat-composer-footer { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 6px 16px; margin: 7px 5px 0; min-width: 0; }
 .chat-workspace-select { min-width: 0 !important; max-width: 50%; width: auto !important; height: 25px !important; padding: 0 !important; background: transparent !important; border: 0 !important; box-shadow: none !important; color: var(--chat-soft) !important; font-size: 10px !important; }.chat-workspace-select > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chat-keyboard-hint { font-size: 10px; color: var(--chat-soft); white-space: nowrap; opacity: .8; }
-.chat-attachments { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }.chat-attachments > span { display: flex; align-items: center; gap: 6px; max-width: 100%; border: 1px solid var(--chat-line); border-radius: 8px; padding: 6px 9px; font-size: 11px; overflow-wrap: anywhere; }.chat-attachments > span > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.chat-attachments svg { flex-shrink: 0; }
+.chat-attachments { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 10px; }.chat-attachments > span, .chat-attachments > a { display: flex; align-items: center; gap: 6px; max-width: 100%; border: 1px solid var(--chat-line); border-radius: 8px; padding: 6px 9px; font-size: 11px; overflow-wrap: anywhere; }.chat-attachments > span > span, .chat-attachments > a > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.chat-attachments svg { flex-shrink: 0; }
+.chat-attachments > span > em.chat-attachment-size { font-style: normal; flex-shrink: 0; color: var(--chat-soft); }
+.chat-attachments > span > button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; border: 0; background: transparent; color: var(--chat-soft); padding: 1px; border-radius: 5px; }.chat-attachments > span > button:hover:not(:disabled) { background: var(--chat-hover); color: var(--chat-ink); }
+.chat-attachments > a.chat-attachment-link { text-decoration: none; color: inherit; cursor: pointer; }.chat-attachments > a.chat-attachment-link:hover { background: var(--chat-hover); }
+.chat-attachments > a.chat-attachment-link > img { max-height: 46px; max-width: 96px; border-radius: 5px; object-fit: cover; flex-shrink: 0; }
+.chat-composer.is-dragging { border-color: color-mix(in srgb, var(--chat-soft) 55%, var(--chat-line)); }
+.chat-dropzone { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 8px; border-radius: 21px; background: color-mix(in srgb, var(--chat-bg) 82%, transparent); color: var(--chat-soft); font-size: 12px; pointer-events: none; }
 .chat-error, .chat-remote { display: flex; align-items: center; gap: 8px; font-size: 12px; line-height: 1.5; margin-bottom: 10px; padding: 0 5px; overflow-wrap: anywhere; }.chat-error { color: #b15543; }.chat-error button { text-decoration: underline; flex-shrink: 0; }.chat-remote { color: var(--chat-soft); }
 .chat-latest { position: absolute; left: 50%; transform: translateX(-50%); top: -32px; display: flex; align-items: center; gap: 6px; padding: 7px 12px; border: 1px solid var(--chat-line); border-radius: 18px; background: var(--chat-bg); box-shadow: 0 2px 9px #00000008; font-size: 11px; }
 .chat-mobile-sidebar { --chat-bg: #fff; --chat-side: #f6f6f5; --chat-line: #e8e8e6; --chat-ink: #242423; --chat-soft: #777774; --chat-hover: #ebebea; background: var(--chat-side); color: var(--chat-ink); }

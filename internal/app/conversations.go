@@ -48,6 +48,13 @@ type ConversationMessage struct {
 	// EditedAt marks content an operator rewrote by hand, so the UI can show
 	// that the stored text is no longer exactly what the model produced.
 	EditedAt *time.Time `json:"edited_at,omitempty"`
+	// StepType is set on role="step" entries and on attachment steps. A "step"
+	// entry is an intermediate upstream step (a tool call, a search, a thinking
+	// pass) that Notion renders as part of a process trail rather than as a chat
+	// bubble. The raw upstream type is preserved verbatim instead of being
+	// mapped onto a fixed vocabulary, so an unfamiliar step still renders with
+	// its own name rather than being dropped or mislabelled.
+	StepType string `json:"step_type,omitempty"`
 }
 
 type ConversationEntry struct {
@@ -440,6 +447,11 @@ func buildConversationSummary(entry *ConversationEntry) ConversationSummary {
 
 func conversationPreviewFromMessages(messages []ConversationMessage) string {
 	for i := len(messages) - 1; i >= 0; i-- {
+		// A process step carries tool/search text, not something a person said,
+		// so it would read as a stray fragment if it became the preview.
+		if strings.EqualFold(strings.TrimSpace(messages[i].Role), "step") {
+			continue
+		}
 		text := collapseWhitespace(messages[i].Content)
 		if text == "" && len(messages[i].Attachments) > 0 {
 			text = fmt.Sprintf("%d attachments", len(messages[i].Attachments))

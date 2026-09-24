@@ -5,6 +5,7 @@ import type {
   AdminVerifyPayload,
   AttachmentInput,
   ConversationDetailPayload,
+  ConversationMutationPayload,
   ConversationsPayload,
   HealthPayload,
   JsonResult,
@@ -91,6 +92,18 @@ export const AdminService = {
       method: 'POST',
       body: JSON.stringify({ ids }),
     });
+  },
+  renameConversation(id: string, title: string) {
+    return apiFetch<ConversationMutationPayload>(`/admin/conversations/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    });
+  },
+  editConversationMessage(id: string, messageId: string, content: string) {
+    return apiFetch<ConversationMutationPayload>(
+      `/admin/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}`,
+      { method: 'PATCH', body: JSON.stringify({ content }) },
+    );
   },
   testPrompt(payload: {
     prompt: string;
