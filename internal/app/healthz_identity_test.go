@@ -140,7 +140,8 @@ func TestHealthzAnonymousStillReportsRuntimeFields(t *testing.T) {
 	if got, _ := payload["last_session_refresh"].(string); got != "2026-01-02T03:04:05Z" {
 		t.Errorf("last_session_refresh = %q", got)
 	}
-	if got, _ := payload["last_session_refresh_error"].(string); got != "refresh failed" {
+	// Anonymous callers learn that refresh failed, not the raw error text.
+	if got, _ := payload["last_session_refresh_error"].(string); got != "session refresh failed" {
 		t.Errorf("last_session_refresh_error = %q", got)
 	}
 	assertNoIdentity(t, payload, "cached runtime path")

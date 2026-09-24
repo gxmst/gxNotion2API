@@ -224,7 +224,9 @@ func (a *App) deleteAdminConversationByID(r *http.Request, conversationID string
 		if err := client.deleteThread(timedRequest.Context(), threadID); err != nil {
 			return err
 		}
-		a.State.deleteConversationSessionByConversationOrThread("", threadID)
+		if err := a.State.deleteConversationSessionByConversationOrThread("", threadID); err != nil {
+			return err
+		}
 		a.State.deleteResponsesByConversationOrThread("", threadID)
 		return nil
 	}
@@ -357,7 +359,6 @@ func (a *App) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-	applyCORSHeaders(w)
 	w.WriteHeader(http.StatusOK)
 
 	subID, events := a.State.conversations().Subscribe()

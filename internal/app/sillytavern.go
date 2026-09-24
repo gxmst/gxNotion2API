@@ -471,6 +471,12 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				}
 			}
 			if strings.TrimSpace(target.Conversation.ThreadID) != "" {
+				if a.conversationDeleted(target.Conversation.ID) {
+					// Only a session row survived a partial delete. Adopting its
+					// thread would continue a conversation nobody owns, and the
+					// caller would recreate the row under the same id.
+					return sillyTavernContinuationMatch{}, false
+				}
 				target = continuationTargetWithSession(target.Conversation, target.Session)
 				return sillyTavernContinuationMatch{
 					Target:            target,
@@ -496,6 +502,12 @@ func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string
 				}
 			}
 			if strings.TrimSpace(target.Conversation.ThreadID) != "" {
+				if a.conversationDeleted(target.Conversation.ID) {
+					// Same guard as the explicit-id branch above: a leftover
+					// session row must not let a deleted conversation's thread
+					// be continued through an explicit thread id.
+					return sillyTavernContinuationMatch{}, false
+				}
 				target = continuationTargetWithSession(target.Conversation, target.Session)
 				return sillyTavernContinuationMatch{
 					Target:            target,

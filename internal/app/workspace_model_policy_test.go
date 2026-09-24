@@ -5,7 +5,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -20,6 +23,9 @@ type policyTestUpstream struct {
 	unconfirmed  bool
 	calls        int
 	catalog      string
+	// rawUpdateBody, when set, is returned verbatim from updateSpaceSettings so
+	// a test can simulate an accepted write whose response cannot be parsed.
+	rawUpdateBody string
 }
 
 func newPolicyTestUpstream(t *testing.T) *policyTestUpstream {
@@ -72,9 +78,9 @@ func newPolicyTestUpstream(t *testing.T) *policyTestUpstream {
 				return
 			}
 			_, _ = w.Write([]byte(`{"modelSelectionRestricted":false,"models":[
-{"model":"model-a","modelMessage":"Model A","modelFamily":"mystery","modelProvider":"glm","restrictedForPersonalAgent":true,"workflow":{}},
-{"model":"model-b","modelMessage":"Model B","modelProvider":"anthropic","workflow":{}},
-{"model":"model-c","modelMessage":"Model C","modelProvider":"glm","workflow":{}},
+{"model":"model-a","modelMessage":"Model A","modelFamily":"mystery","modelProvider":"glm","restrictedForPersonalAgent":true,"workflow":{},"customAgent":{}},
+{"model":"model-b","modelMessage":"Model B","modelProvider":"anthropic","workflow":{},"customAgent":{}},
+{"model":"model-c","modelMessage":"Model C","modelProvider":"glm","workflow":{},"customAgent":{}},
 {"model":"paid-only","modelMessage":"Paid Only","modelProvider":"openai","isDisabled":true,"workflow":{"isDisabled":true,"disabledReason":"trial_not_allowed"}}
 ]}`))
 		case "/api/v3/updateSpaceSettings":
@@ -100,6 +106,10 @@ func newPolicyTestUpstream(t *testing.T) *policyTestUpstream {
 			}
 			for _, key := range unset {
 				delete(fixture.settings, stringValue(key))
+			}
+			if fixture.rawUpdateBody != "" {
+				_, _ = w.Write([]byte(fixture.rawUpdateBody))
+				return
 			}
 			if fixture.unconfirmed {
 				_, _ = w.Write([]byte(`{}`))
@@ -195,14 +205,18 @@ func TestManualModelPolicyLockAndRestore(t *testing.T) {
 			if w := f.edit(t, policyLockEdit(after)); w.Code != 200 || len(f.writes) != 1 {
 				t.Fatal("identical setting was written again")
 			}
+			// The pre-change policy is kept server-side, so a reload loses nothing.
+			if reread := f.read(t, scope); reread.RestorePoint == nil || modelPolicyRevision(scope, reread.RestorePoint.Policy, reread.RestorePoint.Present) != before.Revision {
+				t.Fatalf("restore point missing or wrong: %+v", reread.RestorePoint)
+			}
 			restore := policyLockEdit(after)
-			restore.Action, restore.RestorePolicy, restore.RestorePresent = "restore", &before.Policy, before.PolicyPresent
+			restore.Action = "restore"
 			w = f.edit(t, restore)
 			if w.Code != 200 || len(f.writes) != 2 {
 				t.Fatalf("restore: %d %s", w.Code, w.Body.String())
 			}
-			if restored := f.read(t, scope); restored.Revision != before.Revision {
-				t.Fatal("restore did not preserve the exact prior policy")
+			if restored := f.read(t, scope); restored.Revision != before.Revision || restored.RestorePoint != nil {
+				t.Fatal("restore did not preserve the exact prior policy or kept a stale restore point")
 			}
 			cfg, _, _ := f.app.State.Snapshot()
 			workspace, _ := accountWorkspace(cfg.Accounts[0], "policy-space")
@@ -293,6 +307,18 @@ func TestModelPolicyFailuresNeverReplayAndMissingPolicyRestores(t *testing.T) {
 			if w.Code != want || len(f.writes) != wantWrites {
 				t.Fatalf("unexpected retry/result: %d %s writes=%d", w.Code, w.Body.String(), len(f.writes))
 			}
+			if scenario == "forbidden" || scenario == "limited" {
+				// An explicit rejection changed nothing, so no restore point.
+				cfg, _, _ := f.app.State.Snapshot()
+				if f.app.State.modelPolicyRestorePoint(cfg, modelPolicyRestoreKey("policy-space", "personal")) != nil {
+					t.Fatal("rejected write left a restore point")
+				}
+			}
+			if scenario == "unconfirmed" || scenario == "redirect" {
+				if after := f.read(t, "personal"); after.RestorePoint == nil {
+					t.Fatal("unconfirmed write must keep the restore point")
+				}
+			}
 			if scenario == "limited" {
 				cfg, _, _ := f.app.State.Snapshot()
 				if w.Header().Get("Retry-After") == "" || !parseOptionalRFC3339(cfg.Accounts[0].CredentialCooldownUntil).After(time.Now()) {
@@ -303,7 +329,6 @@ func TestModelPolicyFailuresNeverReplayAndMissingPolicyRestores(t *testing.T) {
 				after := f.read(t, "personal")
 				restore := policyLockEdit(after)
 				restore.Action = "restore"
-				restore.RestorePolicy = &before.Policy
 				if w := f.edit(t, restore); w.Code != 200 {
 					t.Fatalf("unset failed: %s", w.Body.String())
 				}
@@ -341,5 +366,156 @@ func TestModelPolicyRejectsIncompleteCatalogBeforeWriting(t *testing.T) {
 				t.Fatalf("incomplete catalog allowed a policy write: %d writes=%d", w.Code, len(f.writes))
 			}
 		})
+	}
+}
+
+func TestModelPolicyClearAndRestoreGuards(t *testing.T) {
+	f := newPolicyTestUpstream(t)
+	before := f.read(t, "personal")
+	restore := policyLockEdit(before)
+	restore.Action = "restore"
+	if w := f.edit(t, restore); w.Code != http.StatusConflict || len(f.writes) != 0 {
+		t.Fatalf("restore without a restore point: %d writes=%d", w.Code, len(f.writes))
+	}
+	partial := policyLockEdit(before)
+	partial.Action, partial.RestorePolicy = "restore", &before.Policy
+	if w := f.edit(t, partial); w.Code != http.StatusBadRequest || len(f.writes) != 0 {
+		t.Fatalf("restore_policy without restore_present: %d", w.Code)
+	}
+	clear := policyLockEdit(before)
+	clear.Action = "clear"
+	if w := f.edit(t, clear); w.Code != 200 || len(f.writes) != 1 {
+		t.Fatalf("clear: %d %s", w.Code, w.Body.String())
+	}
+	if _, exists := f.settings["personal_agent_model_policy"]; exists {
+		t.Fatal("clear did not unset the policy")
+	}
+}
+
+func TestModelPolicyCatalogSurfacesAndExtraFields(t *testing.T) {
+	f := newPolicyTestUpstream(t)
+	f.settings["custom_agent_model_policy"] = map[string]any{"disabledModels": []string{"custom-old"}, "disabledProviders": []string{}, "allowedRestrictedModels": []string{"paid-only"}, "defaultModel": "model-c"}
+	f.catalog = `{"models":[
+{"model":"model-a","modelMessage":"Model A","modelProvider":"glm","workflow":{}},
+{"model":"agent-only","modelMessage":"Agent Only","modelProvider":"anthropic","customAgent":{}}
+]}`
+	personal := f.read(t, "personal")
+	for _, model := range personal.Models {
+		if model.ID == "agent-only" && model.Available {
+			t.Fatal("a model without a workflow entry was offered for personal agents")
+		}
+	}
+	custom := f.read(t, "custom")
+	if custom.Policy.DefaultModel != "model-c" || len(custom.Policy.AllowedRestrictedModels) != 1 {
+		t.Fatalf("extra policy fields dropped: %+v", custom.Policy)
+	}
+	lock := policyLockEdit(custom)
+	lock.ModelID = "agent-only"
+	if w := f.edit(t, lock); w.Code != 200 {
+		t.Fatalf("lock: %d %s", w.Code, w.Body.String())
+	}
+	written, _ := json.Marshal(f.settings["custom_agent_model_policy"])
+	var policy workspaceModelPolicy
+	_ = json.Unmarshal(written, &policy)
+	if policy.DefaultModel != "agent-only" || !reflect.DeepEqual(policy.AllowedRestrictedModels, []string{"paid-only"}) {
+		t.Fatalf("lock mishandled extra fields: %+v", policy)
+	}
+}
+
+// readModelPolicyAudit returns every entry written beside the config.
+func readModelPolicyAudit(t *testing.T, app *App) []modelPolicyAuditEntry {
+	t.Helper()
+	cfg, _, _ := app.State.Snapshot()
+	raw, err := os.ReadFile(filepath.Join(filepath.Dir(cfg.Storage.SQLitePath), "model_policy_audit.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var entries []modelPolicyAuditEntry
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry modelPolicyAuditEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatal(err)
+		}
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+func lastModelPolicyAuditEntry(t *testing.T, app *App) modelPolicyAuditEntry {
+	t.Helper()
+	entries := readModelPolicyAudit(t, app)
+	if len(entries) == 0 {
+		t.Fatal("no audit entry was written")
+	}
+	return entries[len(entries)-1]
+}
+
+// The audit trail exists to answer "what did this write replace?". The success
+// path reassigns snapshot.Policy, so an entry that reads it at defer time would
+// record before == after and lose the policy the operator overwrote.
+func TestModelPolicyAuditRecordsTheReplacedPolicy(t *testing.T) {
+	fixture := newPolicyTestUpstream(t)
+	before := fixture.read(t, "personal")
+	if slices.Contains(before.Policy.DisabledModels, "model-b") {
+		t.Fatalf("precondition failed: model-b is already locked (%v)", before.Policy.DisabledModels)
+	}
+
+	w := fixture.edit(t, modelPolicyEdit{
+		Email: before.Email, WorkspaceID: before.WorkspaceID, Scope: before.Scope,
+		Revision: before.Revision, Action: "lock", ModelID: "model-b",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("lock: %d %s", w.Code, w.Body.String())
+	}
+
+	last := lastModelPolicyAuditEntry(t, fixture.app)
+	if last.Result != "ok" {
+		t.Fatalf("expected a confirmed write, got result=%q", last.Result)
+	}
+	// Locking one model disables every other one, so before and after must
+	// differ. Reading snapshot.Policy at defer time made them identical.
+	if !reflect.DeepEqual(last.Before, before.Policy) {
+		t.Fatalf("audit recorded %v as the previous policy, want %v", last.Before, before.Policy)
+	}
+	if reflect.DeepEqual(last.Before, last.After) {
+		t.Fatalf("audit recorded the applied policy as its own predecessor: %v", last.After.DisabledModels)
+	}
+	if slices.Contains(last.After.DisabledModels, "model-b") {
+		t.Fatalf("lock did not disable the other models: after=%v", last.After.DisabledModels)
+	}
+	if !slices.Contains(last.After.DisabledModels, "model-c") {
+		t.Fatalf("lock did not disable model-c: after=%v", last.After.DisabledModels)
+	}
+}
+
+// Notion accepting the write and then returning a body we cannot parse is not
+// the same as the write never leaving. The audit trail must not claim the
+// request was unsent when the workspace setting may already have changed.
+func TestModelPolicyAuditRecordsSentButUnparsableWrite(t *testing.T) {
+	fixture := newPolicyTestUpstream(t)
+	before := fixture.read(t, "personal")
+	fixture.rawUpdateBody = "this is not json"
+
+	w := fixture.edit(t, modelPolicyEdit{
+		Email: before.Email, WorkspaceID: before.WorkspaceID, Scope: before.Scope,
+		Revision: before.Revision, Action: "lock", ModelID: "model-b",
+	})
+	if w.Code == http.StatusOK {
+		t.Fatalf("unparsable confirmation must not be reported as success: %s", w.Body.String())
+	}
+
+	last := lastModelPolicyAuditEntry(t, fixture.app)
+	if last.Result == "not_sent" {
+		t.Fatal("audit recorded an accepted write as never sent")
+	}
+	if last.Result != "unconfirmed" {
+		t.Fatalf("expected an unconfirmed audit result, got %q", last.Result)
+	}
+	// The write did reach upstream, so the fixture's settings reflect it.
+	if _, ok := fixture.settings["personal_agent_model_policy"]; !ok {
+		t.Fatal("precondition failed: upstream never received the write")
 	}
 }

@@ -43,13 +43,11 @@ func isSessionRetryableError(err error) bool {
 	if errors.As(err, &loginErr) {
 		return loginErr.StatusCode == http.StatusUnauthorized || loginErr.StatusCode == http.StatusForbidden
 	}
-	message := strings.ToLower(strings.TrimSpace(err.Error()))
-	return strings.Contains(message, "notion_user_id missing") ||
-		strings.Contains(message, "cookie jar empty") ||
-		strings.Contains(message, "unauthorized") ||
-		strings.Contains(message, "forbidden") ||
-		strings.Contains(message, "session expired") ||
-		strings.Contains(message, "client version")
+	// Free-form error text is deliberately not inspected: a client attachment
+	// URL answering "403 Forbidden" used to read as an expired session and
+	// refresh, re-login and cool down every account in the pool. Only typed
+	// upstream statuses and the explicit internal marker count.
+	return errors.Is(err, errSessionInvalid)
 }
 
 func loadSessionInfoForAccountRefresh(cfg AppConfig, account NotionAccount) (SessionInfo, error) {
@@ -120,7 +118,7 @@ func buildRefreshedSession(ctx context.Context, cfg AppConfig, account NotionAcc
 		probeCookieValue(probeCookiesFromJar(session.Jar, upstream.LoginURL()), "notion_user_id"),
 	)
 	if userID == "" {
-		return SessionInfo{}, fmt.Errorf("notion_user_id missing during session refresh")
+		return SessionInfo{}, fmt.Errorf("%w: notion_user_id missing during session refresh", errSessionInvalid)
 	}
 	spaces, err := getSpacesInitial(ctx, session, upstream, clientVersion, userID)
 	if err != nil {
@@ -131,7 +129,7 @@ func buildRefreshedSession(ctx context.Context, cfg AppConfig, account NotionAcc
 		cookies = probeCookiesFromJar(session.Jar, upstream.LoginURL())
 	}
 	if len(cookies) == 0 {
-		return SessionInfo{}, fmt.Errorf("cookie jar empty after session refresh")
+		return SessionInfo{}, fmt.Errorf("%w: cookie jar empty after session refresh", errSessionInvalid)
 	}
 	userName := firstNonEmpty(spaces.UserName, prior.UserName, account.UserName)
 	if userName == "" {
@@ -313,16 +311,20 @@ func (s *ServerState) tryRefreshAccount(ctx context.Context, cfg AppConfig, acco
 	account.ConsecutiveFailures = 0
 	// A completed refresh means the account is healthy again, so the cleared
 	// counters must survive persistence rather than being merged back.
+	// The active account is deliberately left alone: a refresh triggered by
+	// dispatch must not silently move the global active account. Only
+	// RefreshSession, which refreshes the active account on purpose, may switch.
 	cfg.UpsertAccountRuntimeState(account)
-	cfg.ActiveAccount = account.Email
-	cfg.ActiveWorkspaceID = accountWorkspaceID(account)
-	cfg.ProbeJSON = account.ProbeJSON
 	return cfg, nil
 }
 
 func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
-	s.refreshMu.Lock()
-	defer s.refreshMu.Unlock()
+	// sessionRefreshMu only keeps two explicit/periodic refreshes from running
+	// at once. refreshMu is taken solely for the commit, so dispatch
+	// bookkeeping and admin saves are never blocked behind the network calls
+	// a refresh (and its AutoSwitch fallbacks) make.
+	s.sessionRefreshMu.Lock()
+	defer s.sessionRefreshMu.Unlock()
 
 	cfg, _, _ := s.Snapshot()
 	refreshCfg := cfg.ResolveSessionRefresh()
@@ -338,19 +340,24 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 	if testHookTryRefreshAccount != nil {
 		tryRefresh = testHookTryRefreshAccount
 	}
-	saveAndApply := s.saveAndApplyLocked
-	if testHookSaveAndApply != nil {
-		saveAndApply = func(cfg AppConfig) error {
-			return testHookSaveAndApply(s, cfg)
+	// attempt refreshes one account without holding refreshMu and then commits
+	// the outcome against the live state with an identity check. A failed
+	// refresh still commits its status (expired/failed) so the admin view
+	// reflects it; only a successful one makes the account active.
+	attempt := func(candidate NotionAccount) (refreshErr error, saveErr error) {
+		updatedCfg, err := tryRefresh(ctx, cfg, candidate)
+		if _, commitErr := s.commitAccountRefreshResult(cfg, candidate, updatedCfg, err == nil); commitErr != nil && err == nil {
+			return nil, commitErr
 		}
+		return err, nil
 	}
 
-	updatedCfg, err := tryRefresh(ctx, cfg, account)
+	err, saveErr := attempt(account)
+	if saveErr != nil {
+		s.setSessionRefreshRuntime(saveErr)
+		return saveErr
+	}
 	if err == nil {
-		if saveErr := saveAndApply(updatedCfg); saveErr != nil {
-			s.setSessionRefreshRuntime(saveErr)
-			return saveErr
-		}
 		if s.DispatchProbeCache != nil {
 			s.DispatchProbeCache.invalidateAll()
 		}
@@ -360,7 +367,6 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 
 	if !refreshCfg.AutoSwitch {
 		s.setSessionRefreshRuntime(err)
-		_ = saveAndApply(updatedCfg)
 		return fmt.Errorf("refresh active account %s failed (%s): %w", account.Email, reason, err)
 	}
 
@@ -372,15 +378,14 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 		if !fileExists(ensureAccountPaths(cfg, candidate).ProbeJSON) {
 			continue
 		}
-		nextCfg, nextErr := tryRefresh(ctx, updatedCfg, candidate)
-		if nextErr != nil {
-			lastErr = nextErr
-			updatedCfg = nextCfg
-			continue
-		}
-		if saveErr := saveAndApply(nextCfg); saveErr != nil {
+		nextErr, saveErr := attempt(candidate)
+		if saveErr != nil {
 			s.setSessionRefreshRuntime(saveErr)
 			return saveErr
+		}
+		if nextErr != nil {
+			lastErr = nextErr
+			continue
 		}
 		if s.DispatchProbeCache != nil {
 			s.DispatchProbeCache.invalidateAll()
@@ -389,7 +394,6 @@ func (s *ServerState) RefreshSession(ctx context.Context, reason string) error {
 		return nil
 	}
 
-	_ = saveAndApply(updatedCfg)
 	s.setSessionRefreshRuntime(lastErr)
 	return fmt.Errorf("session refresh failed after trying active account and fallbacks (%s): %w", reason, lastErr)
 }

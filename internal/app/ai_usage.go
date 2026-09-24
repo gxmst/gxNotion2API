@@ -43,9 +43,100 @@ type workspaceAIUsage struct {
 	OverageLimit                int   `json:"overage_limit,omitempty"`
 	PremiumServicePeriodStartMs int64 `json:"premium_service_period_start_ms,omitempty"`
 	LastUsageAtMs               int64 `json:"last_usage_at_ms,omitempty"`
+	// RateLimit carries the rolling credit windows. It is fetched separately
+	// from the allowance counters and may be absent on its own.
+	RateLimit *workspaceRateLimit `json:"rate_limit,omitempty"`
 
 	usageFromV2  bool `json:"-"`
 	limitsFromV2 bool `json:"-"`
+}
+
+// workspaceRateLimitWindow is one rolling allowance window as Notion reports it.
+// Used and Limit are the raw upstream numbers; a remaining percentage is only
+// derived by the caller, and only when Limit > 0. Label is upstream's own name
+// for the window ("5h", "6h", ...) and is shown verbatim -- the length belongs
+// to Notion, not to us.
+type workspaceRateLimitWindow struct {
+	Label       string  `json:"label,omitempty"`
+	CreditType  string  `json:"credit_type,omitempty"`
+	Scope       string  `json:"scope,omitempty"`
+	Cadence     string  `json:"cadence,omitempty"`
+	Used        float64 `json:"used"`
+	Limit       float64 `json:"limit"`
+	PeriodEndMs int64   `json:"period_end_ms,omitempty"`
+}
+
+// workspaceRateLimit is the two-window credit status of one workspace: a short
+// rolling window and the longer billing-period window. Either may be missing,
+// so both are optional and callers render only what came back.
+type workspaceRateLimit struct {
+	Status string                    `json:"status,omitempty"`
+	Short  *workspaceRateLimitWindow `json:"short,omitempty"`
+	Long   *workspaceRateLimitWindow `json:"long,omitempty"`
+}
+
+// getCreditRateLimitStatus fetches the rolling credit windows for one space.
+// This is a different endpoint from the allowance counters: it answers "how
+// much of the current window is left", which is what a quota display needs.
+func (c *NotionAIClient) getCreditRateLimitStatus(ctx context.Context, spaceID string) (*workspaceRateLimit, error) {
+	spaceID = strings.TrimSpace(spaceID)
+	if spaceID == "" {
+		return nil, fmt.Errorf("credit rate limit: space id is empty")
+	}
+	body, err := c.postJSON(ctx, c.Config.NotionUpstream().API("getCreditRateLimitStatus"), map[string]any{"spaceId": spaceID}, "application/json")
+	if err != nil {
+		return nil, err
+	}
+	return parseCreditRateLimitStatus(body)
+}
+
+func parseCreditRateLimitStatus(body []byte) (*workspaceRateLimit, error) {
+	var payload struct {
+		Status string `json:"status"`
+		Window *struct {
+			CreditType string  `json:"creditType"`
+			Scope      string  `json:"scope"`
+			Window     string  `json:"window"`
+			Used       float64 `json:"used"`
+			Limit      float64 `json:"limit"`
+		} `json:"window"`
+		BillingPeriodWindow *struct {
+			CreditType  string  `json:"creditType"`
+			Scope       string  `json:"scope"`
+			Cadence     string  `json:"cadence"`
+			Used        float64 `json:"used"`
+			Limit       float64 `json:"limit"`
+			PeriodEndMs int64   `json:"periodEndMs"`
+		} `json:"billingPeriodWindow"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, fmt.Errorf("decode credit rate limit: %w", err)
+	}
+	if payload.Window == nil && payload.BillingPeriodWindow == nil {
+		return nil, fmt.Errorf("decode credit rate limit: no recognized window fields")
+	}
+	out := &workspaceRateLimit{Status: strings.TrimSpace(payload.Status)}
+	if window := payload.Window; window != nil {
+		out.Short = &workspaceRateLimitWindow{
+			Label:      strings.TrimSpace(window.Window),
+			CreditType: strings.TrimSpace(window.CreditType),
+			Scope:      strings.TrimSpace(window.Scope),
+			Used:       window.Used,
+			Limit:      window.Limit,
+		}
+	}
+	if window := payload.BillingPeriodWindow; window != nil {
+		out.Long = &workspaceRateLimitWindow{
+			Label:       strings.TrimSpace(window.Cadence),
+			CreditType:  strings.TrimSpace(window.CreditType),
+			Scope:       strings.TrimSpace(window.Scope),
+			Cadence:     strings.TrimSpace(window.Cadence),
+			Used:        window.Used,
+			Limit:       window.Limit,
+			PeriodEndMs: window.PeriodEndMs,
+		}
+	}
+	return out, nil
 }
 
 // getAIUsageEligibility fetches the workspace AI allowance for one space. The

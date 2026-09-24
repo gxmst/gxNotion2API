@@ -138,8 +138,16 @@ func TestWorkspaceModelRoutingAndExplicitAutoFallback(t *testing.T) {
 		t.Fatal("fallback lost requested identity or did not use Auto")
 	}
 	cfg.Accounts[0].Workspaces[0].ModelCapabilities = nil
+	candidates, err = resolveDispatchCandidates(cfg, request, time.Now())
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("unknown capability with restricted fallback enabled must fall back to Auto: %v", err)
+	}
+	if resolved, err = selectWorkspaceModel(cfg, candidates[0], request); err != nil || resolved.NotionModel != "" || resolved.ModelSelectionMode != "auto_fallback" {
+		t.Fatalf("unknown capability did not fall back to Auto: %+v %v", resolved, err)
+	}
+	cfg.Dispatch.RestrictedModelFallback = false
 	if _, err := resolveDispatchCandidates(cfg, request, time.Now()); !isModelSelectionError(err) {
-		t.Fatal("unknown capability treated as restricted")
+		t.Fatal("unknown capability without fallback must be rejected")
 	}
 	request.NotionModel = ""
 	if _, err := resolveDispatchCandidates(cfg, request, time.Now()); err != nil {

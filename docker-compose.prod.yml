@@ -9,7 +9,7 @@ services:
     expose:
       - "8787"
     volumes:
-      - ./config.docker.json:/app/config/config.json
+      - ./config.docker.local.json:/app/config/config.json
       - notion2api-data:/app/data
     environment:
       TZ: Asia/Shanghai

@@ -50,7 +50,9 @@ func TestAdminChatStreamContinuesAndLoadsLocalHistory(t *testing.T) {
 		t.Fatalf("local history did not preserve both turns: status=%d", rec.Code)
 	}
 	unauthenticated := httptest.NewRecorder()
-	app.ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodPost, "/admin/test", mustJSONBody(t, map[string]any{"prompt": "denied", "stream": true})))
+	denied := httptest.NewRequest(http.MethodPost, "/admin/test", mustJSONBody(t, map[string]any{"prompt": "denied", "stream": true}))
+	denied.Header.Set("Content-Type", "application/json")
+	app.ServeHTTP(unauthenticated, denied)
 	if unauthenticated.Code != http.StatusUnauthorized || len(requests) != 2 {
 		t.Fatal("unauthenticated stream was dispatched")
 	}
@@ -110,7 +112,7 @@ func TestAdminChatStreamCancellationPreservesPartialHistory(t *testing.T) {
 	if account.TotalFailures != 0 || account.CooldownUntil != "" {
 		t.Fatal("cancellation cooled down a healthy account")
 	}
-	if app.State.AvailableDispatchCapacity([]string{account.Email}) == 0 {
+	if app.State.AvailableDispatchCapacityKeys([]string{dispatchWorkspaceKey(account)}) == 0 {
 		t.Fatal("cancellation leaked the dispatch slot")
 	}
 }

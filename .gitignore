@@ -51,3 +51,11 @@ __tests__/
 !frontend/tests/*.spec.ts
 WEBUI_DEVELOPMENT_GUIDE.md
 .serena/
+
+# Local-only notes (real account / workspace identifiers)
+docs/local/
+# Model policy restore points and audit log written beside the config
+model_policy_restore_points.json
+model_policy_audit.jsonl
+# Agent working memory, not project source
+.workbuddy-ai/

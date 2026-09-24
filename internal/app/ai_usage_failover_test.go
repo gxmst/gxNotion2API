@@ -45,7 +45,7 @@ func TestKnownQuotaCooldownContinuationFailover(t *testing.T) {
 				if tc.ordinaryFailure {
 					failure = errors.New("synthetic transport failure")
 				}
-				if err := app.State.finishAccountDispatchFailure("primary@example.com", time.Now(), failure, false); err != nil {
+				if err := app.State.finishWorkspaceDispatchFailure("primary@example.com", testDefaultWorkspaceID(app.State, "primary@example.com"), time.Now(), failure, false); err != nil {
 					t.Fatal(err)
 				}
 				entry := app.State.conversations().Create(ConversationCreateRequest{Prompt: "first question"})
@@ -722,6 +722,10 @@ func TestAdminAIUsageEndpoint(t *testing.T) {
 	}
 	defer state.Close()
 	app := &App{State: state}
+	token := "test-admin-token"
+	state.mu.Lock()
+	state.AdminTokens[token] = time.Now().Add(time.Hour)
+	state.mu.Unlock()
 
 	fetches := 0
 	app.workspaceAIUsageFetchOverride = func(_ context.Context, _ AppConfig, account NotionAccount) (workspaceAIUsage, error) {
@@ -732,8 +736,21 @@ func TestAdminAIUsageEndpoint(t *testing.T) {
 		return workspaceAIUsage{}, errors.New("upstream denied")
 	}
 
+	// The report names every account and its workspaces and can force upstream
+	// calls, so it must never answer anonymously.
 	rec := httptest.NewRecorder()
-	app.handleAdminAccountsAIUsage(rec, httptest.NewRequest(http.MethodGet, "/admin/accounts/ai-usage", nil))
+	app.handleAdminAccountsAIUsage(rec, httptest.NewRequest(http.MethodGet, "/admin/accounts/ai-usage?refresh=1", nil))
+	if rec.Code != http.StatusUnauthorized || fetches != 0 {
+		t.Fatalf("anonymous status = %d fetches=%d, want 401 and no upstream call", rec.Code, fetches)
+	}
+
+	authed := func(method, target string) *http.Request {
+		req := httptest.NewRequest(method, target, nil)
+		req.Header.Set("X-Admin-Token", token)
+		return req
+	}
+	rec = httptest.NewRecorder()
+	app.handleAdminAccountsAIUsage(rec, authed(http.MethodGet, "/admin/accounts/ai-usage"))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -764,8 +781,20 @@ func TestAdminAIUsageEndpoint(t *testing.T) {
 		t.Fatalf("fetches = %d, want 1 (only the eligible account is queried)", fetches)
 	}
 
+	// Back-to-back forced refreshes collapse into one upstream round.
+	for i := 0; i < 2; i++ {
+		rec = httptest.NewRecorder()
+		app.handleAdminAccountsAIUsage(rec, authed(http.MethodGet, "/admin/accounts/ai-usage?refresh=1"))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("forced status = %d", rec.Code)
+		}
+	}
+	if fetches != 2 {
+		t.Fatalf("fetches = %d, want 2 (second forced refresh is throttled)", fetches)
+	}
+
 	rec = httptest.NewRecorder()
-	app.handleAdminAccountsAIUsage(rec, httptest.NewRequest(http.MethodPut, "/admin/accounts/ai-usage", nil))
+	app.handleAdminAccountsAIUsage(rec, authed(http.MethodPut, "/admin/accounts/ai-usage"))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("put status = %d, want 405", rec.Code)
 	}

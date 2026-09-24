@@ -4,9 +4,12 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -228,6 +231,11 @@ func (a *App) cleanupAdminLoginAttemptsLocked(now time.Time) {
 		}
 		if !attempt.LockedUntil.IsZero() && now.After(attempt.LockedUntil) && now.Sub(attempt.LastFailure) > adminLoginLockWindow {
 			delete(a.State.AdminLoginAttempts, key)
+			continue
+		}
+		// Failures that never reached the lock threshold age out too.
+		if attempt.LockedUntil.IsZero() && now.Sub(attempt.LastFailure) > adminLoginLockWindow {
+			delete(a.State.AdminLoginAttempts, key)
 		}
 	}
 }
@@ -244,22 +252,39 @@ func (a *App) adminLoginLocked(clientIP string) (time.Time, bool) {
 	return attempt.LockedUntil, true
 }
 
-func (a *App) recordAdminLoginFailure(clientIP string) (time.Time, bool) {
+// reserveAdminLoginAttempt counts an attempt as failed before the password is
+// checked, in the same critical section as the lockout check. Checking first and
+// recording only after a failed comparison let a burst of concurrent requests
+// all pass the check and try far more than adminLoginMaxFailures passwords.
+// A successful login clears the reservation.
+func (a *App) reserveAdminLoginAttempt(clientIP string) (time.Time, bool) {
 	now := time.Now()
 	a.State.mu.Lock()
 	defer a.State.mu.Unlock()
 	a.cleanupAdminLoginAttemptsLocked(now)
 	attempt := a.State.AdminLoginAttempts[clientIP]
+	if !attempt.LockedUntil.IsZero() && now.Before(attempt.LockedUntil) {
+		return attempt.LockedUntil, true
+	}
 	attempt.Failures++
 	attempt.LastFailure = now
 	if attempt.Failures >= adminLoginMaxFailures {
 		attempt.LockedUntil = now.Add(adminLoginLockWindow)
 	}
 	a.State.AdminLoginAttempts[clientIP] = attempt
-	if attempt.LockedUntil.IsZero() {
-		return time.Time{}, false
+	return time.Time{}, false
+}
+
+// revokeOtherAdminTokens ends every admin session except the caller's.
+func (a *App) revokeOtherAdminTokens(keep string) {
+	keep = strings.TrimSpace(keep)
+	a.State.mu.Lock()
+	defer a.State.mu.Unlock()
+	for token := range a.State.AdminTokens {
+		if token != keep {
+			delete(a.State.AdminTokens, token)
+		}
 	}
-	return attempt.LockedUntil, true
 }
 
 func (a *App) clearAdminLoginFailures(clientIP string) {
@@ -346,7 +371,55 @@ func (a *App) adminAuthOK(w http.ResponseWriter, r *http.Request) bool {
 func redactConfigSecrets(cfg AppConfig) AppConfig {
 	cfg.APIKey = ""
 	cfg.Admin.Password = ""
+	cfg.ProxyURL, cfg.ProxyHTTPURL, cfg.ProxyHTTPSURL, cfg.ResinURL = redactProxyURL(cfg.ProxyURL), redactProxyURL(cfg.ProxyHTTPURL), redactProxyURL(cfg.ProxyHTTPSURL), redactProxyURL(cfg.ResinURL)
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		account.ProxyURL, account.ProxyHTTPURL, account.ProxyHTTPSURL, account.ResinURL = redactProxyURL(account.ProxyURL), redactProxyURL(account.ProxyHTTPURL), redactProxyURL(account.ProxyHTTPSURL), redactProxyURL(account.ResinURL)
+	}
 	return cfg
+}
+
+const redactedURLPassword = "__redacted__"
+
+// redactProxyURL masks the password in a proxy URL's userinfo so config reads,
+// exports and snapshots do not carry it. restoreRedactedProxyURL maps the
+// masked form back when the admin console saves it unchanged.
+func redactProxyURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || parsed.User == nil {
+		return raw
+	}
+	if _, hasPassword := parsed.User.Password(); !hasPassword {
+		return raw
+	}
+	parsed.User = url.UserPassword(parsed.User.Username(), redactedURLPassword)
+	return parsed.String()
+}
+
+func restoreRedactedProxyURL(incoming, current string) string {
+	if incoming != current && strings.Contains(incoming, redactedURLPassword) && incoming == redactProxyURL(current) {
+		return current
+	}
+	return incoming
+}
+
+func restoreRedactedProxySecrets(cfg *AppConfig, current AppConfig) {
+	cfg.ProxyURL = restoreRedactedProxyURL(cfg.ProxyURL, current.ProxyURL)
+	cfg.ProxyHTTPURL = restoreRedactedProxyURL(cfg.ProxyHTTPURL, current.ProxyHTTPURL)
+	cfg.ProxyHTTPSURL = restoreRedactedProxyURL(cfg.ProxyHTTPSURL, current.ProxyHTTPSURL)
+	cfg.ResinURL = restoreRedactedProxyURL(cfg.ResinURL, current.ResinURL)
+	for i := range cfg.Accounts {
+		account := &cfg.Accounts[i]
+		existing, _, ok := current.FindAccount(account.Email)
+		if !ok {
+			continue
+		}
+		account.ProxyURL = restoreRedactedProxyURL(account.ProxyURL, existing.ProxyURL)
+		account.ProxyHTTPURL = restoreRedactedProxyURL(account.ProxyHTTPURL, existing.ProxyHTTPURL)
+		account.ProxyHTTPSURL = restoreRedactedProxyURL(account.ProxyHTTPSURL, existing.ProxyHTTPSURL)
+		account.ResinURL = restoreRedactedProxyURL(account.ResinURL, existing.ResinURL)
+	}
 }
 
 func (a *App) getConfigPayload() map[string]any {
@@ -433,26 +506,86 @@ func (a *App) getSettingsPayload() map[string]any {
 	}
 }
 
-func (a *App) mergeConfigFromBody(r *http.Request) (AppConfig, error) {
-	current, _, _ := a.State.Snapshot()
-	defer r.Body.Close()
-	var raw map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		return current, fmt.Errorf("invalid json")
+// readConfigPatch reads an admin config body, honouring the request size limit.
+func (a *App) readConfigPatch(w http.ResponseWriter, r *http.Request) (map[string]any, error) {
+	raw, err := a.decodeBody(w, r)
+	if err != nil {
+		return nil, err
 	}
 	if nested, ok := raw["config"].(map[string]any); ok {
 		raw = nested
 	}
-	body, err := json.Marshal(raw)
+	return raw, nil
+}
+
+// mergeConfigPatch overlays patch on a private deep copy of current. Decoding
+// straight into the snapshot would write into slice backing arrays and maps
+// shared with the live config, and json reuses existing slice elements, so an
+// account omitted from the body's fields would inherit another account's
+// runtime state. Accounts carry cooldowns and counters owned by dispatch, so
+// only config import may replace them.
+func mergeConfigPatch(current AppConfig, patch map[string]any, allowAccounts bool) (AppConfig, error) {
+	fields := make(map[string]any, len(patch))
+	for key, value := range patch {
+		fields[key] = value
+	}
+	if !allowAccounts {
+		delete(fields, "accounts")
+	}
+	baseBody, err := json.Marshal(current)
 	if err != nil {
 		return current, err
 	}
-	cfg := current
-	if err := json.Unmarshal(body, &cfg); err != nil {
+	var cfg AppConfig
+	if err := json.Unmarshal(baseBody, &cfg); err != nil {
 		return current, err
 	}
 	cfg.ConfigPath = current.ConfigPath
-	return normalizeConfig(cfg), nil
+	cfg.Accounts = cloneAccounts(current.Accounts)
+	if _, ok := fields["accounts"]; ok {
+		cfg.Accounts = nil
+	}
+	if _, ok := fields["models"]; ok {
+		cfg.Models = nil
+	}
+	if _, ok := fields["model_aliases"]; ok {
+		cfg.ModelAliases = nil
+	}
+	body, err := json.Marshal(fields)
+	if err != nil {
+		return current, err
+	}
+	if err := json.Unmarshal(body, &cfg); err != nil {
+		return current, fmt.Errorf("invalid config: %w", err)
+	}
+	restoreRedactedProxySecrets(&cfg, current)
+	cfg = normalizeConfig(cfg)
+	if err := validateUpstreamEndpoints(cfg); err != nil {
+		return current, err
+	}
+	return cfg, nil
+}
+
+func (a *App) applyConfigPatch(w http.ResponseWriter, r *http.Request, allowAccounts bool) error {
+	patch, err := a.readConfigPatch(w, r)
+	if err != nil {
+		return err
+	}
+	passwordChanged := false
+	_, err = a.State.Mutate(func(cfg *AppConfig) error {
+		merged, err := mergeConfigPatch(*cfg, patch, allowAccounts)
+		if err != nil {
+			return err
+		}
+		passwordChanged = merged.Admin.Password != cfg.Admin.Password
+		*cfg = merged
+		return nil
+	})
+	if err == nil && passwordChanged {
+		// A new password must end every session issued under the old one.
+		a.revokeOtherAdminTokens(adminTokenFromRequest(r))
+	}
+	return err
 }
 
 func (a *App) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
@@ -471,7 +604,7 @@ func (a *App) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientIP := adminClientIP(r, cfg.Admin.TrustedProxies)
-	if lockedUntil, locked := a.adminLoginLocked(clientIP); locked {
+	if lockedUntil, locked := a.reserveAdminLoginAttempt(clientIP); locked {
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
 			"detail":       "too many failed login attempts",
 			"locked_until": lockedUntil.Format(time.RFC3339),
@@ -484,7 +617,7 @@ func (a *App) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !securePasswordEqual(password, stringValue(payload["password"])) {
-		lockedUntil, locked := a.recordAdminLoginFailure(clientIP)
+		lockedUntil, locked := a.adminLoginLocked(clientIP)
 		body := map[string]any{"detail": "wrong password"}
 		if locked {
 			body["locked_until"] = lockedUntil.Format(time.RFC3339)
@@ -500,7 +633,7 @@ func (a *App) handleAdminLogin(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Path:     "/",
 		Secure:   shouldUseSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   maxInt(cfg.Admin.TokenTTLHours, 1) * 3600,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -536,7 +669,7 @@ func (a *App) handleAdminLogout(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Path:     "/",
 		Secure:   shouldUseSecureCookie(r),
-		SameSite: http.SameSiteLaxMode,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -552,15 +685,11 @@ func (a *App) handleAdminConfig(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, a.getConfigPayload())
 	case http.MethodPost:
-		cfg, err := a.mergeConfigFromBody(r)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		if err := a.applyConfigPatch(w, r, false); err != nil {
+			writeConfigPatchError(w, err)
 			return
 		}
-		if err := a.State.SaveAndApply(cfg); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
-			return
-		}
+		cfg, _, _ := a.State.Snapshot()
 		writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "config updated", "persisted": strings.TrimSpace(cfg.ConfigPath) != ""})
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
@@ -619,16 +748,42 @@ func (a *App) handleAdminConfigImport(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
 		return
 	}
-	cfg, err := a.mergeConfigFromBody(r)
-	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
-		return
-	}
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err := a.applyConfigPatch(w, r, true); err != nil {
+		writeConfigPatchError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "config imported"})
+}
+
+// adminHTTPError lets a State.Mutate callback abort with a specific status.
+type adminHTTPError struct {
+	status int
+	detail string
+}
+
+func (e *adminHTTPError) Error() string { return e.detail }
+
+func adminError(status int, detail string) error {
+	return &adminHTTPError{status: status, detail: detail}
+}
+
+// writeAdminError maps a Mutate failure to a response; plain errors come from
+// validation or persistence and keep the historical 400.
+func writeAdminError(w http.ResponseWriter, err error) {
+	var httpErr *adminHTTPError
+	if errors.As(err, &httpErr) {
+		writeJSON(w, httpErr.status, map[string]any{"detail": httpErr.detail})
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+}
+
+func writeConfigPatchError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errRequestTooLarge) {
+		writeInvalidBodyError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 }
 
 func (a *App) handleAdminConfigSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -707,13 +862,8 @@ func (a *App) handleAdminSettings(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, a.getSettingsPayload())
 	case http.MethodPut, http.MethodPost:
-		cfg, err := a.mergeConfigFromBody(r)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
-			return
-		}
-		if err := a.State.SaveAndApply(cfg); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		if err := a.applyConfigPatch(w, r, false); err != nil {
+			writeConfigPatchError(w, err)
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"success": true, "message": "settings updated"})
@@ -879,7 +1029,38 @@ func (a *App) serveAdminStatic(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, index)
 }
 
+// adminRequestNotForged rejects state-changing admin requests that a browser
+// could have sent on another site's behalf. The session cookie is SameSite
+// Strict, but sibling subdomains count as same-site, and a text/plain POST is a
+// "simple" request that skips the CORS preflight. Requiring JSON forces that
+// preflight, which the admin surface never answers; Sec-Fetch-Site catches the
+// rest in current browsers. Header tokens (X-Admin-Token / Bearer) cannot be
+// attached by another origin, so scripted clients are not constrained.
+func adminRequestNotForged(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "", "same-origin", "none":
+	default:
+		return false
+	}
+	if strings.TrimSpace(r.Header.Get("X-Admin-Token")) != "" || strings.HasPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer ") {
+		return true
+	}
+	if r.ContentLength == 0 {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	return err == nil && mediaType == "application/json"
+}
+
 func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	if !adminRequestNotForged(r) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"detail": "cross-site admin request rejected; send JSON from the admin console"})
+		return
+	}
 	switch {
 	case r.URL.Path == "/admin/login":
 		a.handleAdminLogin(w, r)
@@ -923,6 +1104,8 @@ func (a *App) handleAdmin(w http.ResponseWriter, r *http.Request) {
 		a.handleAdminWorkspaceRefresh(w, r)
 	case r.URL.Path == "/admin/accounts/ai-usage":
 		a.handleAdminAccountsAIUsage(w, r)
+	case r.URL.Path == "/admin/accounts/ai-usage/workspace":
+		a.handleAdminWorkspaceAIUsage(w, r)
 	case r.URL.Path == "/admin/accounts/login/start":
 		a.handleAdminAccountLoginStart(w, r)
 	case r.URL.Path == "/admin/accounts/login/verify":

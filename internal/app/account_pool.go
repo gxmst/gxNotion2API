@@ -431,6 +431,28 @@ func accountIdentityUnchanged(started NotionAccount, current NotionAccount) bool
 		strings.TrimSpace(started.PlanType) == strings.TrimSpace(current.PlanType)
 }
 
+// dispatchFailureBookkeepingUnchanged reports whether a workspace still carries
+// the same failure bookkeeping a refresh was started against. It exists because
+// accountIdentityUnchanged deliberately ignores runtime state: a refresh may
+// only clear a cooldown or failure count that nobody else recorded in the
+// meantime. Window counters and last-used timestamps are excluded -- every
+// dispatch touches them, and they are not evidence of a new failure.
+func dispatchFailureBookkeepingUnchanged(started NotionWorkspace, live NotionWorkspace) bool {
+	return strings.TrimSpace(started.CooldownUntil) == strings.TrimSpace(live.CooldownUntil) &&
+		strings.TrimSpace(started.LastQuotaExhaustedAt) == strings.TrimSpace(live.LastQuotaExhaustedAt) &&
+		started.ConsecutiveFailures == live.ConsecutiveFailures
+}
+
+// activeQuotaCooldown reports whether a workspace is sitting out a confirmed AI
+// allowance exhaustion whose deadline has not elapsed. It is derived purely from
+// the recorded deadline, so it can never outlive the cooldown it describes.
+func activeQuotaCooldown(workspace NotionWorkspace, now time.Time) bool {
+	if !strings.EqualFold(strings.TrimSpace(workspace.Status), "quota_exhausted") {
+		return false
+	}
+	return parseOptionalRFC3339(workspace.CooldownUntil).After(now)
+}
+
 // saveAndApplyCommitted is the persistence step shared by the dispatch state
 // helpers below. It expects refreshMu to be held and routes through the
 // test hook so tests can intercept saves.
@@ -444,22 +466,13 @@ func (s *ServerState) saveAndApplyCommitted(cfg AppConfig) error {
 	return save(cfg)
 }
 
-// beginAccountDispatch re-checks dispatch eligibility against the live state and
-// records the dispatch start on the account record before any upstream work
-// happens. The read-modify-write is serialised on refreshMu so two concurrent
-// dispatches cannot both start from the same stale snapshot and silently drop
-// each other's window bookkeeping. A false `started` means "not dispatchable
-// right now, try the next candidate"; an error means the account is gone
-// entirely and the request cannot proceed.
-func (s *ServerState) beginAccountDispatch(email string, now time.Time) (NotionAccount, bool, error) {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		return NotionAccount{}, false, fmt.Errorf("account %s not found", email)
-	}
-	return s.beginWorkspaceDispatch(email, accountWorkspaceID(account), now)
-}
-
+// beginWorkspaceDispatch re-checks dispatch eligibility against the live state
+// and records the dispatch start on the workspace record before any upstream
+// work happens. The read-modify-write is serialised on refreshMu so two
+// concurrent dispatches cannot both start from the same stale snapshot and
+// silently drop each other's window bookkeeping. A false `started` means "not
+// dispatchable right now, try the next candidate"; an error means the
+// workspace is gone entirely and the request cannot proceed.
 func (s *ServerState) beginWorkspaceDispatch(email string, workspaceID string, now time.Time) (NotionAccount, bool, error) {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -487,20 +500,11 @@ func (s *ServerState) beginWorkspaceDispatch(email string, workspaceID string, n
 	return account, true, nil
 }
 
-// finishAccountDispatchSuccess records a completed dispatch: session metadata is
-// merged without clobbering the configured workspace, runtime counters clear,
-// and the probe pointer follows the account when it is (or becomes) the active
-// one. A vanished account is not an error — the request itself already
-// succeeded, there is simply nothing left to update.
-func (s *ServerState) finishAccountDispatchSuccess(email string, session SessionInfo, now time.Time, makeActive bool) error {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		return nil
-	}
-	return s.finishWorkspaceDispatchSuccess(email, accountWorkspaceID(account), session, now, makeActive)
-}
-
+// finishWorkspaceDispatchSuccess records a completed dispatch: session
+// metadata is merged without clobbering the configured workspace, runtime
+// counters clear, and the probe pointer follows the account when it is (or
+// becomes) the active one. A vanished account is not an error -- the request
+// itself already succeeded, there is simply nothing left to update.
 func (s *ServerState) finishWorkspaceDispatchSuccess(email string, workspaceID string, session SessionInfo, now time.Time, makeActive bool) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -528,18 +532,9 @@ func (s *ServerState) finishWorkspaceDispatchSuccess(email string, workspaceID s
 	return s.saveAndApplyCommitted(cfg)
 }
 
-// finishAccountDispatchFailure records a failed dispatch so cooldowns and
+// finishWorkspaceDispatchFailure records a failed dispatch so cooldowns and
 // failure counters actually persist. A vanished account is likewise not an
 // error; there is nothing left to cool down.
-func (s *ServerState) finishAccountDispatchFailure(email string, now time.Time, dispatchErr error, retryable bool) error {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		return nil
-	}
-	return s.finishWorkspaceDispatchFailure(email, accountWorkspaceID(account), now, dispatchErr, retryable)
-}
-
 func (s *ServerState) finishWorkspaceDispatchFailure(email string, workspaceID string, now time.Time, dispatchErr error, retryable bool) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
@@ -573,7 +568,20 @@ func (s *ServerState) finishWorkspaceDispatchFailure(email string, workspaceID s
 // was taken: an admin edit or another refresh that landed in between must not be
 // silently clobbered by this commit. On divergence the live configuration is
 // returned with an error so the caller falls back instead of persisting.
+//
+// A dispatch-time refresh never changes which account is active; that decision
+// belongs to the explicit RefreshSession path (commitAccountRefreshResult with
+// makeActive).
 func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount, refreshedCfg AppConfig) (AppConfig, error) {
+	return s.commitAccountRefreshResult(cfg, account, refreshedCfg, false)
+}
+
+// commitAccountRefreshResult is the commit step of a refresh whose network work
+// already ran without any lock. Only the fields a refresh owns are taken from
+// the refreshed record (session identity, status, refresh timestamps, cleared
+// failure bookkeeping); window counters, cooldowns and entitlements committed
+// by concurrent dispatches or admin edits while the refresh ran are kept.
+func (s *ServerState) commitAccountRefreshResult(cfg AppConfig, account NotionAccount, refreshedCfg AppConfig, makeActive bool) (AppConfig, error) {
 	startedParent, _, ok := cfg.FindAccount(account.Email)
 	if !ok {
 		return cfg, fmt.Errorf("account %s not found in dispatch snapshot", account.Email)
@@ -603,27 +611,60 @@ func (s *ServerState) commitAccountRefresh(cfg AppConfig, account NotionAccount,
 	}
 	live.Accounts = cloneAccounts(live.Accounts)
 	parent := live.Accounts[index]
-	workspace := workspaceFromAccountFields(refreshed)
-	// Session refresh does not discover subscription entitlements. Keep the
-	// latest metadata, including any revocation published while it ran.
-	if currentWorkspace, ok := accountWorkspace(parent, workspaceID); ok {
-		workspace.SubscriptionTier = currentWorkspace.SubscriptionTier
-		workspace.AIEnabled = currentWorkspace.AIEnabled
-		workspace.AIDisabled = currentWorkspace.AIDisabled
-		workspace.ModelCapabilities = cloneWorkspaceModelCapabilities(currentWorkspace.ModelCapabilities)
+	workspace, ok := accountWorkspace(parent, workspaceID)
+	if !ok {
+		return live, fmt.Errorf("workspace %s was removed during refresh", workspaceID)
 	}
+	refreshedWorkspace := workspaceFromAccountFields(refreshed)
+	// The live failure bookkeeping is captured before the merge overwrites it,
+	// so the "healthy again" clearing below can tell whether a concurrent
+	// dispatch touched it while the refresh ran.
+	liveWorkspace := workspace
+	workspace.ViewID = firstNonEmpty(refreshedWorkspace.ViewID, workspace.ViewID)
+	workspace.Name = firstNonEmpty(refreshedWorkspace.Name, workspace.Name)
+	workspace.LastRefreshAt = firstNonEmpty(refreshedWorkspace.LastRefreshAt, workspace.LastRefreshAt)
+	healthyRefresh := strings.EqualFold(refreshedWorkspace.Status, "ready") &&
+		refreshedWorkspace.CooldownUntil == "" && refreshedWorkspace.ConsecutiveFailures == 0
+	// A completed refresh proves the credential authenticates again; it says
+	// nothing about the workspace's AI allowance. Clearing an active quota
+	// cooldown here would put the account back in the pool and re-dispatch it
+	// into the same wall on every refresh interval, so let it expire on its own.
+	quotaCooldownHeld := healthyRefresh && activeQuotaCooldown(liveWorkspace, time.Now())
+	if healthyRefresh && dispatchFailureBookkeepingUnchanged(workspaceFromAccountFields(started), liveWorkspace) && !quotaCooldownHeld {
+		// A completed refresh means the credential is healthy again, so the
+		// cleared failure bookkeeping must survive the commit.
+		workspace.Status = firstNonEmpty(refreshedWorkspace.Status, workspace.Status)
+		workspace.LastError = ""
+		workspace.CooldownUntil = ""
+		workspace.ConsecutiveFailures = 0
+	} else if !healthyRefresh {
+		// A failed refresh still commits its own status (expired/failed) so the
+		// admin view reflects it.
+		workspace.Status = firstNonEmpty(refreshedWorkspace.Status, workspace.Status)
+		workspace.LastError = refreshedWorkspace.LastError
+	}
+	// A healthy refresh that raced with a newly recorded failure keeps the live
+	// bookkeeping: a successful login says nothing about the workspace's AI
+	// allowance, so a concurrent quota-exhausted cooldown must not be wiped.
 	setAccountWorkspace(&parent, workspace)
+	parent.UserID = firstNonEmpty(refreshedParent.UserID, parent.UserID)
+	parent.UserName = firstNonEmpty(refreshedParent.UserName, parent.UserName)
+	parent.ClientVersion = firstNonEmpty(refreshedParent.ClientVersion, parent.ClientVersion)
+	parent.LastLoginAt = firstNonEmpty(refreshedParent.LastLoginAt, parent.LastLoginAt)
+	// An auto relogin commits through here too; its start time is what stops
+	// the next failed request from sending another verification email.
+	parent.LastReloginAt = firstNonEmpty(refreshedParent.LastReloginAt, parent.LastReloginAt)
 	live.Accounts[index] = normalizeAccountWorkspaces(parent)
-	wasActive := canonicalEmailKey(live.ActiveAccount) == canonicalEmailKey(refreshed.Email)
-	makeActive := canonicalEmailKey(refreshedCfg.ActiveAccount) == canonicalEmailKey(refreshed.Email) &&
-		firstNonEmpty(refreshedCfg.ActiveWorkspaceID, refreshedParent.DefaultWorkspaceID) == workspaceID
-	if wasActive || makeActive {
+	if makeActive {
 		live.ActiveAccount = refreshed.Email
 		live.ActiveWorkspaceID = workspaceID
 		live.ProbeJSON = refreshed.ProbeJSON
+	} else if canonicalEmailKey(live.ActiveAccount) == canonicalEmailKey(refreshed.Email) {
+		live.ProbeJSON = firstNonEmpty(refreshed.ProbeJSON, live.ProbeJSON)
 	}
 	if err := s.saveAndApplyCommitted(live); err != nil {
 		return live, err
 	}
-	return live, nil
+	committed, _, _ := s.Snapshot()
+	return committed, nil
 }

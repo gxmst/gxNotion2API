@@ -13,10 +13,13 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"os"
+	"os/signal"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -38,7 +41,10 @@ type snapshotBundle struct {
 type ServerState struct {
 	mu                         sync.RWMutex
 	refreshMu                  sync.Mutex
+	sessionRefreshMu           sync.Mutex
 	modelPolicyMu              sync.Mutex
+	modelPolicyStateMu         sync.Mutex
+	modelPolicyRestorePoints   map[string]*modelPolicyRestorePoint
 	Config                     AppConfig
 	Session                    SessionInfo
 	Client                     *NotionAIClient
@@ -60,6 +66,7 @@ type ServerState struct {
 	cachedModelByIDJSON        atomic.Pointer[map[string][]byte]
 	aiUsageMu                  sync.Mutex
 	aiUsageCache               map[string]workspaceAIUsageReport
+	aiUsageLastForced          time.Time
 }
 
 type accountDispatchState struct {
@@ -250,18 +257,6 @@ func (s *ServerState) loadAccountSlots() map[string]*accountSlot {
 	return *loaded
 }
 
-func (s *ServerState) TryAcquireAccountDispatchSlot(email string) bool {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.ResolveActiveAccount()
-	if !ok || canonicalEmailKey(account.Email) != canonicalEmailKey(email) {
-		account, _, ok = cfg.FindAccount(email)
-	}
-	if !ok {
-		return false
-	}
-	return s.TryAcquireWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
-}
-
 // workspaceSlotKey resolves an account/workspace pair from a config snapshot.
 // Acquisition uses the live config under s.mu together with the slot update.
 func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string, bool) {
@@ -272,13 +267,39 @@ func (s *ServerState) workspaceSlotKey(email string, workspaceID string) (string
 	return "", false
 }
 
-func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
-	return s.tryAcquireWorkspaceDispatchSlot(email, workspaceID, false)
+// dispatchSlotLease is the exact set of slots one acquisition incremented.
+// Releasing through the lease decrements those same slot objects, so a config
+// change between acquire and release (a workspace renamed, a blank workspace
+// id now resolving elsewhere) can neither leak the credential slot nor release
+// somebody else's. release is idempotent and safe to defer.
+type dispatchSlotLease struct {
+	state *ServerState
+	keys  []string
+	slots []*accountSlot
+	once  sync.Once
 }
 
-func (s *ServerState) tryAcquireWorkspaceDispatchSlot(email string, workspaceID string, forRetry bool) bool {
+func (l *dispatchSlotLease) release() {
+	if l == nil || l.state == nil {
+		return
+	}
+	l.once.Do(func() {
+		l.state.mu.RLock()
+		defer l.state.mu.RUnlock()
+		for i := len(l.slots) - 1; i >= 0; i-- {
+			releaseAccountSlot(l.keys[i], l.slots[i])
+		}
+	})
+}
+
+func (s *ServerState) TryAcquireWorkspaceDispatchSlot(email string, workspaceID string) bool {
+	_, ok := s.acquireWorkspaceDispatchSlot(email, workspaceID, false)
+	return ok
+}
+
+func (s *ServerState) acquireWorkspaceDispatchSlot(email string, workspaceID string, forRetry bool) (*dispatchSlotLease, bool) {
 	if s == nil {
-		return false
+		return nil, false
 	}
 	// Keep lookup and acquisition in the same read-side critical section so a
 	// rebuild cannot retire an idle slot before its in-flight count is raised.
@@ -286,7 +307,7 @@ func (s *ServerState) tryAcquireWorkspaceDispatchSlot(email string, workspaceID 
 	defer s.mu.RUnlock()
 	account, _, ok := s.Config.FindAccountWorkspace(email, workspaceID)
 	if !ok {
-		return false
+		return nil, false
 	}
 	if forRetry {
 		// The first attempt already consumed the logical request's quota.
@@ -294,30 +315,26 @@ func (s *ServerState) tryAcquireWorkspaceDispatchSlot(email string, workspaceID 
 		eligible, _ := accountWorkspaceEligibility(account)
 		now := time.Now()
 		if account.Disabled || !eligible || accountCooldownActive(account, now) || parseOptionalRFC3339(account.CredentialCooldownUntil).After(now) {
-			return false
+			return nil, false
 		}
 	}
-	credentialKey := credentialSlotKey(email)
-	if !s.tryAcquireDispatchSlotKeyLocked(credentialKey) {
-		return false
+	lease := &dispatchSlotLease{state: s}
+	for _, key := range []string{credentialSlotKey(email), dispatchWorkspaceKey(account)} {
+		key = strings.TrimSpace(key)
+		slot := s.loadAccountSlots()[key]
+		if key == "" || slot == nil || !tryAcquireAccountSlot(key, slot) {
+			for i := len(lease.slots) - 1; i >= 0; i-- {
+				releaseAccountSlot(lease.keys[i], lease.slots[i])
+			}
+			return nil, false
+		}
+		lease.keys = append(lease.keys, key)
+		lease.slots = append(lease.slots, slot)
 	}
-	if !s.tryAcquireDispatchSlotKeyLocked(dispatchWorkspaceKey(account)) {
-		s.releaseDispatchSlotKeyLocked(credentialKey)
-		return false
-	}
-	return true
+	return lease, true
 }
 
-// The caller holds s.mu for reading or writing through the entire acquisition.
-func (s *ServerState) tryAcquireDispatchSlotKeyLocked(key string) bool {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return false
-	}
-	slot := s.loadAccountSlots()[key]
-	if slot == nil {
-		return false
-	}
+func tryAcquireAccountSlot(key string, slot *accountSlot) bool {
 	for {
 		maxConcurrency := slot.max.Load()
 		if maxConcurrency <= 0 {
@@ -334,18 +351,25 @@ func (s *ServerState) tryAcquireDispatchSlotKeyLocked(key string) bool {
 	}
 }
 
-func (s *ServerState) ReleaseAccountDispatchSlot(email string) {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.ResolveActiveAccount()
-	if !ok || canonicalEmailKey(account.Email) != canonicalEmailKey(email) {
-		account, _, ok = cfg.FindAccount(email)
+func releaseAccountSlot(key string, slot *accountSlot) bool {
+	if slot == nil {
+		return false
 	}
-	if !ok {
-		return
+	for {
+		inflight := slot.inflight.Load()
+		if inflight <= 0 {
+			return false
+		}
+		if slot.inflight.CompareAndSwap(inflight, inflight-1) {
+			setDispatchSlotInflight(key, int(inflight-1))
+			return true
+		}
 	}
-	s.ReleaseWorkspaceDispatchSlot(account.Email, accountWorkspaceID(account))
 }
 
+// ReleaseWorkspaceDispatchSlot releases by account/workspace lookup. The
+// dispatcher itself releases through dispatchSlotLease; this remains for
+// callers that hold no lease.
 func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID string) {
 	if s == nil || canonicalEmailKey(email) == "" {
 		return
@@ -366,39 +390,8 @@ func (s *ServerState) ReleaseWorkspaceDispatchSlot(email string, workspaceID str
 	}
 }
 
-func (s *ServerState) releaseDispatchSlotKey(key string) {
-	if s == nil {
-		return
-	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	s.releaseDispatchSlotKeyLocked(key)
-}
-
 func (s *ServerState) releaseDispatchSlotKeyLocked(key string) bool {
-	slot := s.loadAccountSlots()[key]
-	if slot == nil {
-		return false
-	}
-	for {
-		inflight := slot.inflight.Load()
-		if inflight <= 0 {
-			return false
-		}
-		if slot.inflight.CompareAndSwap(inflight, inflight-1) {
-			setDispatchSlotInflight(key, int(inflight-1))
-			return true
-		}
-	}
-}
-
-func (s *ServerState) RemainingAccountDispatchSlots(email string) int {
-	cfg, _, _ := s.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		return 0
-	}
-	return s.RemainingWorkspaceDispatchSlots(account.Email, accountWorkspaceID(account))
+	return releaseAccountSlot(key, s.loadAccountSlots()[key])
 }
 
 func (s *ServerState) RemainingWorkspaceDispatchSlots(email string, workspaceID string) int {
@@ -428,17 +421,6 @@ func (s *ServerState) remainingDispatchSlotKey(key string) int {
 		return 0
 	}
 	return remaining
-}
-
-func (s *ServerState) AvailableDispatchCapacity(emails []string) int {
-	cfg, _, _ := s.Snapshot()
-	keys := make([]string, 0, len(emails))
-	for _, email := range emails {
-		if account, _, ok := cfg.FindAccount(email); ok {
-			keys = append(keys, dispatchWorkspaceKey(account))
-		}
-	}
-	return s.AvailableDispatchCapacityKeys(keys)
 }
 
 func (s *ServerState) AvailableDispatchCapacityKeys(keys []string) int {
@@ -515,7 +497,19 @@ func validateConfiguredAPIKey(cfg AppConfig) error {
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return fmt.Errorf("api key is required")
 	}
+	// The shipped example configs use change-me placeholders; running with them
+	// publishes a well-known credential.
+	if isPlaceholderSecret(cfg.APIKey) {
+		return fmt.Errorf("api key is still the example placeholder; set a real value")
+	}
+	if cfg.Admin.Enabled && isPlaceholderSecret(cfg.Admin.Password) {
+		return fmt.Errorf("admin password is still the example placeholder; set a real value")
+	}
 	return nil
+}
+
+func isPlaceholderSecret(value string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(value)), "change-me")
 }
 
 func newServerState(cfg AppConfig) (*ServerState, error) {
@@ -686,6 +680,26 @@ func (s *ServerState) SaveAndApply(cfg AppConfig) error {
 	return s.saveAndApplyLocked(cfg)
 }
 
+// Mutate runs a read-modify-write of the live config under refreshMu. Handlers
+// that read a snapshot, edit it and then call SaveAndApply would otherwise
+// overwrite cooldowns, counters or capabilities that dispatch committed in
+// between. fn must not block on the network; it receives a private copy whose
+// Accounts slice is already cloned.
+func (s *ServerState) Mutate(fn func(cfg *AppConfig) error) (AppConfig, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+	cfg, _, _ := s.Snapshot()
+	cfg.Accounts = cloneAccounts(cfg.Accounts)
+	if err := fn(&cfg); err != nil {
+		return AppConfig{}, err
+	}
+	if err := s.saveAndApplyLocked(cfg); err != nil {
+		return AppConfig{}, err
+	}
+	committed, _, _ := s.Snapshot()
+	return committed, nil
+}
+
 // saveAndApplyLocked is SaveAndApply's body for callers that already hold
 // refreshMu (the dispatch state helpers in account_pool.go).
 func (s *ServerState) saveAndApplyLocked(cfg AppConfig) error {
@@ -854,17 +868,23 @@ func (s *ServerState) loadConversationContinuationStateByFingerprint(fingerprint
 	}, nil
 }
 
-func (s *ServerState) deleteConversationSessionByConversationOrThread(conversationID string, threadID string) {
+// deleteConversationSessionByConversationOrThread drops the continuation
+// sessions of a conversation or thread. It reports the store error instead of
+// swallowing it: callers must not remove the conversation row while a session
+// that could revive it is still there.
+func (s *ServerState) deleteConversationSessionByConversationOrThread(conversationID string, threadID string) error {
 	store := s.conversationPersistenceStore()
 	s.mu.RLock()
 	enabled := continuationSessionsPersistenceEnabled(s.Config)
 	s.mu.RUnlock()
 	if store == nil || !enabled {
-		return
+		return nil
 	}
 	if err := store.DeleteConversationSessionByConversationOrThread(conversationID, threadID); err != nil {
 		log.Printf("[sqlite] delete continuation session conversation=%s thread=%s failed: %v", conversationID, threadID, err)
+		return err
 	}
+	return nil
 }
 
 func (s *ServerState) invalidateConversationSession(sessionID string, status string) {
@@ -889,6 +909,9 @@ func (s *ServerState) Close() error {
 	if cancelCleanup != nil {
 		cancelCleanup()
 	}
+	// Streaming turns persist at most once a second; write out whatever the
+	// throttle held back before the store goes away.
+	s.flushConversationSnapshots()
 	if sqliteWriter != nil {
 		sqliteWriter.Close()
 	}
@@ -932,13 +955,17 @@ func (s *ServerState) runResponseStoreCleanupOnce(now time.Time) int {
 		return 0
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ResponseStore == nil {
+		s.mu.Unlock()
 		return 0
 	}
 	removed := s.ResponseStore.pruneExpired(now)
+	s.mu.Unlock()
 	if removed > 0 {
 		responseStorePruneTotalMetric.Add("expired_entries", int64(removed))
+	}
+	if links := s.pruneOrphanedResponseLinks(); links > 0 {
+		responseStorePruneTotalMetric.Add("orphaned_links", int64(links))
 	}
 	return removed
 }
@@ -1203,7 +1230,7 @@ func (a *App) authOK(w http.ResponseWriter, r *http.Request) bool {
 		writeOpenAIError(w, http.StatusServiceUnavailable, "server api key is not configured", "server_error", "api_key_required")
 		return false
 	}
-	if strings.TrimSpace(r.Header.Get("Authorization")) == "Bearer "+expected {
+	if subtle.ConstantTimeCompare([]byte(strings.TrimSpace(r.Header.Get("Authorization"))), []byte("Bearer "+expected)) == 1 {
 		return true
 	}
 	writeOpenAIError(w, http.StatusUnauthorized, "invalid api key", "authentication_error", "invalid_api_key")
@@ -1238,6 +1265,10 @@ func (a *App) serveHealthz(w http.ResponseWriter, r *http.Request) {
 	a.State.mu.RUnlock()
 
 	operator := a.healthzCallerIsOperator(r)
+	if !operator && lastRefreshError != "" {
+		// The raw error can carry upstream URLs, response bodies and file paths.
+		lastRefreshError = "session refresh failed"
+	}
 
 	if cached != nil && !operator {
 		body := appendHealthzRuntimeFields(*cached, sessionReady, lastRefresh, lastRefreshError)
@@ -1737,6 +1768,12 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 			return continuationTarget{Conversation: entry}, true
 		}
 		if state, err := a.State.loadConversationContinuationStateByConversationID(explicitConversationID); err == nil && state != nil {
+			if a.conversationDeleted(explicitConversationID) {
+				// The conversation row is gone and only a session row survived
+				// a partial delete. Reviving it would run the next turn against
+				// a thread the conversation no longer owns.
+				return continuationTarget{}, false
+			}
 			if !validateState(state) {
 				entry := ConversationEntry{
 					ID:           strings.TrimSpace(state.Session.ConversationID),
@@ -1772,6 +1809,11 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 				}
 			}
 			if stored.ThreadID != "" {
+				if stored.ConversationID != "" && a.conversationDeleted(stored.ConversationID) {
+					// The response link outlived the conversation it belonged
+					// to; continuing its thread would resurrect deleted state.
+					return continuationTarget{}, false
+				}
 				target := continuationTarget{Conversation: ConversationEntry{
 					ThreadID:     stored.ThreadID,
 					AccountEmail: strings.TrimSpace(stored.AccountEmail),
@@ -1781,6 +1823,12 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 						return continuationTarget{}, false
 					}
 					target = continuationTargetWithSession(target.Conversation, state)
+				}
+				// The link may carry only a thread id, leaving the session as the
+				// only thing that names the conversation. Re-check on the
+				// resolved target so that path cannot revive deleted state.
+				if a.conversationDeleted(target.Conversation.ID) {
+					return continuationTarget{}, false
 				}
 				return target, true
 			}
@@ -1809,11 +1857,22 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 			}
 			target = continuationTargetWithSession(target.Conversation, state)
 		}
+		// No live conversation owns this thread. If the session that matched it
+		// points at a deleted conversation, adopting its thread would revive the
+		// very state the delete removed.
+		if a.conversationDeleted(target.Conversation.ID) {
+			return continuationTarget{}, false
+		}
 		return target, true
 	}
 	fingerprint = strings.TrimSpace(fingerprint)
 	if fingerprint != "" {
 		if state, err := a.State.loadConversationContinuationStateByFingerprint(fingerprint); err == nil && state != nil {
+			if a.conversationDeleted(state.Session.ConversationID) {
+				// The fingerprint still matches a session whose conversation
+				// was deleted; start a fresh thread instead of reviving it.
+				return continuationTarget{}, false
+			}
 			if !validateState(state) {
 				return continuationTarget{}, false
 			}
@@ -1954,9 +2013,17 @@ func (a *App) cleanupExpiredEphemeralConversations() {
 	if a == nil || a.State == nil {
 		return
 	}
-	expired := a.State.conversations().ListExpiredEphemeral(time.Now().UTC(), ephemeralConversationCleanupBatchSize)
+	now := time.Now().UTC()
+	expired := a.State.conversations().ListExpiredEphemeral(now, ephemeralConversationCleanupBatchSize)
+	// Conversations evicted from memory still sit in SQLite; sweep those too.
+	for _, entry := range a.persistedSweepCandidates(now, true, ephemeralConversationCleanupBatchSize-len(expired)) {
+		if entry.AutoDeleteAt != nil && !entry.AutoDeleteAt.After(now) {
+			expired = append(expired, entry)
+		}
+	}
 	for _, entry := range expired {
 		if err := a.deleteConversation(entry.ID); err != nil {
+			a.deferConversationSweep(entry.ID)
 			log.Printf("[cleanup] delete expired ephemeral conversation=%s thread=%s reason=%s failed: %v", entry.ID, entry.ThreadID, entry.EphemeralReason, err)
 			continue
 		}
@@ -1978,14 +2045,56 @@ func (a *App) cleanupIdleConversations() {
 	if idleTTL <= 0 {
 		return
 	}
-	idle := a.State.conversations().ListIdleConversations(time.Now().UTC(), idleTTL, ephemeralConversationCleanupBatchSize)
+	now := time.Now().UTC()
+	idle := a.State.conversations().ListIdleConversations(now, idleTTL, ephemeralConversationCleanupBatchSize)
+	idle = append(idle, a.persistedSweepCandidates(now.Add(-idleTTL), false, ephemeralConversationCleanupBatchSize-len(idle))...)
 	for _, entry := range idle {
 		if err := a.deleteConversation(entry.ID); err != nil {
+			a.deferConversationSweep(entry.ID)
 			log.Printf("[cleanup] delete idle conversation=%s thread=%s idle_ttl=%s failed: %v", entry.ID, entry.ThreadID, idleTTL, err)
 			continue
 		}
 		log.Printf("[cleanup] deleted idle conversation=%s thread=%s idle_ttl=%s", entry.ID, entry.ThreadID, idleTTL)
 	}
+}
+
+// persistedSweepCandidates lists conversations that exist only in SQLite
+// (evicted from the in-memory store) and were last updated before the cutoff.
+// Resident conversations are skipped: the in-memory sweep owns them.
+func (a *App) persistedSweepCandidates(updatedBefore time.Time, ephemeral bool, limit int) []ConversationEntry {
+	if limit <= 0 {
+		return nil
+	}
+	store := a.State.conversationPersistenceStore()
+	if store == nil {
+		return nil
+	}
+	// Over-fetch: resident and deferred rows are filtered out below.
+	rows, err := store.ListConversationsForSweep(updatedBefore, ephemeral, limit*4)
+	if err != nil {
+		log.Printf("[cleanup] list persisted conversations failed: %v", err)
+		return nil
+	}
+	conversations := a.State.conversations()
+	now := time.Now().UTC()
+	out := make([]ConversationEntry, 0, limit)
+	for _, entry := range rows {
+		if conversations.Contains(entry.ID) || conversations.SweepDeferred(entry.ID, now) {
+			continue
+		}
+		out = append(out, entry)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+// deferConversationSweep keeps a conversation whose cleanup failed out of the
+// following batches for a while, so a handful of undeletable entries cannot
+// occupy every batch forever.
+func (a *App) deferConversationSweep(conversationID string) {
+	a.State.conversations().DeferSweep(conversationID, time.Now().UTC().Add(conversationSweepRetryDelay))
 }
 
 func (a *App) StartEphemeralConversationCleanupLoop(parent context.Context) {
@@ -2245,6 +2354,8 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.ConversationID = conversationID
+	// A panic or early return must not leave the turn "running" forever.
+	defer a.abandonConversationTurn(conversationID)
 	setConversationIDHeader(w, conversationID)
 	stream := typed.Stream
 	if stream {
@@ -2386,6 +2497,8 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 		return
 	}
 	request.ConversationID = conversationID
+	// A panic or early return must not leave the turn "running" forever.
+	defer a.abandonConversationTurn(conversationID)
 	setConversationIDHeader(w, conversationID)
 
 	stream, _ := payload["stream"].(bool)
@@ -2521,6 +2634,8 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.ConversationID = conversationID
+	// A panic or early return must not leave the turn "running" forever.
+	defer a.abandonConversationTurn(conversationID)
 	setConversationIDHeader(w, conversationID)
 	if stream {
 		a.writeResponsesLiveStream(w, r, request, entry.ID, cfg.DebugUpstream, conversationID)
@@ -2557,6 +2672,10 @@ func (a *App) writeUpstreamError(w http.ResponseWriter, err error) {
 	var selectionErr *modelSelectionError
 	if errors.As(err, &selectionErr) {
 		writeModelSelectionError(w, err)
+		return
+	}
+	if isClientInputError(err) {
+		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", "invalid_request_input")
 		return
 	}
 	var apiErr *notionAPIError
@@ -2670,6 +2789,13 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 	const reasoningHeartbeat = "\u200b"
 	var writeMu sync.Mutex
 	headersSent := false
+	// streamStarted reads headersSent under writeMu; sink callbacks set it
+	// from the upstream reader goroutine.
+	streamStarted := func() bool {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return headersSent
+	}
 	safeWriteData := func(payload any) error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -2790,7 +2916,7 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 		// stop: the client already saw partial text, so the error event is the
 		// only way to tell it the answer was truncated.
 		a.failConversation(conversationID, err)
-		if !headersSent {
+		if !streamStarted() {
 			a.writeUpstreamError(w, err)
 			return
 		}
@@ -2873,6 +2999,13 @@ func (a *App) writeResponsesLiveStream(w http.ResponseWriter, r *http.Request, r
 		writeSSEDone(w, flusher)
 	}
 	headersSent := false
+	// streamStarted reads headersSent under writeMu; sink callbacks set it
+	// from the upstream reader goroutine.
+	streamStarted := func() bool {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return headersSent
+	}
 	startStream := func() error {
 		writeMu.Lock()
 		defer writeMu.Unlock()
@@ -2983,7 +3116,7 @@ func (a *App) writeResponsesLiveStream(w http.ResponseWriter, r *http.Request, r
 	})
 	if err != nil {
 		a.failConversation(conversationID, err)
-		if !headersSent {
+		if !streamStarted() {
 			a.writeUpstreamError(w, err)
 			return
 		}
@@ -3263,15 +3396,26 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	statusCode = safeWriter.status
 }
 
+const (
+	// shutdownGracePeriod bounds how long in-flight requests may finish after
+	// SIGINT/SIGTERM before connections are closed.
+	shutdownGracePeriod = 30 * time.Second
+	// shutdownHandlerDrain is how long handlers interrupted by a forced close
+	// get to record their final conversation state before the store closes.
+	shutdownHandlerDrain = 5 * time.Second
+)
+
 func Main() {
 	cfg := parseCLI()
 	state, err := newServerState(cfg)
 	if err != nil {
 		log.Fatalf("init state failed: %v", err)
 	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	app := &App{State: state}
-	state.StartSessionRefreshLoop(context.Background())
-	app.StartEphemeralConversationCleanupLoop(context.Background())
+	state.StartSessionRefreshLoop(ctx)
+	app.StartEphemeralConversationCleanupLoop(ctx)
 	if cfg.Debug.PprofEnabled {
 		go func(addr string) {
 			log.Printf("[pprof] listening on http://%s/debug/pprof/ (local debug endpoint; avoid public exposure)", addr)
@@ -3281,13 +3425,44 @@ func Main() {
 		}(cfg.Debug.PprofAddr)
 	}
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	var activeHandlers atomic.Int64
 	server := &http.Server{
-		Addr:              addr,
-		Handler:           app,
+		Addr: addr,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			activeHandlers.Add(1)
+			defer activeHandlers.Add(-1)
+			app.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 15 * time.Second,
 	}
-	log.Printf("[notion2api-go] listening on http://%s default_model=%s", addr, cfg.DefaultPublicModel())
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+	serveErr := make(chan error, 1)
+	go func() {
+		log.Printf("[notion2api-go] listening on http://%s default_model=%s", addr, cfg.DefaultPublicModel())
+		serveErr <- server.ListenAndServe()
+	}()
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			_ = state.Close()
+			log.Fatal(err)
+		}
+	case <-ctx.Done():
+		log.Printf("[notion2api-go] shutdown signal received; draining in-flight requests (up to %s)", shutdownGracePeriod)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGracePeriod)
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[notion2api-go] graceful shutdown incomplete: %v; closing remaining connections", err)
+			_ = server.Close()
+		}
+		cancel()
+		// Handlers whose connection was force-closed still record their
+		// failed turn; give them a moment before the store closes.
+		deadline := time.Now().Add(shutdownHandlerDrain)
+		for activeHandlers.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
 	}
+	if err := state.Close(); err != nil {
+		log.Printf("[notion2api-go] closing state failed: %v", err)
+	}
+	log.Printf("[notion2api-go] stopped")
 }

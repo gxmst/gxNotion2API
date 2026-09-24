@@ -18,6 +18,12 @@ export interface WorkspaceModelPolicy {
   disabledProviders: string[];
 }
 
+export interface ModelPolicyRestorePoint {
+  policy: WorkspaceModelPolicy;
+  present: boolean;
+  saved_at: string;
+}
+
 export interface ModelPolicySnapshot {
   email: string;
   workspace_id: string;
@@ -28,6 +34,9 @@ export interface ModelPolicySnapshot {
   policy_present: boolean;
   revision: string;
   models: { id: string; name: string; provider: string; available: boolean; disabled_reason?: string; allowed: boolean }[];
+  // Server-persisted pre-change policy captured at the first successful lock;
+  // cleared after a successful restore or clear.
+  restore_point?: ModelPolicyRestorePoint | null;
 }
 
 export interface ModelPolicyEdit {
@@ -35,10 +44,8 @@ export interface ModelPolicyEdit {
   workspace_id: string;
   scope: 'personal' | 'custom';
   revision: string;
-  action: 'lock' | 'restore';
+  action: 'lock' | 'restore' | 'clear';
   model_id?: string;
-  restore_policy?: WorkspaceModelPolicy;
-  restore_present?: boolean;
 }
 
 export interface SessionSummary {
@@ -67,9 +74,6 @@ export interface FeatureConfig {
   enable_csv_attachment_support?: boolean;
   ai_surface?: string;
   thread_type?: string;
-  is_custom_agent?: boolean;
-  is_custom_agent_builder?: boolean;
-  use_custom_agent_draft?: boolean;
   search_scopes?: string[];
   [key: string]: unknown;
 }
@@ -309,10 +313,35 @@ export interface AIUsageReport {
     credits_in_overage?: number;
     overage_limit?: number;
     premium_service_period_start_ms?: number;
+    rate_limit?: AIUsageRateLimit;
   };
 }
 
+/**
+ * One rolling allowance window as Notion reports it. `label` is upstream's own
+ * name for the window ("6h", "billing_period", ...) and is displayed verbatim;
+ * `used`/`limit` are raw counters, so a remaining percentage is derived only
+ * when `limit > 0`.
+ */
+export interface AIUsageRateLimitWindow {
+  label?: string;
+  credit_type?: string;
+  scope?: string;
+  cadence?: string;
+  used: number;
+  limit: number;
+  period_end_ms?: number;
+}
+
+export interface AIUsageRateLimit {
+  status?: string;
+  short?: AIUsageRateLimitWindow;
+  long?: AIUsageRateLimitWindow;
+}
+
 export interface AIUsagePayload { accounts: AIUsageReport[]; ttl_seconds: number }
+
+export interface WorkspaceAIUsagePayload { report: AIUsageReport; ttl_seconds: number }
 
 export interface ChatRunInput {
   account_email?: string;

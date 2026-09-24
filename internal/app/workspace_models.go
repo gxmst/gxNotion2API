@@ -115,6 +115,14 @@ func selectWorkspaceModel(cfg AppConfig, account NotionAccount, request PromptRu
 	workspace, _ := accountWorkspace(account, accountWorkspaceID(account))
 	capability := workspace.ModelCapabilities
 	if capability == nil || (capability.Mode != "manual" && capability.Mode != "auto_only") {
+		// Unknown capability is treated like a restricted workspace when the
+		// operator opted into falling back: Auto always works, a named model
+		// may not.
+		if cfg.Dispatch.RestrictedModelFallback {
+			request.NotionModel = ""
+			request.ModelSelectionMode = "auto_fallback"
+			return request, nil
+		}
 		return request, &modelSelectionError{"workspace model capability is unknown; refresh models or use model=auto"}
 	}
 	if capability.Mode == "auto_only" {

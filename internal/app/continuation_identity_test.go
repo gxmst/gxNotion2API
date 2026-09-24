@@ -96,7 +96,7 @@ func TestQuotaFailoverKeepsImportedHistoryAndSystemPrompt(t *testing.T) {
 	if err != nil || len(persisted) != 1 || len(persisted[0].Messages) != 4 {
 		t.Fatalf("imported history was not persisted: err=%v", err)
 	}
-	if err := app.State.finishAccountDispatchFailure("primary@example.com", time.Now(), errors.New(syntheticQuotaExhaustedError), false); err != nil {
+	if err := app.State.finishWorkspaceDispatchFailure("primary@example.com", testDefaultWorkspaceID(app.State, "primary@example.com"), time.Now(), errors.New(syntheticQuotaExhaustedError), false); err != nil {
 		t.Fatal(err)
 	}
 	rec = httptest.NewRecorder()

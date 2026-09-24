@@ -149,10 +149,41 @@ type ConversationStore struct {
 	order     []string
 	subs      map[int]chan ConversationEvent
 	nextSubID int
+	// streams holds the append buffer of each assistant message being
+	// streamed, so a delta costs O(len(delta)) instead of re-concatenating
+	// the whole answer. Guarded by mu.
+	streams map[string]*conversationStreamBuffer
+	// sweepRetryAt keeps a conversation whose cleanup failed out of the next
+	// cleanup batches for a while, so a few undeletable entries cannot starve
+	// every later batch. Guarded by mu.
+	sweepRetryAt map[string]time.Time
 	// ephemeralTTLNanos is read on the streaming hot path (every delta goes
 	// through conversations()), so it is atomic rather than guarded by mu.
 	ephemeralTTLNanos atomic.Int64
+
+	// persistMu serialises snapshot writes so the row in SQLite is always
+	// the latest state, and guards the per-conversation delta throttle.
+	persistMu     sync.Mutex
+	persistLastAt map[string]time.Time
+	persistDirty  map[string]struct{}
 }
+
+// conversationStreamBuffer accumulates one streaming assistant message.
+// strings.Builder.String does not copy and later appends never touch bytes
+// an earlier String result covers, so published snapshots stay immutable.
+type conversationStreamBuffer struct {
+	messageID     string
+	buf           strings.Builder
+	previewFrozen bool
+}
+
+// conversationPersistDeltaInterval bounds how often a streaming conversation
+// is written to SQLite. Terminal states (complete/fail) always persist.
+const conversationPersistDeltaInterval = time.Second
+
+// conversationSweepRetryDelay is how long a conversation whose cleanup failed
+// stays out of the cleanup batches.
+const conversationSweepRetryDelay = 10 * time.Minute
 
 // SetEphemeralTTL overrides the lifetime granted to an ephemeral conversation
 // when a turn finishes. Zero or negative means "no override", which leaves each
@@ -178,8 +209,12 @@ func (s *ConversationStore) ephemeralTTL() time.Duration {
 
 func newConversationStore() *ConversationStore {
 	return &ConversationStore{
-		items: map[string]*ConversationEntry{},
-		subs:  map[int]chan ConversationEvent{},
+		items:         map[string]*ConversationEntry{},
+		subs:          map[int]chan ConversationEvent{},
+		streams:       map[string]*conversationStreamBuffer{},
+		sweepRetryAt:  map[string]time.Time{},
+		persistLastAt: map[string]time.Time{},
+		persistDirty:  map[string]struct{}{},
 	}
 }
 
@@ -464,19 +499,21 @@ func (s *ConversationStore) broadcast(event ConversationEvent) {
 	}
 }
 
+// moveToFrontLocked shifts the entry to the front in place. It runs for every
+// streamed delta, so it must not allocate a new order slice each time.
 func (s *ConversationStore) moveToFrontLocked(id string) {
 	if len(s.order) == 0 || s.order[0] == id {
 		return
 	}
-	next := make([]string, 0, len(s.order))
-	next = append(next, id)
-	for _, itemID := range s.order {
-		if itemID == id {
+	for i, itemID := range s.order {
+		if itemID != id {
 			continue
 		}
-		next = append(next, itemID)
+		copy(s.order[1:i+1], s.order[:i])
+		s.order[0] = id
+		return
 	}
-	s.order = next
+	s.order = append([]string{id}, s.order...)
 }
 
 func (s *ConversationStore) trimLocked() {
@@ -587,6 +624,7 @@ func (s *ConversationStore) Continue(conversationID string, req ConversationCrea
 			s.mu.Unlock()
 			return cloned, nil
 		}
+		delete(s.streams, conversationID)
 		next := cloneConversationEntry(current)
 		next.HiddenPrompt = firstNonEmpty(req.HiddenPrompt, next.HiddenPrompt)
 		next.RequestFingerprint = req.RequestFingerprint
@@ -705,6 +743,11 @@ func (s *ConversationStore) SetEnvelopeIDs(conversationID string, responseID str
 	}
 }
 
+// AppendAssistantDelta is the streaming hot path. It keeps the store's
+// copy-on-write contract (published entries are never mutated) but only
+// copies what changes: the entry header and the message slice, not every
+// attachment and observation, and the answer text grows through an append
+// buffer instead of being re-concatenated for every delta.
 func (s *ConversationStore) AppendAssistantDelta(conversationID string, delta string) {
 	delta = strings.TrimRight(delta, "\r")
 	if delta == "" {
@@ -720,14 +763,34 @@ func (s *ConversationStore) AppendAssistantDelta(conversationID string, delta st
 	s.mu.Lock()
 	current := s.items[conversationID]
 	if current != nil && conversationStatusBusy(current.Status) {
-		next := cloneConversationEntry(current)
+		next := *current
+		next.Messages = make([]ConversationMessage, len(current.Messages), len(current.Messages)+1)
+		copy(next.Messages, current.Messages)
 		assistant := s.ensureAssistantMessageLocked(&next, now)
-		assistant.Content += delta
+		if s.streams == nil {
+			s.streams = map[string]*conversationStreamBuffer{}
+		}
+		stream := s.streams[conversationID]
+		if stream == nil || stream.messageID != assistant.ID || stream.buf.Len() != len(assistant.Content) {
+			// First delta of this message, or its content changed through
+			// another path: restart the buffer from the published content.
+			stream = &conversationStreamBuffer{messageID: assistant.ID}
+			stream.buf.WriteString(assistant.Content)
+			s.streams[conversationID] = stream
+		}
+		stream.buf.WriteString(delta)
+		assistant.Content = stream.buf.String()
 		assistant.Status = "streaming"
 		assistant.UpdatedAt = now
 		next.Status = "running"
 		next.UpdatedAt = now
-		refreshConversationDerivedFields(&next)
+		// The preview is the first ~96 visible runes of the latest message.
+		// Appending never changes an already-collapsed prefix, so once the
+		// preview is full it stays valid and need not be recomputed.
+		if !stream.previewFrozen {
+			refreshConversationDerivedFields(&next)
+			stream.previewFrozen = len([]rune(collapseWhitespace(assistant.Content))) > 96
+		}
 		entry = &next
 		s.items[conversationID] = entry
 		s.moveToFrontLocked(conversationID)
@@ -762,6 +825,7 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 	s.mu.Lock()
 	current := s.items[conversationID]
 	if current != nil {
+		delete(s.streams, conversationID)
 		next := cloneConversationEntry(current)
 		next.Status = "completed"
 		next.UpdatedAt = now
@@ -822,6 +886,7 @@ func (s *ConversationStore) Fail(conversationID string, err error) {
 	s.mu.Lock()
 	current := s.items[conversationID]
 	if current != nil {
+		delete(s.streams, conversationID)
 		next := cloneConversationEntry(current)
 		next.Status = "failed"
 		next.Error = message
@@ -867,6 +932,8 @@ func (s *ConversationStore) Delete(conversationID string) error {
 		return fmt.Errorf("conversation is still running")
 	}
 	delete(s.items, conversationID)
+	delete(s.streams, conversationID)
+	delete(s.sweepRetryAt, conversationID)
 	next := make([]string, 0, len(s.order))
 	for _, id := range s.order {
 		if id != conversationID {
@@ -903,7 +970,7 @@ func (s *ConversationStore) ListExpiredEphemeral(now time.Time, limit int) []Con
 		if entry == nil || !entry.Ephemeral {
 			continue
 		}
-		if conversationStatusBusy(entry.Status) {
+		if conversationStatusBusy(entry.Status) || s.sweepDeferredLocked(id, now) {
 			continue
 		}
 		if entry.AutoDeleteAt == nil || entry.AutoDeleteAt.After(now) {
@@ -937,7 +1004,7 @@ func (s *ConversationStore) ListIdleConversations(now time.Time, idleTTL time.Du
 		if entry == nil || entry.Ephemeral {
 			continue
 		}
-		if conversationStatusBusy(entry.Status) {
+		if conversationStatusBusy(entry.Status) || s.sweepDeferredLocked(id, now) {
 			continue
 		}
 		last := entry.UpdatedAt
@@ -953,6 +1020,47 @@ func (s *ConversationStore) ListIdleConversations(now time.Time, idleTTL time.Du
 		}
 	}
 	return items
+}
+
+// DeferSweep keeps a conversation out of cleanup batches until the given
+// time. A cleanup that failed for a reason that is not permanent is retried
+// later instead of occupying a slot in every following batch.
+func (s *ConversationStore) DeferSweep(conversationID string, until time.Time) {
+	if s == nil || strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sweepRetryAt == nil {
+		s.sweepRetryAt = map[string]time.Time{}
+	}
+	s.sweepRetryAt[conversationID] = until
+}
+
+// SweepDeferred reports whether a cleanup of the conversation was deferred
+// past now.
+func (s *ConversationStore) SweepDeferred(conversationID string, now time.Time) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.sweepDeferredLocked(conversationID, now)
+}
+
+func (s *ConversationStore) sweepDeferredLocked(conversationID string, now time.Time) bool {
+	until, ok := s.sweepRetryAt[conversationID]
+	return ok && now.Before(until)
+}
+
+// Contains reports whether the conversation is resident in memory.
+func (s *ConversationStore) Contains(conversationID string) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.items[conversationID] != nil
 }
 
 // conversationStatusBusy reports whether a conversation has a turn in flight.
@@ -1146,20 +1254,30 @@ func (s *ConversationStore) Unsubscribe(id int) {
 }
 
 // conversations is on the streaming hot path (pushConversationDelta calls it for
-// every delta), so it must stay cheap: no store-level write lock, and the
-// ephemeral TTL is pushed in from applyEphemeralTTLFromConfig when config
-// changes rather than recomputed per call.
+// every delta), so the common case takes only a shared read lock on the server
+// state; the exclusive lock is needed just once, to create the store lazily.
+// The ephemeral TTL is pushed in from ApplyConfig when config changes rather
+// than recomputed per call.
 func (s *ServerState) conversations() *ConversationStore {
+	s.mu.RLock()
+	store := s.Conversations
+	s.mu.RUnlock()
+	if store != nil {
+		return store
+	}
 	s.mu.Lock()
 	if s.Conversations == nil {
 		s.Conversations = newConversationStore()
 		s.Conversations.SetEphemeralTTL(configuredEphemeralTTLOverride(s.Config))
 	}
-	store := s.Conversations
+	store = s.Conversations
 	s.mu.Unlock()
 	return store
 }
 
+// persistConversationSnapshot writes the conversation's current state to
+// SQLite. Writes are serialised and each one reads the entry inside the
+// critical section, so an older snapshot can never land after a newer one.
 func (s *ServerState) persistConversationSnapshot(conversationID string) {
 	if s == nil || strings.TrimSpace(conversationID) == "" {
 		return
@@ -1171,12 +1289,67 @@ func (s *ServerState) persistConversationSnapshot(conversationID string) {
 	if store == nil || !enabled {
 		return
 	}
-	entry, ok := s.conversations().Get(conversationID)
+	convs := s.conversations()
+	convs.persistMu.Lock()
+	defer convs.persistMu.Unlock()
+	if convs.persistLastAt == nil {
+		convs.persistLastAt = map[string]time.Time{}
+	}
+	delete(convs.persistDirty, conversationID)
+	entry, ok := convs.Get(conversationID)
 	if !ok {
+		delete(convs.persistLastAt, conversationID)
 		return
+	}
+	if conversationStatusBusy(entry.Status) {
+		convs.persistLastAt[conversationID] = time.Now()
+	} else {
+		// A finished turn needs no delta throttle state any more.
+		delete(convs.persistLastAt, conversationID)
 	}
 	if err := store.SaveConversation(entry); err != nil {
 		log.Printf("[sqlite] save conversation %s failed: %v", conversationID, err)
+	}
+}
+
+// persistConversationDelta persists a streaming conversation at most once per
+// conversationPersistDeltaInterval. Skipped deltas are marked dirty; the
+// terminal complete/fail write (or flushConversationSnapshots on shutdown)
+// always records the final state.
+func (s *ServerState) persistConversationDelta(conversationID string) {
+	if s == nil || strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	convs := s.conversations()
+	now := time.Now()
+	convs.persistMu.Lock()
+	if last, ok := convs.persistLastAt[conversationID]; ok && now.Sub(last) < conversationPersistDeltaInterval {
+		if convs.persistDirty == nil {
+			convs.persistDirty = map[string]struct{}{}
+		}
+		convs.persistDirty[conversationID] = struct{}{}
+		convs.persistMu.Unlock()
+		return
+	}
+	convs.persistMu.Unlock()
+	s.persistConversationSnapshot(conversationID)
+}
+
+// flushConversationSnapshots writes every conversation whose latest deltas
+// were throttled. It runs on shutdown so a partial answer is not lost.
+func (s *ServerState) flushConversationSnapshots() {
+	if s == nil {
+		return
+	}
+	convs := s.conversations()
+	convs.persistMu.Lock()
+	dirty := make([]string, 0, len(convs.persistDirty))
+	for id := range convs.persistDirty {
+		dirty = append(dirty, id)
+	}
+	convs.persistMu.Unlock()
+	for _, id := range dirty {
+		s.persistConversationSnapshot(id)
 	}
 }
 
@@ -1263,7 +1436,7 @@ func (a *App) pushConversationDelta(conversationID string, delta string) {
 		return
 	}
 	a.State.conversations().AppendAssistantDelta(conversationID, delta)
-	a.State.persistConversationSnapshot(conversationID)
+	a.State.persistConversationDelta(conversationID)
 }
 
 func (a *App) completeConversation(conversationID string, result InferenceResult) {
@@ -1319,7 +1492,7 @@ func (a *App) persistConversationSession(conversationID string, request PromptRu
 		ConfigID:         strings.TrimSpace(result.ConfigID),
 		ContextID:        strings.TrimSpace(result.ContextID),
 		OriginalDatetime: strings.TrimSpace(result.OriginalDatetime),
-		ModelUsed:        firstNonEmpty(strings.TrimSpace(result.NotionModel), strings.TrimSpace(request.NotionModel)),
+		ModelUsed:        sessionModelUsed(request, result),
 		TurnCount:        turnCount,
 		RawMessageCount:  maxInt(request.RawMessageCount, 0),
 		Status:           conversationSessionStatusActive,
@@ -1401,6 +1574,35 @@ func (a *App) failConversation(conversationID string, err error) {
 	a.State.persistConversationSnapshot(conversationID)
 }
 
+// errConversationTurnAbandoned is recorded on a turn whose handler exited
+// without completing or failing it (a panic, or an early return path).
+var errConversationTurnAbandoned = errors.New("turn ended without a result")
+
+// abandonConversationTurn is deferred by every handler that starts a turn. If
+// the handler leaves while the conversation is still running, the turn is
+// failed here; otherwise the conversation would stay "running" forever and
+// every continuation would be rejected as busy.
+func (a *App) abandonConversationTurn(conversationID string) {
+	if a == nil || a.State == nil || strings.TrimSpace(conversationID) == "" {
+		return
+	}
+	entry, ok := a.State.conversations().Get(conversationID)
+	if !ok || !conversationStatusBusy(entry.Status) {
+		return
+	}
+	a.failConversation(conversationID, errConversationTurnAbandoned)
+}
+
+// sessionModelUsed records the Notion model that was actually sent upstream.
+// Under auto_fallback the requested model was replaced by Auto, so recording
+// the requested codename would claim a model that never ran.
+func sessionModelUsed(request PromptRunRequest, result InferenceResult) string {
+	if strings.EqualFold(strings.TrimSpace(result.ModelSelectionMode), "auto_fallback") {
+		return strings.TrimSpace(result.NotionModel)
+	}
+	return firstNonEmpty(strings.TrimSpace(result.NotionModel), strings.TrimSpace(request.NotionModel))
+}
+
 func (a *App) notionClientForAccount(ctx context.Context, accountEmail string) (*NotionAIClient, error) {
 	cfg, snapshot, _ := a.State.Snapshot()
 	a.State.mu.RLock()
@@ -1418,7 +1620,7 @@ func (a *App) notionClientForAccount(ctx context.Context, accountEmail string) (
 		if len(cfg.Accounts) == 0 && canonicalEmailKey(snapshot.UserEmail) == canonicalEmailKey(email) && fallbackClient != nil {
 			return fallbackClient, nil
 		}
-		return nil, fmt.Errorf("account %s not found", email)
+		return nil, fmt.Errorf("%w: account %s not found", errConversationOwnerGone, email)
 	}
 	if fallbackClient != nil {
 		return fallbackClient, nil
@@ -1443,7 +1645,7 @@ func (a *App) notionClientForWorkspace(ctx context.Context, accountEmail, worksp
 	}
 	account, _, ok := cfg.FindAccountWorkspace(accountEmail, workspaceID)
 	if !ok {
-		return nil, fmt.Errorf("workspace %s for account %s is no longer available", workspaceID, accountEmail)
+		return nil, fmt.Errorf("%w: workspace %s for account %s is no longer available", errConversationOwnerGone, workspaceID, accountEmail)
 	}
 	session, err := loadSessionInfoForAccountRefresh(cfg, account)
 	if err != nil {
@@ -1452,6 +1654,16 @@ func (a *App) notionClientForWorkspace(ctx context.Context, accountEmail, worksp
 	return newNotionAIClient(session, cfg, account.Email), nil
 }
 
+// errConversationOwnerGone reports that the account or workspace owning a
+// conversation's upstream thread no longer exists. The thread can never be
+// reached again, so deleting the conversation drops the local record instead
+// of retrying forever.
+var errConversationOwnerGone = errors.New("conversation owner is gone")
+
+// deleteConversation removes a conversation and, conservatively, its upstream
+// thread. Conversations evicted from memory (the store keeps the newest
+// maxConversationEntries) are still found in SQLite, so admin deletes and the
+// cleanup sweeps also reach them.
 func (a *App) deleteConversation(conversationID string) error {
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" {
@@ -1459,7 +1671,7 @@ func (a *App) deleteConversation(conversationID string) error {
 	}
 	entry, ok := a.State.conversations().Get(conversationID)
 	if !ok {
-		return fmt.Errorf("conversation not found")
+		return a.deletePersistedConversation(conversationID)
 	}
 	if conversationStatusBusy(entry.Status) {
 		return fmt.Errorf("conversation is still running")
@@ -1471,30 +1683,116 @@ func (a *App) deleteConversation(conversationID string) error {
 	if _, err := a.State.conversations().ClaimForDeletion(conversationID); err != nil {
 		return err
 	}
-	if threadID := strings.TrimSpace(entry.ThreadID); threadID != "" {
-		cfg, _, _ := a.State.Snapshot()
-		timeout := time.Duration(maxInt(cfg.TimeoutSec, 10)) * time.Second
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		defer cancel()
-		client, err := a.notionClientForWorkspace(ctx, entry.AccountEmail, entry.SpaceID)
-		if err != nil {
-			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
-			return err
-		}
-		if entry.SpaceID != "" && entry.SpaceID != client.Session.SpaceID {
-			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
-			return errConversationWorkspaceMismatch
-		}
-		if err := client.deleteThread(ctx, threadID); err != nil {
-			_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
-			return err
-		}
+	if err := a.deleteConversationThread(entry); err != nil {
+		_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
+		return err
 	}
 	if err := a.State.conversations().Delete(conversationID); err != nil {
 		return err
 	}
-	a.State.deleteResponsesByConversationOrThread(conversationID, entry.ThreadID)
-	a.State.deleteConversationSessionByConversationOrThread(conversationID, entry.ThreadID)
+	return a.deleteConversationLocalRecords(conversationID, entry.ThreadID)
+}
+
+// deletePersistedConversation deletes a conversation that exists only in
+// SQLite. No turn can be running on it: every turn executes against the
+// in-memory entry, so a "running" status here is stale from a crash.
+func (a *App) deletePersistedConversation(conversationID string) error {
+	store := a.State.conversationPersistenceStore()
+	if store == nil {
+		return fmt.Errorf("conversation not found")
+	}
+	entry, found, err := store.LoadConversation(conversationID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("conversation not found")
+	}
+	if a.State.conversations().Contains(conversationID) {
+		// A turn recreated it in memory meanwhile; go through the claim path.
+		return a.deleteConversation(conversationID)
+	}
+	if err := a.deleteConversationThread(entry); err != nil {
+		return err
+	}
+	return a.deleteConversationLocalRecords(conversationID, entry.ThreadID)
+}
+
+// deleteConversationThread deletes the upstream thread of a conversation. It
+// leaves the thread alone when another live conversation still points at it,
+// and treats a vanished owner (account or workspace removed) as nothing left
+// to delete upstream.
+func (a *App) deleteConversationThread(entry ConversationEntry) error {
+	threadID := strings.TrimSpace(entry.ThreadID)
+	if threadID == "" {
+		return nil
+	}
+	if other, ok := a.State.conversations().FindByThreadID(threadID); ok && other.ID != entry.ID {
+		log.Printf("[cleanup] conversation=%s shares thread=%s with conversation=%s; keeping the upstream thread", entry.ID, threadID, other.ID)
+		return nil
+	}
+	cfg, _, _ := a.State.Snapshot()
+	timeout := time.Duration(maxInt(cfg.TimeoutSec, 10)) * time.Second
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	client, err := a.notionClientForWorkspace(ctx, entry.AccountEmail, entry.SpaceID)
+	if err != nil {
+		if errors.Is(err, errConversationOwnerGone) {
+			log.Printf("[cleanup] conversation=%s thread=%s owner is gone (%v); deleting the local record only", entry.ID, threadID, err)
+			return nil
+		}
+		return err
+	}
+	if entry.SpaceID != "" && entry.SpaceID != client.Session.SpaceID {
+		return errConversationWorkspaceMismatch
+	}
+	return client.deleteThread(ctx, threadID)
+}
+
+// conversationDeleted reports whether a conversation id is provably gone: it is
+// absent from the in-memory store and from the persisted snapshot table. A
+// continuation session can outlive a failed delete, so the resolver consults
+// this before resurrecting a conversation from session state. An empty id or a
+// read error proves nothing and is never treated as deleted.
+func (a *App) conversationDeleted(conversationID string) bool {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" || a == nil || a.State == nil {
+		return false
+	}
+	if a.State.conversations().Contains(conversationID) {
+		return false
+	}
+	a.State.mu.RLock()
+	store := a.State.Store
+	persisted := store != nil && conversationSnapshotsPersistenceEnabled(a.State.Config)
+	a.State.mu.RUnlock()
+	if !persisted {
+		// Conversations live only in memory here, so a session row is the only
+		// record that can still point at this conversation.
+		return false
+	}
+	_, found, err := store.LoadConversation(conversationID)
+	if err != nil {
+		// A read failure must not silently drop a live conversation.
+		return false
+	}
+	return !found
+}
+
+func (a *App) deleteConversationLocalRecords(conversationID string, threadID string) error {
+	a.State.deleteResponsesByConversationOrThread(conversationID, threadID)
+	// Remove the continuation session before the conversation row. A session
+	// that outlives its conversation is exactly what lets a deleted thread be
+	// revived, so a failed delete aborts here and leaves the conversation row
+	// in place for a retry instead of creating that state.
+	if err := a.State.deleteConversationSessionByConversationOrThread(conversationID, threadID); err != nil {
+		return fmt.Errorf("delete continuation session for %s: %w", conversationID, err)
+	}
+	convs := a.State.conversations()
+	convs.persistMu.Lock()
+	delete(convs.persistLastAt, conversationID)
+	delete(convs.persistDirty, conversationID)
+	convs.persistMu.Unlock()
 	a.State.mu.RLock()
 	store := a.State.Store
 	a.State.mu.RUnlock()

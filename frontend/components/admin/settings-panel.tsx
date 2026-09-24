@@ -194,6 +194,7 @@ function resolveStoragePersistenceFlag(flag: boolean | undefined, fallback: bool
 function buildFormState(config: AppConfigShape): SettingsFormState {
   const promptState = buildPromptStrategyFormState(config.prompt);
   const persistConversations = config.storage?.persist_conversations !== false;
+  const forceDisableUpstreamEdits = config.features?.force_disable_upstream_edits !== false;
   return {
     host: config.host || '',
     port: String(config.port || 8787),
@@ -216,10 +217,11 @@ function buildFormState(config: AppConfigShape): SettingsFormState {
     persistContinuationSessions: resolveStoragePersistenceFlag(config.storage?.persist_continuation_sessions, persistConversations),
     persistSillyTavernBindings: resolveStoragePersistenceFlag(config.storage?.persist_sillytavern_bindings, persistConversations),
     useWebSearch: Boolean(config.features?.use_web_search),
-    readOnly: Boolean(config.features?.use_read_only_mode),
-    forceDisableUpstreamEdits: config.features?.force_disable_upstream_edits !== false,
+    // Mirror the forced-read-only normalization so a freshly loaded form is not dirty.
+    readOnly: forceDisableUpstreamEdits || Boolean(config.features?.use_read_only_mode),
+    forceDisableUpstreamEdits,
     forceFreshThreadPerRequest: Boolean(config.features?.force_fresh_thread_per_request),
-    writerMode: Boolean(config.features?.writer_mode),
+    writerMode: !forceDisableUpstreamEdits && Boolean(config.features?.writer_mode),
     generateImage: Boolean(config.features?.enable_generate_image),
     enableCsv: Boolean(config.features?.enable_csv_attachment_support),
     aiSurface: String(config.features?.ai_surface || 'ai_module'),
@@ -232,6 +234,10 @@ function buildFormState(config: AppConfigShape): SettingsFormState {
     modelAliases: JSON.stringify(config.model_aliases || {}, null, 2),
     searchScopes: (config.features?.search_scopes || []).join('\n'),
   };
+}
+
+function sameFormState(left: SettingsFormState, right: SettingsFormState) {
+  return (Object.keys(left) as Array<keyof SettingsFormState>).every((key) => left[key] === right[key]);
 }
 
 function parseHostLabel(value: string) {
@@ -435,6 +441,7 @@ export function SettingsPanel({
   onCreateSnapshot,
   onListSnapshot,
   onTestPrompt,
+  onDirtyChange,
 }: {
   config: AppConfigShape;
   models: ModelItem[];
@@ -445,10 +452,14 @@ export function SettingsPanel({
   onCreateSnapshot: () => Promise<unknown>;
   onListSnapshot: () => Promise<unknown>;
   onTestPrompt: (payload: { prompt: string; model: string; use_web_search: boolean; attachments: AttachmentInput[] }) => Promise<unknown>;
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const promptStrategyFileInputRef = useRef<HTMLInputElement | null>(null);
   const [form, setForm] = useState<SettingsFormState>(() => buildFormState(config));
+  // The form state last synced from `config`; edits are "dirty" relative to it.
+  const [baseline, setBaseline] = useState<SettingsFormState>(() => buildFormState(config));
+  const syncedConfig = useRef(config);
   const [output, setOutput] = useState('等待操作...');
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
@@ -459,9 +470,43 @@ export function SettingsPanel({
   const [strategyTestOutput, setStrategyTestOutput] = useState('等待策略测试...');
   const [strategyTesting, setStrategyTesting] = useState(false);
 
+  const dirty = useMemo(() => !sameFormState(form, baseline), [form, baseline]);
+  const configChangedWhileDirty = dirty && syncedConfig.current !== config;
+
+  // Background refreshes (top-bar resync, account actions) replace `config`.
+  // Only adopt the new values while there are no unsaved edits; otherwise the
+  // resync is deferred until the edits are saved or discarded.
   useEffect(() => {
-    setForm(buildFormState(config));
-  }, [config]);
+    if (dirty || syncedConfig.current === config) return;
+    syncedConfig.current = config;
+    const next = buildFormState(config);
+    setForm(next);
+    setBaseline(next);
+  }, [config, dirty]);
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const handler = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handler);
+    return () => window.removeEventListener('beforeunload', handler);
+  }, [dirty]);
+
+  const discardChanges = () => {
+    syncedConfig.current = config;
+    const next = buildFormState(config);
+    setForm(next);
+    setBaseline(next);
+    setMessage('已放弃未保存的修改');
+  };
 
   useEffect(() => {
     setStrategyTestModel(config.default_model || config.model_id || models[0]?.id || 'auto');
@@ -693,12 +738,16 @@ export function SettingsPanel({
   };
 
   const saveConfig = async () => {
+    const savedForm = form;
     setSaving(true);
     setMessage('保存中...');
     try {
       const parsedModelAliases = JSON.parse(form.modelAliases || '{}');
       const parsedSearchScopes = form.searchScopes.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
       const nextConfig: JsonResult = structuredClone(config) as JsonResult;
+      // Accounts are managed by the account endpoints; the copy held here may
+      // carry stale runtime state (cooldowns, counters, model capabilities).
+      delete nextConfig.accounts;
       const next = nextConfig as AppConfigShape;
       next.host = form.host.trim();
       next.port = Number(form.port || 8787);
@@ -744,9 +793,6 @@ export function SettingsPanel({
       next.features.enable_csv_attachment_support = form.enableCsv;
       next.features.ai_surface = form.aiSurface.trim() || 'ai_module';
       next.features.thread_type = form.threadType.trim() || 'workflow';
-      next.features.is_custom_agent = false;
-      next.features.is_custom_agent_builder = false;
-      next.features.use_custom_agent_draft = false;
       next.features.search_scopes = parsedSearchScopes;
 
       if (form.apiKey.trim()) {
@@ -762,6 +808,9 @@ export function SettingsPanel({
 
       next.model_aliases = parsedModelAliases;
       const payload = await onSave(next as JsonResult);
+      // The saved values are now the baseline; once nothing else is pending the
+      // form resyncs from the refreshed config (which also clears secret inputs).
+      setBaseline(savedForm);
       setOutput(JSON.stringify(payload, null, 2));
       setMessage('已保存并热更新');
       toast.success('设置已保存');
@@ -783,7 +832,8 @@ export function SettingsPanel({
         accept="application/json"
         className="hidden"
         onChange={async (event) => {
-          const file = event.target.files?.[0];
+          const input = event.currentTarget;
+          const file = input.files?.[0];
           if (!file) return;
           try {
             setMessage('导入配置中...');
@@ -791,6 +841,9 @@ export function SettingsPanel({
             const parsed = JSON.parse(raw);
             const imported = (parsed?.config || parsed) as JsonResult;
             const payload = await onImport(imported);
+            // An import replaces the whole config; drop unsaved edits so the
+            // form resyncs from the imported values.
+            setBaseline(form);
             setOutput(JSON.stringify(payload, null, 2));
             setMessage('配置已导入: ' + file.name);
             toast.success('配置导入成功');
@@ -799,7 +852,7 @@ export function SettingsPanel({
             setMessage(text);
             toast.error(text);
           } finally {
-            event.currentTarget.value = '';
+            input.value = '';
           }
         }}
       />
@@ -809,7 +862,8 @@ export function SettingsPanel({
         accept="application/json"
         className="hidden"
         onChange={async (event) => {
-          const file = event.target.files?.[0];
+          const input = event.currentTarget;
+          const file = input.files?.[0];
           if (!file) return;
           try {
             setMessage('导入策略中...');
@@ -825,7 +879,7 @@ export function SettingsPanel({
             setMessage(text);
             toast.error(text);
           } finally {
-            event.currentTarget.value = '';
+            input.value = '';
           }
         }}
       />
@@ -837,8 +891,17 @@ export function SettingsPanel({
         actions={
           <>
             <div className="status-chip max-w-[360px]">
-              {message || '保存后立即热更新。'}
+              {dirty && !saving
+                ? configChangedWhileDirty
+                  ? '有未保存的修改（后台配置已更新，保存将以你的修改为准）'
+                  : '有未保存的修改'
+                : message || '保存后立即热更新。'}
             </div>
+            {dirty ? (
+              <Button variant="outline" disabled={saving} onClick={discardChanges}>
+                放弃修改
+              </Button>
+            ) : null}
             <Button disabled={saving} onClick={() => void saveConfig()}>
               <Save className="size-4" />
               {saving ? '保存中...' : '保存设置'}

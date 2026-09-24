@@ -6,10 +6,16 @@ services:
     image: ${N2A_IMAGE:-notion2api:latest}
     container_name: ${N2A_CONTAINER_NAME:-notion2api}
     restart: ${N2A_RESTART_POLICY:-unless-stopped}
+    # Loopback only: /v1 and /admin must not be reachable from other hosts
+    # unless a reverse proxy in front decides so. Set N2A_BIND=0.0.0.0 to
+    # publish on every interface deliberately.
     ports:
-      - "${N2A_PORT:-8787}:8787"
+      - "${N2A_BIND:-127.0.0.1}:${N2A_PORT:-8787}:8787"
+    # The service rewrites this file on every admin save and it holds the API
+    # key and admin password, so mount an untracked copy
+    # (cp config.docker.json config.docker.local.json), not the template.
     volumes:
-      - ${N2A_CONFIG_FILE:-./config.docker.json}:/app/config/config.json
+      - ${N2A_CONFIG_FILE:-./config.docker.local.json}:/app/config/config.json
       - ${N2A_DATA_DIR:-./data}:/app/data
     environment:
       TZ: ${TZ:-Asia/Shanghai}

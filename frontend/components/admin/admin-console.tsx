@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useTheme } from 'next-themes';
 import {
   AlertTriangle,
@@ -46,7 +46,14 @@ const TAB_LABEL: Record<TabKey, string> = {
 
 export function AdminConsole() {
   const consoleState = useAdminConsole();
-  const [activeTab, setActiveTab] = useState<TabKey>('tester');
+  const [activeTab, setActiveTabState] = useState<TabKey>('tester');
+  const settingsDirty = useRef(false);
+  const handleSettingsDirtyChange = useCallback((dirty: boolean) => { settingsDirty.current = dirty; }, []);
+  const setActiveTab = useCallback((tab: TabKey) => {
+    // Leaving the settings tab unmounts the form, so confirm before discarding edits.
+    if (tab !== 'settings' && settingsDirty.current && !window.confirm('设置有未保存的修改，离开后将丢失。确定离开？')) return;
+    setActiveTabState(tab);
+  }, []);
   const [resumeConversationID, setResumeConversationID] = useState('');
   const [loginBusy, setLoginBusy] = useState(false);
   const [loginMessage, setLoginMessage] = useState('');
@@ -126,6 +133,7 @@ export function AdminConsole() {
             config={configPayload.config}
             models={models}
             adminPasswordSet={Boolean(configPayload.secrets?.admin_password_set)}
+            onDirtyChange={handleSettingsDirtyChange}
             onSave={async (config) => {
               const payload = await services.updateSettings(config);
               await refreshAll();

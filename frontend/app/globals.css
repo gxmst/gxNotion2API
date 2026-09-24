@@ -38,6 +38,38 @@
 .chat-breadcrumb h1 { overflow: hidden; text-overflow: ellipsis; color: var(--chat-ink); font-size: 13px; font-weight: 500; max-width: 48vw; }
 .chat-generating { display: flex; align-items: center; gap: 6px; color: var(--chat-soft); font-size: 11px; margin-right: 10px; }
 .chat-generating span { width: 5px; height: 5px; border-radius: 50%; background: #7d9b82; }
+/* Workspace quota indicator. Percentages come from Notion, so the bar only
+   ever renders a number upstream confirmed. */
+.chat-quota { position: relative; display: flex; align-items: center; }
+.chat-quota-chip { display: flex; align-items: center; gap: 6px; height: 30px; padding: 0 9px; border-radius: 7px; color: var(--chat-soft); font-size: 12px; white-space: nowrap; }
+.chat-quota-chip:hover, .chat-quota-chip[aria-expanded="true"] { background: var(--chat-hover); color: var(--chat-ink); }
+.chat-quota-bar { display: block; width: 34px; height: 4px; border-radius: 999px; background: var(--chat-line); overflow: hidden; }
+.chat-quota-bar b { display: block; height: 100%; border-radius: 999px; background: #75917b; transition: width .25s ease; }
+.chat-quota-bar.is-warn b { background: #b08a4a; }
+.chat-quota-bar.is-low b { background: #b4574f; }
+.chat-quota-backdrop { position: fixed; inset: 0; z-index: 40; }
+.chat-quota-panel { position: absolute; top: 38px; right: 0; z-index: 41; width: 292px; padding: 14px 15px 13px; border: 1px solid var(--chat-line); border-radius: 12px; background: var(--chat-bg); box-shadow: 0 14px 38px #0000001f; }
+.chat-quota-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 9px; font-size: 12px; font-weight: 600; }
+.chat-quota-workspace { margin-bottom: 4px; color: var(--chat-soft); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-quota-window { margin-top: 12px; }
+.chat-quota-window-top { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; font-size: 12px; }
+.chat-quota-window-top strong { font-weight: 600; }
+.chat-quota-window-top span { color: var(--chat-soft); font-size: 11px; }
+.chat-quota-window .chat-quota-bar { width: 100%; height: 5px; margin-top: 7px; }
+.chat-quota-window-meta { margin-top: 6px; color: var(--chat-soft); font-size: 11px; }
+.chat-quota-empty { color: var(--chat-soft); font-size: 12px; line-height: 1.7; }
+.chat-quota-note { margin-top: 13px; padding-top: 10px; border-top: 1px solid var(--chat-line); color: var(--chat-soft); font-size: 11px; line-height: 1.6; }
+.chat-quota-list { display: grid; gap: 1px; }
+.chat-quota-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; font-size: 12px; }
+.chat-quota-row + .chat-quota-row { border-top: 1px solid var(--chat-line); }
+.chat-quota-row-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-quota-row-value { flex-shrink: 0; color: var(--chat-soft); font-size: 11px; }
+.chat-quota-row-value.is-warn { color: #b08a4a; }
+.chat-quota-row-value.is-low { color: #b4574f; }
+@media (max-width: 720px) {
+  .chat-quota-chip span { display: none; }
+  .chat-quota-panel { width: min(292px, calc(100vw - 34px)); }
+}
 .chat-scroll { min-height: 0; flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 10px 32px 0; scrollbar-gutter: stable; }
 .chat-welcome { max-width: 790px; margin: 0 auto; min-height: 100%; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 30px 0 65px; text-align: center; }
 .chat-welcome-symbol { display: grid; place-items: center; margin-bottom: 24px; width: 57px; height: 57px; border: 1px solid var(--chat-line); border-radius: 18px; box-shadow: 0 3px 12px #00000004; }

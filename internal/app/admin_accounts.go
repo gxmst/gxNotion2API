@@ -342,19 +342,20 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
 			return
 		}
-		cfg, _, _ := a.State.Snapshot()
-		account, _ = cfg.UpsertAccount(account)
-		if makeActive {
-			if !fileExists(account.ProbeJSON) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "account probe_json not found; cannot activate"})
-				return
+		_, err = a.State.Mutate(func(cfg *AppConfig) error {
+			account, _ = cfg.UpsertAccount(account)
+			if makeActive {
+				if !fileExists(account.ProbeJSON) {
+					return adminError(http.StatusBadRequest, "account probe_json not found; cannot activate")
+				}
+				cfg.ActiveAccount = account.Email
+				cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
+				cfg.ProbeJSON = account.ProbeJSON
 			}
-			cfg.ActiveAccount = account.Email
-			cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
-			cfg.ProbeJSON = account.ProbeJSON
-		}
-		if err := a.State.SaveAndApply(cfg); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+			return nil
+		})
+		if err != nil {
+			writeAdminError(w, err)
 			return
 		}
 		a.invalidateDispatchProbeCache()
@@ -370,38 +371,35 @@ func (a *App) handleAdminAccounts(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "email is required"})
 			return
 		}
-		cfg, _, _ := a.State.Snapshot()
-		existing, index, ok := cfg.FindAccount(email)
-		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
-			return
-		}
-		next, makeActive, err := mergeEditableAccountFields(existing, payload)
-		if err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
-			return
-		}
-		if next.Disabled && makeActive {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "disabled account cannot be activated"})
-			return
-		}
-		cfg.Accounts = cloneAccounts(cfg.Accounts)
-		cfg.Accounts[index] = ensureAccountPaths(cfg, next)
-		if canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(next) && next.Disabled {
-			cfg.ActiveAccount = ""
-			cfg.ProbeJSON = ""
-		}
-		if makeActive {
-			if !fileExists(next.ProbeJSON) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "account probe_json not found; cannot activate"})
-				return
+		_, err = a.State.Mutate(func(cfg *AppConfig) error {
+			existing, index, ok := cfg.FindAccount(email)
+			if !ok {
+				return adminError(http.StatusNotFound, "account not found")
 			}
-			cfg.ActiveAccount = next.Email
-			cfg.ActiveWorkspaceID = next.DefaultWorkspaceID
-			cfg.ProbeJSON = next.ProbeJSON
-		}
-		if err := a.State.SaveAndApply(cfg); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+			next, makeActive, err := mergeEditableAccountFields(existing, payload)
+			if err != nil {
+				return adminError(http.StatusBadRequest, err.Error())
+			}
+			if next.Disabled && makeActive {
+				return adminError(http.StatusBadRequest, "disabled account cannot be activated")
+			}
+			cfg.Accounts[index] = ensureAccountPaths(*cfg, next)
+			if canonicalEmailKey(cfg.ActiveAccount) == getAccountEmailKey(next) && next.Disabled {
+				cfg.ActiveAccount = ""
+				cfg.ProbeJSON = ""
+			}
+			if makeActive {
+				if !fileExists(next.ProbeJSON) {
+					return adminError(http.StatusBadRequest, "account probe_json not found; cannot activate")
+				}
+				cfg.ActiveAccount = next.Email
+				cfg.ActiveWorkspaceID = next.DefaultWorkspaceID
+				cfg.ProbeJSON = next.ProbeJSON
+			}
+			return nil
+		})
+		if err != nil {
+			writeAdminError(w, err)
 			return
 		}
 		a.invalidateDispatchProbeCache()
@@ -428,13 +426,14 @@ func (a *App) handleAdminAccountDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "email is required"})
 		return
 	}
-	cfg, _, _ := a.State.Snapshot()
-	if !cfg.DeleteAccount(email) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
-		return
-	}
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	_, err := a.State.Mutate(func(cfg *AppConfig) error {
+		if !cfg.DeleteAccount(email) {
+			return adminError(http.StatusNotFound, "account not found")
+		}
+		return nil
+	})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.invalidateDispatchProbeCache()
@@ -545,31 +544,30 @@ func (a *App) handleAdminAccountsActivate(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "email is required"})
 		return
 	}
-	cfg, _, _ := a.State.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "account not found"})
-		return
-	}
-	workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), account.DefaultWorkspaceID)
-	if workspaceID != "" {
-		if selected, _, selectedOK := cfg.FindAccountWorkspace(email, workspaceID); selectedOK {
-			account = selected
-		} else {
-			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "workspace not found"})
-			return
+	_, err = a.State.Mutate(func(cfg *AppConfig) error {
+		account, _, ok := cfg.FindAccount(email)
+		if !ok {
+			return adminError(http.StatusNotFound, "account not found")
 		}
-	}
-	account = ensureAccountPaths(cfg, account)
-	if !fileExists(account.ProbeJSON) {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "probe_json not found for account"})
-		return
-	}
-	cfg.ActiveAccount = account.Email
-	cfg.ActiveWorkspaceID = workspaceID
-	cfg.ProbeJSON = account.ProbeJSON
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		workspaceID := firstNonEmpty(strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), account.DefaultWorkspaceID)
+		if workspaceID != "" {
+			selected, _, selectedOK := cfg.FindAccountWorkspace(email, workspaceID)
+			if !selectedOK {
+				return adminError(http.StatusNotFound, "workspace not found")
+			}
+			account = selected
+		}
+		account = ensureAccountPaths(*cfg, account)
+		if !fileExists(account.ProbeJSON) {
+			return adminError(http.StatusBadRequest, "probe_json not found for account")
+		}
+		cfg.ActiveAccount = account.Email
+		cfg.ActiveWorkspaceID = workspaceID
+		cfg.ProbeJSON = account.ProbeJSON
+		return nil
+	})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.invalidateDispatchProbeCache()
@@ -935,64 +933,74 @@ func (a *App) handleAdminAccountManualImport(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	account = mergeAccountWithStatus(cfg, account, status)
-	account.Status = "ready"
-	account.LastError = ""
-	account.LastLoginAt = status.LastLoginAt
-	requestedDefaultWorkspaceID := strings.TrimSpace(req.DefaultWorkspaceID)
-	account.DefaultWorkspaceID = firstNonEmpty(requestedDefaultWorkspaceID, account.DefaultWorkspaceID, probe.SpaceID)
-	if len(discovered.Workspaces) > 0 {
-		for _, candidate := range discovered.Workspaces {
+	// The import reached the network above; merge into the live config so
+	// runtime state other requests committed meanwhile is kept.
+	_, err = a.State.Mutate(func(cfg *AppConfig) error {
+		if live, _, ok := cfg.FindAccount(accountEmail); ok {
+			live = ensureAccountPaths(*cfg, live)
+			live.ProbeJSON, live.StorageStatePath, live.PendingStatePath, live.ProfileDir = account.ProbeJSON, account.StorageStatePath, account.PendingStatePath, account.ProfileDir
+			account = live
+		}
+		account = mergeAccountWithStatus(*cfg, account, status)
+		account.Status = "ready"
+		account.LastError = ""
+		account.LastLoginAt = status.LastLoginAt
+		requestedDefaultWorkspaceID := strings.TrimSpace(req.DefaultWorkspaceID)
+		account.DefaultWorkspaceID = firstNonEmpty(requestedDefaultWorkspaceID, account.DefaultWorkspaceID, probe.SpaceID)
+		if len(discovered.Workspaces) > 0 {
+			for _, candidate := range discovered.Workspaces {
+				workspace := NotionWorkspace{
+					ID:               candidate.ID,
+					ViewID:           candidate.ViewID,
+					Name:             candidate.Name,
+					PlanType:         candidate.PlanType,
+					SubscriptionTier: candidate.SubscriptionTier,
+					AIEnabled:        candidate.AIEnabled,
+					AIDisabled:       candidate.AIDisabled,
+					Status:           "ready",
+				}
+				if existing, ok := accountWorkspace(account, workspace.ID); ok {
+					workspace = mergeWorkspaceValues(existing, workspace)
+				}
+				workspace.AIEnabled = candidate.AIEnabled
+				workspace.AIDisabled = candidate.AIDisabled
+				setAccountWorkspace(&account, workspace)
+			}
+		} else if probe.SpaceID != "" {
 			workspace := NotionWorkspace{
-				ID:               candidate.ID,
-				ViewID:           candidate.ViewID,
-				Name:             candidate.Name,
-				PlanType:         candidate.PlanType,
-				SubscriptionTier: candidate.SubscriptionTier,
-				AIEnabled:        candidate.AIEnabled,
-				AIDisabled:       candidate.AIDisabled,
-				Status:           "ready",
+				ID:       probe.SpaceID,
+				ViewID:   probe.SpaceViewID,
+				Name:     probe.SpaceName,
+				PlanType: account.PlanType,
+				Status:   "ready",
 			}
 			if existing, ok := accountWorkspace(account, workspace.ID); ok {
 				workspace = mergeWorkspaceValues(existing, workspace)
 			}
-			workspace.AIEnabled = candidate.AIEnabled
-			workspace.AIDisabled = candidate.AIDisabled
 			setAccountWorkspace(&account, workspace)
 		}
-	} else if probe.SpaceID != "" {
-		workspace := NotionWorkspace{
-			ID:       probe.SpaceID,
-			ViewID:   probe.SpaceViewID,
-			Name:     probe.SpaceName,
-			PlanType: account.PlanType,
-			Status:   "ready",
+		if account.DefaultWorkspaceID == "" {
+			account.DefaultWorkspaceID = probe.SpaceID
 		}
-		if existing, ok := accountWorkspace(account, workspace.ID); ok {
-			workspace = mergeWorkspaceValues(existing, workspace)
+		if _, ok := accountForWorkspace(account, account.DefaultWorkspaceID); !ok {
+			account.DefaultWorkspaceID = probe.SpaceID
 		}
-		setAccountWorkspace(&account, workspace)
-	}
-	if account.DefaultWorkspaceID == "" {
-		account.DefaultWorkspaceID = probe.SpaceID
-	}
-	if _, ok := accountForWorkspace(account, account.DefaultWorkspaceID); !ok {
-		account.DefaultWorkspaceID = probe.SpaceID
-	}
-	account.PlanType = firstNonEmpty(account.PlanType, discovered.PlanType)
-	account.UserName = firstNonEmpty(account.UserName, discovered.UserName)
-	account.SpaceName = firstNonEmpty(account.SpaceName, discovered.SpaceName)
-	if len(discovered.Models) > 0 {
-		cfg.Models = mergeModelDefinitions(discovered.Models, cfg.Models)
-	}
-	cfg.UpsertAccount(account)
-	if req.Active {
-		cfg.ActiveAccount = account.Email
-		cfg.ActiveWorkspaceID = probe.SpaceID
-		cfg.ProbeJSON = account.ProbeJSON
-	}
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		account.PlanType = firstNonEmpty(account.PlanType, discovered.PlanType)
+		account.UserName = firstNonEmpty(account.UserName, discovered.UserName)
+		account.SpaceName = firstNonEmpty(account.SpaceName, discovered.SpaceName)
+		if len(discovered.Models) > 0 {
+			cfg.Models = mergeModelDefinitions(discovered.Models, cfg.Models)
+		}
+		cfg.UpsertAccount(account)
+		if req.Active {
+			cfg.ActiveAccount = account.Email
+			cfg.ActiveWorkspaceID = probe.SpaceID
+			cfg.ProbeJSON = account.ProbeJSON
+		}
+		return nil
+	})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.invalidateDispatchProbeCache()
@@ -1024,17 +1032,20 @@ func (a *App) handleAdminAccountLoginStart(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	cfg, _, _ := a.State.Snapshot()
-	account, _, ok := cfg.FindAccount(email)
-	if !ok {
-		account = NotionAccount{Email: email, Status: "new"}
-	}
-	account = ensureAccountPaths(cfg, account)
-	account.Status = "starting"
-	account.LastError = ""
-	account, _ = cfg.UpsertAccount(account)
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	var account NotionAccount
+	cfg, err := a.State.Mutate(func(cfg *AppConfig) error {
+		existing, _, ok := cfg.FindAccount(email)
+		if !ok {
+			existing = NotionAccount{Email: email, Status: "new"}
+		}
+		existing = ensureAccountPaths(*cfg, existing)
+		existing.Status = "starting"
+		existing.LastError = ""
+		account, _ = cfg.UpsertAccount(existing)
+		return nil
+	})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 
@@ -1046,23 +1057,27 @@ func (a *App) handleAdminAccountLoginStart(w http.ResponseWriter, r *http.Reques
 		AccountEmail:     account.Email,
 	})
 
-	cfg, _, _ = a.State.Snapshot()
-	account, _, _ = cfg.FindAccount(email)
-	account = ensureAccountPaths(cfg, account)
-	if err != nil {
-		account.Status = "failed"
-		account.LastError = firstNonEmpty(status.Error, status.Message, err.Error())
+	loginErr := err
+	cfg, err = a.State.Mutate(func(cfg *AppConfig) error {
+		account, _, _ = cfg.FindAccount(email)
+		account = ensureAccountPaths(*cfg, account)
+		if loginErr != nil {
+			account.Status = "failed"
+			account.LastError = firstNonEmpty(status.Error, status.Message, loginErr.Error())
+		} else {
+			account = mergeAccountWithStatus(*cfg, account, status)
+			account.Status = firstNonEmpty(account.Status, "pending_code")
+			account.LastError = ""
+		}
 		cfg.UpsertAccount(account)
-		_ = a.State.SaveAndApply(cfg)
+		return nil
+	})
+	if loginErr != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": account.LastError, "account": account.Email})
 		return
 	}
-	account = mergeAccountWithStatus(cfg, account, status)
-	account.Status = firstNonEmpty(account.Status, "pending_code")
-	account.LastError = ""
-	cfg.UpsertAccount(account)
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.invalidateDispatchProbeCache()
@@ -1110,35 +1125,39 @@ func (a *App) handleAdminAccountLoginVerify(w http.ResponseWriter, r *http.Reque
 		AccountEmail:     account.Email,
 	})
 
-	cfg, _, _ = a.State.Snapshot()
-	account, _, _ = cfg.FindAccount(email)
-	if account.Email == "" {
-		account = NotionAccount{Email: email}
-	}
-	account = ensureAccountPaths(cfg, account)
-	if err != nil {
-		account.Status = "failed"
-		account.LastError = firstNonEmpty(status.Error, status.Message, err.Error())
+	verifyErr := err
+	cfg, err = a.State.Mutate(func(cfg *AppConfig) error {
+		account, _, _ = cfg.FindAccount(email)
+		if account.Email == "" {
+			account = NotionAccount{Email: email}
+		}
+		account = ensureAccountPaths(*cfg, account)
+		if verifyErr != nil {
+			account.Status = "failed"
+			account.LastError = firstNonEmpty(status.Error, status.Message, verifyErr.Error())
+			cfg.UpsertAccount(account)
+			return nil
+		}
+		account = mergeAccountWithStatus(*cfg, account, status)
+		if status.Success && fileExists(account.ProbeJSON) {
+			account.Status = "ready"
+			account.LastError = ""
+			if account.LastLoginAt == "" {
+				account.LastLoginAt = time.Now().Format(time.RFC3339)
+			}
+			cfg.ActiveAccount = account.Email
+			cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
+			cfg.ProbeJSON = account.ProbeJSON
+		}
 		cfg.UpsertAccount(account)
-		_ = a.State.SaveAndApply(cfg)
+		return nil
+	})
+	if verifyErr != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]any{"detail": account.LastError, "account": account.Email})
 		return
 	}
-
-	account = mergeAccountWithStatus(cfg, account, status)
-	if status.Success && fileExists(account.ProbeJSON) {
-		account.Status = "ready"
-		account.LastError = ""
-		if account.LastLoginAt == "" {
-			account.LastLoginAt = time.Now().Format(time.RFC3339)
-		}
-		cfg.ActiveAccount = account.Email
-		cfg.ActiveWorkspaceID = account.DefaultWorkspaceID
-		cfg.ProbeJSON = account.ProbeJSON
-	}
-	cfg.UpsertAccount(account)
-	if err := a.State.SaveAndApply(cfg); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+	if err != nil {
+		writeAdminError(w, err)
 		return
 	}
 	a.invalidateDispatchProbeCache()

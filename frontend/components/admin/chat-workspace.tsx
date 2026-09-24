@@ -1,23 +1,74 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, Copy, FileText, Globe2, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Plus, Search, Settings2, Sparkles, Square, Sun, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, Copy, FileText, Gauge, Globe2, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, X } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
+import { AdminService } from '@/lib/services/admin/admin.service';
 import { ModelEvidence } from '@/components/admin/model-evidence';
+import { safeMarkdownComponents } from '@/components/admin/safe-markdown';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
-import type { AccountItem, ChatRunInput, ChatRunResult, ConversationDetailPayload, ConversationMessage, ConversationSummary, ModelItem, TabKey } from '@/lib/services/admin/types';
+import type { AccountItem, AIUsageReport, AIUsageRateLimitWindow, ChatRunInput, ChatRunResult, ConversationDetailPayload, ConversationMessage, ConversationSummary, ModelItem, TabKey } from '@/lib/services/admin/types';
 
 const SESSION_KEY = 'notion2api-chat-session';
+// How often a completed turn may force a fresh quota read. The server caps
+// forced reads at 30s globally, so this only keeps a busy client from spending
+// the whole allowance on the indicator.
+const QUOTA_FORCE_MIN_INTERVAL_MS = 60_000;
+
 function newID() {
   if (typeof crypto.randomUUID === 'function') return crypto.randomUUID().replace(/-/g, '');
   return Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 const targetID = (email: string, workspace: string) => JSON.stringify([email, workspace]);
+
+// The window length is Notion's, so its own name is kept and only translated
+// into a readable form ("6h" -> "6 小时", "billing_period" -> "账单周期").
+function quotaWindowLabel(raw: string | undefined, fallback: string): string {
+  const value = (raw || '').trim();
+  if (!value) return fallback;
+  if (value === 'billing_period') return '账单周期';
+  const hours = /^(\d+)h$/.exec(value);
+  if (hours) return `${hours[1]} 小时`;
+  const days = /^(\d+)d$/.exec(value);
+  if (days) return `${days[1]} 天`;
+  return value;
+}
+
+// A remaining percentage is only derived from confirmed counters: an absent or
+// zero limit means upstream did not state one, not that nothing is left.
+function quotaRemainingPercent(window?: AIUsageRateLimitWindow): number | null {
+  if (!window || !Number.isFinite(window.limit) || window.limit <= 0) return null;
+  const used = Number.isFinite(window.used) ? window.used : 0;
+  return Math.max(0, Math.min(100, Math.round(((window.limit - used) / window.limit) * 100)));
+}
+
+function quotaTone(percent: number): 'ok' | 'warn' | 'low' {
+  if (percent <= 15) return 'low';
+  if (percent <= 40) return 'warn';
+  return 'ok';
+}
+
+function formatQuotaPeriodEnd(ms?: number): string {
+  if (!ms || !Number.isFinite(ms)) return '';
+  const date = new Date(ms);
+  if (Number.isNaN(date.getTime())) return '';
+  return `${date.getMonth() + 1} 月 ${date.getDate()} 日`;
+}
+
+// Counters are shown as upstream reported them. A missing limit is printed as
+// unknown rather than as zero, which would read as "nothing left".
+function formatQuotaAmount(window: AIUsageRateLimitWindow): string {
+  const round = (value: number) => (Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
+  const used = Number.isFinite(window.used) ? round(window.used) : '?';
+  const limit = Number.isFinite(window.limit) && window.limit > 0 ? round(window.limit) : '未知';
+  const periodEnd = formatQuotaPeriodEnd(window.period_end_ms);
+  return `已用 ${used} / ${limit}${periodEnd ? ` · 至 ${periodEnd}` : ''}`;
+}
 
 export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun, conversations, accounts, onNavigate, visible }: {
   models: ModelItem[];
@@ -51,6 +102,22 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [atBottom, setAtBottom] = useState(true);
   const [copied, setCopied] = useState('');
+  const [quota, setQuota] = useState<AIUsageReport | null>(null);
+  // The workspace the stored report was fetched for. A report is only rendered
+  // while it still matches the workspace the next turn would use, so switching
+  // workspaces never shows one workspace's numbers under another's name.
+  const [quotaKey, setQuotaKey] = useState('');
+  const [quotaRows, setQuotaRows] = useState<AIUsageReport[] | null>(null);
+  const [quotaLoading, setQuotaLoading] = useState(false);
+  // The auto-mode list and the single-workspace read are separate requests; a
+  // shared flag let the faster list clear the flag while the workspace read was
+  // still in flight, which briefly rendered "no windows" for a pending read.
+  const [quotaRowsLoading, setQuotaRowsLoading] = useState(false);
+  const [quotaOpen, setQuotaOpen] = useState(false);
+  const [quotaError, setQuotaError] = useState('');
+  const [quotaRevision, setQuotaRevision] = useState(0);
+  const quotaForcedAt = useRef(0);
+  const quotaForceNext = useRef(false);
   const abortRef = useRef<AbortController | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -78,11 +145,58 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const modelChoiceKey = availableModels.map((item) => item.id).join('|');
   const autoOnly = boundTarget?.capability?.mode === 'auto_only';
   const history = conversations.filter((item) => (item.title || item.preview || item.request_prompt || '新对话').toLowerCase().includes(filter.toLowerCase()));
+  // Quota is per workspace, so the indicator follows the workspace this turn
+  // will actually use: the bound one when a conversation pins it, the
+  // explicitly selected one otherwise. In auto mode there is no single
+  // workspace until the first turn binds one.
+  const effectiveWorkspace = target === 'auto' ? null : boundTarget ?? null;
+  const effectiveWorkspaceKey = effectiveWorkspace ? effectiveWorkspace.email + '\u0000' + effectiveWorkspace.workspace : '';
+  const activeQuota = effectiveWorkspaceKey !== '' && quotaKey === effectiveWorkspaceKey ? quota : null;
+  const shortWindow = activeQuota?.usage?.rate_limit?.short;
+  const longWindow = activeQuota?.usage?.rate_limit?.long;
+  const primaryWindow = shortWindow ?? longWindow;
+  const primaryPercent = quotaRemainingPercent(primaryWindow);
+
+  async function loadQuotaRows(refresh = false) {
+    setQuotaRowsLoading(true); setQuotaError('');
+    try {
+      const { accounts } = await AdminService.getAIUsage(refresh);
+      const eligible = new Set(targets.map((item) => item.workspace));
+      setQuotaRows(accounts.filter((row) => row.space_id && eligible.has(row.space_id)));
+    } catch (cause) {
+      setQuotaError(cause instanceof Error ? cause.message : '额度读取失败');
+    } finally { setQuotaRowsLoading(false); }
+  }
+
+  // A fresh read is asked for at most once a minute; the server also caps
+  // forced reads, so a chatty session cannot turn the indicator into a stream
+  // of upstream calls.
+  function refreshQuota() {
+    if (effectiveWorkspace) {
+      if (Date.now() - quotaForcedAt.current >= QUOTA_FORCE_MIN_INTERVAL_MS) {
+        quotaForcedAt.current = Date.now();
+        quotaForceNext.current = true;
+      }
+      setQuotaRevision((value) => value + 1);
+      return;
+    }
+    // Auto mode has no single workspace, so the pool-wide list is only worth
+    // reading to repaint a panel that is already open. Refreshing it after
+    // every turn would scan every workspace for an indicator nobody is
+    // looking at; opening the panel reads it on demand instead.
+    if (quotaOpen) void loadQuotaRows(true);
+  }
+
+  function toggleQuota() {
+    const next = !quotaOpen;
+    setQuotaOpen(next);
+    if (next && !effectiveWorkspace) void loadQuotaRows();
+  }
 
   async function openConversation(id: string, draft = '') {
     if (abortRef.current) { toast.info('请先停止当前生成，再切换对话'); return; }
     const revision = ++loadRevision.current;
-    setLoading(true); setError(''); setLoadFailed(false); setRemoteRunning(false);
+    setLoading(true); setError(''); setLoadFailed(false); setRemoteRunning(false); setQuotaOpen(false);
     setConversationID(id); setMessages([]); setFiles([]); setPrompt(draft); setOwner(''); setTarget('auto');
     setTitle('加载对话…');
     setMobileOpen(false); followBottom.current = true;
@@ -131,6 +245,31 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   }, [modelChoiceKey, model, running, loading]);
 
   useEffect(() => {
+    if (!visible || !effectiveWorkspaceKey) { setQuota(null); return; }
+    const [email, workspace] = effectiveWorkspaceKey.split('\u0000');
+    // Without an email the account cannot be named, and the server would fall
+    // back to whichever account happens to be active. Say so instead of asking.
+    if (!email) { setQuota(null); setQuotaLoading(false); setQuotaError('该工作区所属账号缺少邮箱，无法读取额度'); return; }
+    const force = quotaForceNext.current;
+    quotaForceNext.current = false;
+    let cancelled = false;
+    setQuotaLoading(true); setQuotaError('');
+    AdminService.getWorkspaceAIUsage(email, workspace, force)
+      .then(({ report }) => {
+        if (cancelled) return;
+        // The server caps forced reads globally and silently serves its cache
+        // when someone else refreshed moments ago. A declined refresh must not
+        // count against the client's own interval, or the next attempt would be
+        // throttled by a read that never happened.
+        if (force && report.cached) quotaForcedAt.current = 0;
+        setQuota(report); setQuotaKey(effectiveWorkspaceKey);
+      })
+      .catch((cause) => { if (!cancelled) setQuotaError(cause instanceof Error ? cause.message : '额度读取失败'); })
+      .finally(() => { if (!cancelled) setQuotaLoading(false); });
+    return () => { cancelled = true; };
+  }, [visible, effectiveWorkspaceKey, quotaRevision]);
+
+  useEffect(() => {
     if (loading) return;
     const saved = JSON.stringify({ conversationID, prompt, model, useWebSearch, target });
     try { sessionStorage.setItem(SESSION_KEY, saved); localStorage.setItem(SESSION_KEY, saved); } catch { /* Optional storage. */ }
@@ -172,7 +311,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     if (abortRef.current) return;
     loadRevision.current++;
     setConversationID(''); setMessages([]); setOwner(''); setTitle('新对话'); setError(''); setPrompt(''); setFiles([]);
-    setLoading(false); setLoadFailed(false); setRemoteRunning(false); setMobileOpen(false);
+    setLoading(false); setLoadFailed(false); setRemoteRunning(false); setMobileOpen(false); setQuotaOpen(false);
     if (!targets.some((item) => item.id === target)) setTarget('auto');
     followBottom.current = true;
     if (fileRef.current) fileRef.current.value = '';
@@ -208,6 +347,8 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       if (!mounted.current) return;
       setConversationID(result.conversation_id || id);
       setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: result.text, status: 'completed' } : message));
+      // The turn just spent allowance; re-read so the indicator is not stale.
+      refreshQuota();
       try {
         const { item } = await propsRef.current.onLoad(result.conversation_id || id);
         if (mounted.current) {
@@ -222,6 +363,52 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       if (!controller.signal.aborted) setPrompt((current) => current || sentPrompt);
     } finally { abortRef.current = null; if (mounted.current) setRunning(false); }
   }
+
+  const quotaWindows = [
+    shortWindow ? { key: 'short', window: shortWindow, fallback: '短窗口' } : null,
+    longWindow ? { key: 'long', window: longWindow, fallback: '长周期' } : null,
+  ].filter((item): item is { key: string; window: AIUsageRateLimitWindow; fallback: string } => item !== null);
+
+  const quotaPanel = !quotaOpen ? null : <>
+    <div className="chat-quota-backdrop" onClick={() => setQuotaOpen(false)} />
+    <div className="chat-quota-panel" role="dialog" aria-label="工作区额度">
+      <div className="chat-quota-panel-head">
+        <span>工作区额度</span>
+        <button type="button" className="chat-icon" aria-label="刷新额度" disabled={quotaLoading || quotaRowsLoading} onClick={() => refreshQuota()}>
+          {quotaLoading || quotaRowsLoading ? <LoaderCircle size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+        </button>
+      </div>
+      {quotaError ? <p className="chat-quota-empty">{quotaError}</p> : null}
+      {!quotaError && !effectiveWorkspace ? (
+        quotaRows === null ? <p className="chat-quota-empty">正在读取…</p>
+          : !quotaRows.length ? <p className="chat-quota-empty">暂无可读取额度的商业工作区。</p>
+          : <div className="chat-quota-list">{quotaRows.map((row) => {
+            const percent = quotaRemainingPercent(row.usage?.rate_limit?.short ?? row.usage?.rate_limit?.long);
+            return <div className="chat-quota-row" key={(row.email || '') + (row.space_id || '')}>
+              <span className="chat-quota-row-name">{row.workspace_name || row.space_id}</span>
+              <span className={'chat-quota-row-value is-' + (percent === null ? 'ok' : quotaTone(percent))}>{percent === null ? '未知' : `剩余 ${percent}%`}</span>
+            </div>;
+          })}</div>
+      ) : null}
+      {!quotaError && effectiveWorkspace ? <>
+        <p className="chat-quota-workspace">{effectiveWorkspace.name} · {effectiveWorkspace.email}</p>
+        {quotaLoading && !activeQuota ? <p className="chat-quota-empty">正在读取…</p> : null}
+        {activeQuota && activeQuota.status !== 'ok' ? <p className="chat-quota-empty">{activeQuota.detail || '额度不可用'}</p> : null}
+        {quotaWindows.length ? quotaWindows.map((item) => {
+          const percent = quotaRemainingPercent(item.window);
+          return <div className="chat-quota-window" key={item.key}>
+            <div className="chat-quota-window-top">
+              <strong>{quotaWindowLabel(item.window.label, item.fallback)}</strong>
+              <span>{percent === null ? '未知' : `剩余 ${percent}%`}</span>
+            </div>
+            {percent === null ? null : <span className={'chat-quota-bar is-' + quotaTone(percent)}><b style={{ width: `${percent}%` }} /></span>}
+            <div className="chat-quota-window-meta">{formatQuotaAmount(item.window)}</div>
+          </div>;
+        }) : (quotaLoading || !activeQuota ? null : <p className="chat-quota-empty">上游未返回窗口额度。</p>)}
+        <p className="chat-quota-note">数值来自 Notion 上游，仅供估算，不代表实际扣费。</p>
+      </> : null}
+    </div>
+  </>;
 
   const sidebar = <div className="chat-sidebar-content">
     <div className="chat-brand"><span className="chat-mark"><Sparkles size={17} /></span><span>Notion AI</span><button className="chat-icon ml-auto hidden lg:flex" aria-label="收起侧栏" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button></div>
@@ -251,6 +438,15 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         <div className="min-w-0"><div className="chat-breadcrumb"><span className="chat-workspace-name">{boundTarget?.name || 'Notion AI'}</span><span>/</span><h1>{title}</h1></div></div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
           {running ? <span className="chat-generating"><span />生成中</span> : null}
+          {targets.length ? <div className="chat-quota">
+            <button type="button" className="chat-quota-chip" aria-expanded={quotaOpen} aria-haspopup="dialog" onClick={toggleQuota}
+              title={quotaError || (effectiveWorkspace ? `${effectiveWorkspace.name} 的工作区额度` : '各工作区剩余额度')}>
+              <Gauge size={15} />
+              <span>{quotaError && !activeQuota ? '额度不可用' : primaryPercent === null ? '额度' : `剩余 ${primaryPercent}%`}</span>
+              {primaryPercent === null ? null : <i className={'chat-quota-bar is-' + quotaTone(primaryPercent)}><b style={{ width: `${primaryPercent}%` }} /></i>}
+            </button>
+            {quotaPanel}
+          </div> : null}
           <button className="chat-icon" aria-label="切换明暗主题" onClick={() => setTheme(resolvedTheme === 'dark' ? 'light' : 'dark')}>{resolvedTheme === 'dark' ? <Sun size={17} /> : <Moon size={17} />}</button>
           <button className="chat-icon lg:hidden" aria-label="新对话" disabled={running} onClick={startNew}><Plus size={18} /></button>
         </div>
@@ -270,7 +466,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         <div className="chat-transcript">{messages.map((message, index) => <article key={message.id || index} className={message.role === 'user' ? 'chat-message chat-user' : 'chat-message chat-assistant'}>
           {message.role !== 'user' ? <div className="chat-assistant-label"><Sparkles size={15} />Notion AI</div> : null}
           <div className="chat-message-content">{message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content}</p> : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-            a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+            ...safeMarkdownComponents,
             table: ({ children }) => <div className="chat-table"><table>{children}</table></div>,
           }}>{message.content || ''}</ReactMarkdown>}
           {!message.content && message.status === 'streaming' ? <div className="chat-thinking"><span /><span /><span /><span className="sr-only">正在生成</span></div> : null}

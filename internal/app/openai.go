@@ -1306,9 +1306,8 @@ func buildTrace(result InferenceResult) map[string]any {
 		"ndjson_line_count": result.NDJSONLineCount,
 		"notion_model":      result.NotionModel,
 	}
-	if strings.TrimSpace(result.AccountEmail) != "" {
-		trace["account_email"] = result.AccountEmail
-	}
+	// No account_email: every API-key holder sees this trace, and the account
+	// pool's identities are operator-only (the admin conversation view has them).
 	if reasoning := sanitizeAssistantVisibleText(result.Reasoning); reasoning != "" {
 		trace["reasoning_chars"] = len([]rune(reasoning))
 	}

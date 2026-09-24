@@ -26,10 +26,10 @@ func TestAccountConcurrencySharedAcrossWorkspaces(t *testing.T) {
 	if app.State.TryAcquireWorkspaceDispatchSlot("primary@example.com", "second") {
 		t.Fatal("second workspace bypassed shared account limit")
 	}
-	if !app.State.TryAcquireAccountDispatchSlot("backup@example.com") {
+	if !app.State.TryAcquireWorkspaceDispatchSlot("backup@example.com", "") {
 		t.Fatal("different account was blocked")
 	}
-	app.State.ReleaseAccountDispatchSlot("backup@example.com")
+	app.State.ReleaseWorkspaceDispatchSlot("backup@example.com", "")
 	app.State.ReleaseWorkspaceDispatchSlot("primary@example.com", "")
 	if !app.State.TryAcquireWorkspaceDispatchSlot("primary@example.com", "second") {
 		t.Fatal("default-workspace release leaked credential capacity")
@@ -42,10 +42,10 @@ func TestAccountConcurrencySharedAcrossWorkspaces(t *testing.T) {
 	if err := app.State.ApplyConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if !app.State.TryAcquireAccountDispatchSlot("primary@example.com") {
+	if !app.State.TryAcquireWorkspaceDispatchSlot("primary@example.com", "second") {
 		t.Fatal("active workspace slot unavailable")
 	}
-	app.State.ReleaseAccountDispatchSlot("primary@example.com")
+	app.State.ReleaseWorkspaceDispatchSlot("primary@example.com", "second")
 	if got := app.State.loadAccountSlots()[credentialSlotKey("primary@example.com")].inflight.Load(); got != 0 {
 		t.Fatal("active workspace release leaked shared capacity")
 	}
@@ -168,4 +168,15 @@ func TestRefusalRetryIsOptInAndBounded(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), `notion2api_inference_activity_total{activity="continuation_calls"}`) {
 		t.Fatal("reuse metric missing")
 	}
+}
+
+// testDefaultWorkspaceID resolves the workspace an account dispatches to by
+// default, for tests that record bookkeeping against it.
+func testDefaultWorkspaceID(state *ServerState, email string) string {
+	cfg, _, _ := state.Snapshot()
+	account, _, ok := cfg.FindAccount(email)
+	if !ok {
+		return ""
+	}
+	return accountWorkspaceID(account)
 }

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -474,348 +475,126 @@ func (a *App) loadPrimarySession(ctx context.Context, cfg AppConfig, snapshot Se
 	return loadSessionInfo(probePath, userName, spaceName)
 }
 
-func (a *App) runPromptActiveFallback(r *http.Request, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
-	cfg, snapshotSession, _ := a.State.Snapshot()
-	_, _, _, activeEmail := cfg.ResolveSessionTarget()
-	timeout := requestTimeout(cfg)
-	if onDelta != nil {
-		timeout = streamRequestTimeout(cfg)
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	session, err := a.loadPrimarySession(ctx, cfg, snapshotSession, "client_missing_fallback")
-	if err != nil {
-		return InferenceResult{}, err
-	}
-	if err := a.probeAccountProtocolHealth(ctx, cfg, session, activeEmail); err != nil {
-		return InferenceResult{}, err
-	}
-
-	emittedAny := false
-	wrappedDelta := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
-		}
-		if onDelta == nil {
-			return nil
-		}
-		return onDelta(delta)
-	}
-
-	a.preparePromptExecutionTarget(&request, activeEmail, session.SpaceID)
-	result, err := a.runPromptWithSession(ctx, cfg, session, activeEmail, request, wrappedDelta)
-	if err == nil {
-		result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
-		return result, nil
-	}
-	if cfg.ResolveSessionRefresh().RetryOnAuthError && isSessionRetryableError(err) && !emittedAny {
-		if refreshErr := a.State.RefreshSession(ctx, "prompt_retry_fallback"); refreshErr == nil {
-			a.invalidateDispatchProbeCache()
-			_, refreshed, _ := a.State.Snapshot()
-			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
-				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, activeEmail); probeErr != nil {
-					return InferenceResult{}, probeErr
-				}
-				result, retryErr := a.runPromptWithSession(ctx, cfg, refreshed, activeEmail, request, wrappedDelta)
-				result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
-				return result, retryErr
-			}
-		}
-	}
-	return InferenceResult{}, err
-}
-
-func (a *App) runPromptActiveFallbackWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
-	cfg, snapshotSession, _ := a.State.Snapshot()
-	_, _, _, activeEmail := cfg.ResolveSessionTarget()
-	timeout := streamRequestTimeout(cfg)
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	session, err := a.loadPrimarySession(ctx, cfg, snapshotSession, "client_missing_fallback")
-	if err != nil {
-		return InferenceResult{}, err
-	}
-	if err := a.probeAccountProtocolHealth(ctx, cfg, session, activeEmail); err != nil {
-		return InferenceResult{}, err
-	}
-
-	emittedAny := false
-	wrappedText := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
-		}
-		return sink.EmitText(delta)
-	}
-	wrappedReasoning := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
-		}
-		return sink.EmitReasoning(delta)
-	}
-	wrappedReasoningWarmup := func() error {
-		return sink.EmitReasoningWarmup()
-	}
-	wrappedKeepAlive := func() error {
-		return sink.EmitKeepAlive()
-	}
-
-	a.preparePromptExecutionTarget(&request, activeEmail, session.SpaceID)
-	result, err := a.runPromptWithSessionWithSink(ctx, cfg, session, activeEmail, request, InferenceStreamSink{
-		Text:            wrappedText,
-		Reasoning:       wrappedReasoning,
-		ReasoningWarmup: wrappedReasoningWarmup,
-		KeepAlive:       wrappedKeepAlive,
-	})
-	if err == nil {
-		result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
-		return result, nil
-	}
-	if cfg.ResolveSessionRefresh().RetryOnAuthError && isSessionRetryableError(err) && !emittedAny {
-		if refreshErr := a.State.RefreshSession(ctx, "prompt_retry_fallback"); refreshErr == nil {
-			a.invalidateDispatchProbeCache()
-			_, refreshed, _ := a.State.Snapshot()
-			if strings.TrimSpace(refreshed.UserID) != "" && strings.TrimSpace(refreshed.SpaceID) != "" && len(refreshed.Cookies) > 0 {
-				if probeErr := a.probeAccountProtocolHealth(ctx, cfg, refreshed, activeEmail); probeErr != nil {
-					return InferenceResult{}, probeErr
-				}
-				result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshed, activeEmail, request, InferenceStreamSink{
-					Text:            wrappedText,
-					Reasoning:       wrappedReasoning,
-					ReasoningWarmup: wrappedReasoningWarmup,
-					KeepAlive:       wrappedKeepAlive,
-				})
-				result.AccountEmail = firstNonEmpty(result.AccountEmail, activeEmail)
-				return result, retryErr
-			}
-		}
-	}
-	return InferenceResult{}, err
-}
-
 func (a *App) runPromptWithAccountPool(r *http.Request, request PromptRunRequest, onDelta func(string) error) (InferenceResult, error) {
-	cfg, _, _ := a.State.Snapshot()
-	if len(cfg.Accounts) == 0 {
-		return InferenceResult{}, noEligibleAccountsError()
-	}
-
-	timeout := requestTimeout(cfg)
-	if onDelta != nil {
-		timeout = streamRequestTimeout(cfg)
-	}
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	now := time.Now()
-	var candidates []NotionAccount
-	var err error
-	if a != nil && a.State != nil {
-		if snap := a.State.snap.Load(); snap != nil {
-			candidates, err = resolveDispatchCandidatesFromSnapshot(snap, request, now)
-		} else {
-			candidates, err = resolveDispatchCandidates(cfg, request, now)
-		}
-	} else {
-		candidates, err = resolveDispatchCandidates(cfg, request, now)
-	}
-	if err != nil {
-		if isQuotaExhaustedError(err) && cfg.ResolveContinuationFailover() {
-			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
-				return a.runPromptWithAccountPool(r, next, onDelta)
-			}, err)
-		}
-		return InferenceResult{}, err
-	}
-	candidateKeys := make([]string, 0, len(candidates))
-	for _, candidate := range candidates {
-		candidateKeys = append(candidateKeys, dispatchWorkspaceKey(candidate))
-	}
-	if a.State.AvailableDispatchCapacityKeys(candidateKeys) <= 0 {
-		return InferenceResult{}, noDispatchCapacityError()
-	}
-
-	emittedAny := false
-	wrappedDelta := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
-		}
-		if onDelta == nil {
-			return nil
-		}
-		return onDelta(delta)
-	}
-
-	var lastErr error
-	for _, original := range candidates {
-		workspaceID := accountWorkspaceID(original)
-		if !a.State.TryAcquireWorkspaceDispatchSlot(original.Email, workspaceID) {
-			continue
-		}
-		slotAcquired := true
-		account, started, startErr := a.State.beginWorkspaceDispatch(original.Email, workspaceID, time.Now())
-		if startErr != nil {
-			a.State.ReleaseWorkspaceDispatchSlot(original.Email, workspaceID)
-			return InferenceResult{}, startErr
-		}
-		if !started {
-			a.State.ReleaseWorkspaceDispatchSlot(original.Email, workspaceID)
-			if quotaErr := accountQuotaCooldownError(account, time.Now()); quotaErr != nil {
-				lastErr = quotaErr
-			}
-			continue
-		}
-		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
-		if err == nil {
-			a.preparePromptExecutionTarget(&request, account.Email, session.SpaceID)
-			result, runErr := a.runPromptWithSession(ctx, cfg, session, account.Email, request, wrappedDelta)
-			if runErr == nil {
-				if slotAcquired {
-					a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-					slotAcquired = false
-				}
-				result.AccountEmail = account.Email
-				if saveErr := a.State.finishWorkspaceDispatchSuccess(account.Email, workspaceID, session, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, account.Email)); saveErr != nil {
-					return InferenceResult{}, saveErr
-				}
-				return result, nil
-			}
-			err = runErr
-		}
-		if !isDispatchContextAbort(ctx, err) && !credentialBackoff(err, time.Now()).IsZero() {
-			// Publish account-wide backoff before releasing capacity, so another
-			// workspace cannot start while this credential is being paused.
-			saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, false)
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			if saveErr != nil {
-				return InferenceResult{}, fmt.Errorf("%w; saving account cooldown: %v", err, saveErr)
-			}
-			lastErr = fmt.Errorf("%s: %w", account.Email, err)
-			if emittedAny {
-				return InferenceResult{}, lastErr
-			}
-			continue
-		}
-		if slotAcquired {
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			slotAcquired = false
-		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
-			return InferenceResult{}, err
-		}
-
-		retryable := isSessionRetryableError(err)
-		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
-			refreshedCfg, refreshErr := a.State.tryRefreshAccount(ctx, cfg, account)
-			if refreshErr == nil {
-				if committedCfg, saveErr := a.State.commitAccountRefresh(cfg, account, refreshedCfg); saveErr == nil {
-					a.invalidateDispatchProbeCache()
-					cfg = committedCfg
-					refreshedAccount, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID)
-					if ok {
-						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
-						if loadErr == nil {
-							if !a.State.tryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID, true) {
-								err = noDispatchCapacityError()
-								retryable = false
-							} else {
-								slotAcquired = true
-								result, retryErr := a.runPromptWithSession(ctx, cfg, refreshedSession, refreshedAccount.Email, request, wrappedDelta)
-								if retryErr == nil {
-									if slotAcquired {
-										a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-										slotAcquired = false
-									}
-									result.AccountEmail = refreshedAccount.Email
-									if saveErr := a.State.finishWorkspaceDispatchSuccess(refreshedAccount.Email, workspaceID, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
-										return InferenceResult{}, saveErr
-									}
-									return result, nil
-								}
-								err = retryErr
-								retryable = isSessionRetryableError(err)
-							}
-						} else {
-							err = loadErr
-							retryable = isSessionRetryableError(err)
-						}
-					}
-				} else {
-					err = saveErr
-					retryable = isSessionRetryableError(err)
-				}
-			}
-		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
-			if slotAcquired {
-				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			}
-			return InferenceResult{}, err
-		}
-
-		if retryable {
-			reloginCfg, _ := a.State.startAutoRelogin(ctx, cfg, account, "request_auth_failed")
-			if committedCfg, commitErr := a.State.commitAccountRefresh(cfg, account, reloginCfg); commitErr == nil {
-				cfg = committedCfg
-			} else {
-				cfg = reloginCfg
-			}
-			if updated, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
-				account = updated
-			}
-		}
-
-		saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
-		if slotAcquired {
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-		}
-		if saveErr != nil {
-			return InferenceResult{}, fmt.Errorf("%w; saving account failure: %v", err, saveErr)
-		}
-		lastErr = fmt.Errorf("%s: %w", account.Email, err)
-		if emittedAny {
-			return InferenceResult{}, lastErr
-		}
-	}
-
-	if lastErr != nil {
-		if !emittedAny && isQuotaExhaustedError(lastErr) && cfg.ResolveContinuationFailover() {
-			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
-				return a.runPromptWithAccountPool(r, next, onDelta)
-			}, lastErr)
-		}
-		return InferenceResult{}, lastErr
-	}
-	return InferenceResult{}, noDispatchCapacityError()
+	return a.dispatchPromptThroughPool(r, request, dispatchOutput{
+		sink:      InferenceStreamSink{Text: onDelta},
+		deltaOnly: true,
+		streaming: onDelta != nil,
+	})
 }
 
 func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRunRequest, sink InferenceStreamSink) (InferenceResult, error) {
+	return a.dispatchPromptThroughPool(r, request, dispatchOutput{sink: sink, streaming: true})
+}
+
+// dispatchOutput describes where one dispatched prompt delivers its output.
+// Both public entry points share a single candidate loop; they only differ in
+// how the per-session runner is invoked, which keeps test overrides and the
+// non-streaming client selection exactly as the separate loops had them.
+type dispatchOutput struct {
+	sink InferenceStreamSink
+	// deltaOnly routes through runPromptWithSession (text callback only)
+	// instead of runPromptWithSessionWithSink.
+	deltaOnly bool
+	streaming bool
+}
+
+// dispatchEmitState records what a dispatch already sent to the client. Sink
+// callbacks may run on the upstream reader and on the keepalive goroutine, so
+// both flags are atomic.
+type dispatchEmitState struct {
+	emitted    atomic.Bool
+	clientGone atomic.Bool
+}
+
+func (s *dispatchEmitState) emittedAny() bool { return s.emitted.Load() }
+
+// clientWrite types a failed client write as clientGoneError and remembers it,
+// so the dispatcher still recognises the disconnect if the upstream client
+// later wraps the error without %w.
+func (s *dispatchEmitState) clientWrite(err error) error {
+	if err == nil {
+		return nil
+	}
+	s.clientGone.Store(true)
+	if isClientGoneError(err) {
+		return err
+	}
+	return &clientGoneError{err: err}
+}
+
+// wrapSink tracks visible output and types every client write failure as a
+// clientGoneError. Nil callbacks stay nil: runPromptWithSessionWithSink picks
+// the non-streaming client when the sink is entirely empty.
+func (s *dispatchEmitState) wrapSink(sink InferenceStreamSink) InferenceStreamSink {
+	out := InferenceStreamSink{}
+	if sink.Text != nil {
+		out.Text = func(delta string) error {
+			if delta != "" {
+				s.emitted.Store(true)
+			}
+			return s.clientWrite(sink.Text(delta))
+		}
+	}
+	if sink.Reasoning != nil {
+		out.Reasoning = func(delta string) error {
+			if delta != "" {
+				s.emitted.Store(true)
+			}
+			return s.clientWrite(sink.Reasoning(delta))
+		}
+	}
+	if sink.ReasoningWarmup != nil {
+		out.ReasoningWarmup = func() error { return s.clientWrite(sink.ReasoningWarmup()) }
+	}
+	if sink.KeepAlive != nil {
+		out.KeepAlive = func() error { return s.clientWrite(sink.KeepAlive()) }
+	}
+	return out
+}
+
+// dispatchAttempt is the outcome of trying one candidate workspace.
+type dispatchAttempt struct {
+	result InferenceResult
+	// err is the attempt's error. Without stop it only feeds lastErr.
+	err error
+	// stop ends the candidate loop and returns result/err as they are.
+	stop bool
+	// accountFailure marks err as a recorded account failure (prefixed with
+	// the account email); other non-stop errors merely explain a skip.
+	accountFailure bool
+	cfg            AppConfig
+}
+
+func (a *App) resolveRequestDispatchCandidates(cfg AppConfig, request PromptRunRequest, now time.Time) ([]NotionAccount, error) {
+	if a != nil && a.State != nil {
+		if snap := a.State.snap.Load(); snap != nil {
+			return resolveDispatchCandidatesFromSnapshot(snap, request, now)
+		}
+	}
+	return resolveDispatchCandidates(cfg, request, now)
+}
+
+func (a *App) dispatchPromptThroughPool(r *http.Request, request PromptRunRequest, output dispatchOutput) (InferenceResult, error) {
 	cfg, _, _ := a.State.Snapshot()
 	if len(cfg.Accounts) == 0 {
 		return InferenceResult{}, noEligibleAccountsError()
 	}
 
-	timeout := streamRequestTimeout(cfg)
+	timeout := requestTimeout(cfg)
+	if output.streaming {
+		timeout = streamRequestTimeout(cfg)
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), timeout)
 	defer cancel()
 
-	now := time.Now()
-	var candidates []NotionAccount
-	var err error
-	if a != nil && a.State != nil {
-		if snap := a.State.snap.Load(); snap != nil {
-			candidates, err = resolveDispatchCandidatesFromSnapshot(snap, request, now)
-		} else {
-			candidates, err = resolveDispatchCandidates(cfg, request, now)
-		}
-	} else {
-		candidates, err = resolveDispatchCandidates(cfg, request, now)
+	rerun := func(next PromptRunRequest) (InferenceResult, error) {
+		return a.dispatchPromptThroughPool(r, next, output)
 	}
+	candidates, err := a.resolveRequestDispatchCandidates(cfg, request, time.Now())
 	if err != nil {
 		if isQuotaExhaustedError(err) && cfg.ResolveContinuationFailover() {
-			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
-				return a.runPromptWithAccountPoolWithSink(r, next, sink)
-			}, err)
+			return a.retryContinuationOnAnotherAccount(r, request, rerun, err)
 		}
 		return InferenceResult{}, err
 	}
@@ -827,173 +606,204 @@ func (a *App) runPromptWithAccountPoolWithSink(r *http.Request, request PromptRu
 		return InferenceResult{}, noDispatchCapacityError()
 	}
 
-	emittedAny := false
-	wrappedText := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
+	emit := &dispatchEmitState{}
+	wrapped := emit.wrapSink(output.sink)
+	run := func(ctx context.Context, cfg AppConfig, session SessionInfo, email string, attempt PromptRunRequest) (InferenceResult, error) {
+		if output.deltaOnly {
+			return a.runPromptWithSession(ctx, cfg, session, email, attempt, wrapped.Text)
 		}
-		return sink.EmitText(delta)
-	}
-	wrappedReasoning := func(delta string) error {
-		if delta != "" {
-			emittedAny = true
-		}
-		return sink.EmitReasoning(delta)
-	}
-	wrappedReasoningWarmup := func() error {
-		return sink.EmitReasoningWarmup()
-	}
-	wrappedKeepAlive := func() error {
-		return sink.EmitKeepAlive()
+		return a.runPromptWithSessionWithSink(ctx, cfg, session, email, attempt, wrapped)
 	}
 
 	var lastErr error
-	for _, original := range candidates {
-		workspaceID := accountWorkspaceID(original)
-		if !a.State.TryAcquireWorkspaceDispatchSlot(original.Email, workspaceID) {
+	for _, candidate := range candidates {
+		attempt := a.dispatchCandidate(ctx, cfg, request, candidate, emit, run)
+		cfg = attempt.cfg
+		if attempt.stop {
+			return attempt.result, attempt.err
+		}
+		if attempt.err == nil {
 			continue
 		}
-		slotAcquired := true
-		account, started, startErr := a.State.beginWorkspaceDispatch(original.Email, workspaceID, time.Now())
-		if startErr != nil {
-			a.State.ReleaseWorkspaceDispatchSlot(original.Email, workspaceID)
-			return InferenceResult{}, startErr
+		if attempt.accountFailure || lastErr == nil {
+			lastErr = attempt.err
 		}
-		if !started {
-			a.State.ReleaseWorkspaceDispatchSlot(original.Email, workspaceID)
-			if quotaErr := accountQuotaCooldownError(account, time.Now()); quotaErr != nil {
-				lastErr = quotaErr
-			}
-			continue
-		}
-		session, err := a.loadReadyDispatchSession(ctx, cfg, account)
-		if err == nil {
-			a.preparePromptExecutionTarget(&request, account.Email, session.SpaceID)
-			result, runErr := a.runPromptWithSessionWithSink(ctx, cfg, session, account.Email, request, InferenceStreamSink{
-				Text:            wrappedText,
-				Reasoning:       wrappedReasoning,
-				ReasoningWarmup: wrappedReasoningWarmup,
-				KeepAlive:       wrappedKeepAlive,
-			})
-			if runErr == nil {
-				if slotAcquired {
-					a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-					slotAcquired = false
-				}
-				result.AccountEmail = account.Email
-				if saveErr := a.State.finishWorkspaceDispatchSuccess(account.Email, workspaceID, session, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, account.Email)); saveErr != nil {
-					return InferenceResult{}, saveErr
-				}
-				return result, nil
-			}
-			err = runErr
-		}
-		if !isDispatchContextAbort(ctx, err) && !credentialBackoff(err, time.Now()).IsZero() {
-			// Keep the shared credential slot until its cooldown is committed.
-			saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, false)
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			if saveErr != nil {
-				return InferenceResult{}, fmt.Errorf("%w; saving account cooldown: %v", err, saveErr)
-			}
-			lastErr = fmt.Errorf("%s: %w", account.Email, err)
-			if emittedAny {
-				return InferenceResult{}, lastErr
-			}
-			continue
-		}
-		if slotAcquired {
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			slotAcquired = false
-		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
-			return InferenceResult{}, err
-		}
-
-		retryable := isSessionRetryableError(err)
-		if retryable && cfg.ResolveSessionRefresh().Enabled && !emittedAny {
-			refreshedCfg, refreshErr := a.State.tryRefreshAccount(ctx, cfg, account)
-			if refreshErr == nil {
-				if committedCfg, saveErr := a.State.commitAccountRefresh(cfg, account, refreshedCfg); saveErr == nil {
-					a.invalidateDispatchProbeCache()
-					cfg = committedCfg
-					if refreshedAccount, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
-						refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
-						if loadErr == nil {
-							if !a.State.tryAcquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID, true) {
-								err = noDispatchCapacityError()
-								retryable = false
-							} else {
-								slotAcquired = true
-								result, retryErr := a.runPromptWithSessionWithSink(ctx, cfg, refreshedSession, refreshedAccount.Email, request, InferenceStreamSink{
-									Text:            wrappedText,
-									Reasoning:       wrappedReasoning,
-									ReasoningWarmup: wrappedReasoningWarmup,
-									KeepAlive:       wrappedKeepAlive,
-								})
-								if retryErr == nil {
-									if slotAcquired {
-										a.State.ReleaseWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID)
-										slotAcquired = false
-									}
-									result.AccountEmail = refreshedAccount.Email
-									if saveErr := a.State.finishWorkspaceDispatchSuccess(refreshedAccount.Email, workspaceID, refreshedSession, time.Now(), shouldPersistDispatchedAccountAsActive(cfg, request, refreshedAccount.Email)); saveErr != nil {
-										return InferenceResult{}, saveErr
-									}
-									return result, nil
-								}
-								err = retryErr
-								retryable = isSessionRetryableError(err)
-							}
-						} else {
-							err = loadErr
-							retryable = isSessionRetryableError(err)
-						}
-					}
-				} else {
-					err = saveErr
-					retryable = isSessionRetryableError(err)
-				}
-			}
-		}
-		if isDispatchContextAbort(ctx, err) || errors.Is(err, errConversationWorkspaceMismatch) || isModelSelectionError(err) {
-			if slotAcquired {
-				a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-			}
-			return InferenceResult{}, err
-		}
-
-		if retryable {
-			reloginCfg, _ := a.State.startAutoRelogin(ctx, cfg, account, "request_auth_failed")
-			if committedCfg, commitErr := a.State.commitAccountRefresh(cfg, account, reloginCfg); commitErr == nil {
-				cfg = committedCfg
-			} else {
-				cfg = reloginCfg
-			}
-			if updated, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
-				account = updated
-			}
-		}
-
-		saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable)
-		if slotAcquired {
-			a.State.ReleaseWorkspaceDispatchSlot(account.Email, workspaceID)
-		}
-		if saveErr != nil {
-			return InferenceResult{}, fmt.Errorf("%w; saving account failure: %v", err, saveErr)
-		}
-		lastErr = fmt.Errorf("%s: %w", account.Email, err)
-		if emittedAny {
+		if attempt.accountFailure && emit.emittedAny() {
 			return InferenceResult{}, lastErr
 		}
 	}
 
 	if lastErr != nil {
-		if !emittedAny && isQuotaExhaustedError(lastErr) && cfg.ResolveContinuationFailover() {
-			return a.retryContinuationOnAnotherAccount(r, request, func(next PromptRunRequest) (InferenceResult, error) {
-				return a.runPromptWithAccountPoolWithSink(r, next, sink)
-			}, lastErr)
+		if !emit.emittedAny() && isQuotaExhaustedError(lastErr) && cfg.ResolveContinuationFailover() {
+			return a.retryContinuationOnAnotherAccount(r, request, rerun, lastErr)
 		}
 		return InferenceResult{}, lastErr
 	}
 	return InferenceResult{}, noDispatchCapacityError()
+}
+
+// promptAttemptRequest isolates per-attempt execution state. The thread
+// prepared for one candidate belongs to that candidate's workspace; handing it
+// to another workspace would target a thread that does not exist there (or
+// was half-created by the failed attempt), so each candidate starts clean,
+// exactly like buildContinuationFailoverRequest does for a failover.
+func promptAttemptRequest(base PromptRunRequest) PromptRunRequest {
+	attempt := base
+	attempt.preparedThreadID = ""
+	attempt.onThreadPrepared = nil
+	attempt.attachmentThreadReady = false
+	return attempt
+}
+
+// abortsDispatch reports errors that end the whole request without touching
+// account health: the caller went away, the request itself is invalid, or it
+// is pinned to a different workspace.
+func abortsDispatch(ctx context.Context, emit *dispatchEmitState, err error) bool {
+	return isDispatchContextAbort(ctx, err) ||
+		emit.clientGone.Load() || isClientGoneError(err) ||
+		isClientInputError(err) ||
+		errors.Is(err, errConversationWorkspaceMismatch)
+}
+
+// dispatchCandidate runs one candidate workspace. Every slot it acquires is
+// released through a deferred lease, so a panic anywhere below cannot leak
+// the credential slot; account bookkeeping is always recorded before the
+// deferred release runs.
+func (a *App) dispatchCandidate(ctx context.Context, cfg AppConfig, base PromptRunRequest, original NotionAccount, emit *dispatchEmitState, run func(context.Context, AppConfig, SessionInfo, string, PromptRunRequest) (InferenceResult, error)) (out dispatchAttempt) {
+	out.cfg = cfg
+	workspaceID := accountWorkspaceID(original)
+	request := promptAttemptRequest(base)
+
+	// Check the model against live capabilities before the attempt consumes
+	// the workspace's request window; an unusable model is not an account
+	// failure, it only means this candidate cannot serve the request.
+	live, _, _ := a.State.Snapshot()
+	if liveAccount, _, ok := live.FindAccountWorkspace(original.Email, workspaceID); ok {
+		if _, selErr := selectWorkspaceModel(live, liveAccount, request); selErr != nil {
+			out.err = selErr
+			return out
+		}
+	}
+
+	lease, ok := a.State.acquireWorkspaceDispatchSlot(original.Email, workspaceID, false)
+	if !ok {
+		return out
+	}
+	defer lease.release()
+	account, started, startErr := a.State.beginWorkspaceDispatch(original.Email, workspaceID, time.Now())
+	if startErr != nil {
+		out.err, out.stop = startErr, true
+		return out
+	}
+	if !started {
+		out.err = accountQuotaCooldownError(account, time.Now())
+		return out
+	}
+
+	succeed := func(result InferenceResult, email string, session SessionInfo, held *dispatchSlotLease) dispatchAttempt {
+		held.release()
+		result.AccountEmail = email
+		// The upstream answer already exists; failing to persist bookkeeping
+		// must not turn it into an error for the client.
+		if saveErr := a.State.finishWorkspaceDispatchSuccess(email, workspaceID, session, time.Now(), shouldPersistDispatchedAccountAsActive(out.cfg, request, email)); saveErr != nil {
+			log.Printf("[dispatch] recording success for %s workspace=%s failed: %v", email, workspaceID, saveErr)
+		}
+		return dispatchAttempt{result: result, stop: true, cfg: out.cfg}
+	}
+
+	session, err := a.loadReadyDispatchSession(ctx, cfg, account)
+	if err == nil {
+		a.preparePromptExecutionTarget(&request, account.Email, session.SpaceID)
+		result, runErr := run(ctx, cfg, session, account.Email, request)
+		if runErr == nil {
+			return succeed(result, account.Email, session, lease)
+		}
+		err = runErr
+	}
+	if abortsDispatch(ctx, emit, err) {
+		out.err, out.stop = err, true
+		return out
+	}
+	if isModelSelectionError(err) {
+		out.err = err
+		return out
+	}
+	if !credentialBackoff(err, time.Now()).IsZero() {
+		// Publish account-wide backoff before releasing capacity (the deferred
+		// lease release), so another workspace cannot start while this
+		// credential is being paused.
+		if saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, false); saveErr != nil {
+			out.err, out.stop = fmt.Errorf("%w; saving account cooldown: %v", err, saveErr), true
+			return out
+		}
+		out.err, out.accountFailure = fmt.Errorf("%s: %w", account.Email, err), true
+		return out
+	}
+	// The refresh below makes network calls; it must not hold capacity.
+	lease.release()
+
+	retryable := isSessionRetryableError(err)
+	if retryable && cfg.ResolveSessionRefresh().Enabled && !emit.emittedAny() {
+		refreshedCfg, refreshErr := a.State.tryRefreshAccount(ctx, cfg, account)
+		if refreshErr == nil {
+			committedCfg, saveErr := a.State.commitAccountRefresh(cfg, account, refreshedCfg)
+			if saveErr == nil {
+				a.invalidateDispatchProbeCache()
+				cfg = committedCfg
+				out.cfg = cfg
+				if refreshedAccount, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
+					refreshedSession, loadErr := a.loadReadyDispatchSession(ctx, cfg, refreshedAccount)
+					if loadErr == nil {
+						retryLease, ok := a.State.acquireWorkspaceDispatchSlot(refreshedAccount.Email, workspaceID, true)
+						if !ok {
+							// The refreshed account is healthy, merely busy: a
+							// capacity miss is not an account failure.
+							out.err = noDispatchCapacityError()
+							return out
+						}
+						defer retryLease.release()
+						result, retryErr := run(ctx, cfg, refreshedSession, refreshedAccount.Email, request)
+						if retryErr == nil {
+							return succeed(result, refreshedAccount.Email, refreshedSession, retryLease)
+						}
+						err = retryErr
+					} else {
+						err = loadErr
+					}
+					retryable = isSessionRetryableError(err)
+				}
+			} else {
+				err = saveErr
+				retryable = isSessionRetryableError(err)
+			}
+		}
+	}
+	if abortsDispatch(ctx, emit, err) {
+		out.err, out.stop = err, true
+		return out
+	}
+	if isModelSelectionError(err) {
+		out.err = err
+		return out
+	}
+
+	if retryable {
+		reloginCfg, _ := a.State.startAutoRelogin(ctx, cfg, account, "request_auth_failed")
+		if committedCfg, commitErr := a.State.commitAccountRefresh(cfg, account, reloginCfg); commitErr == nil {
+			cfg = committedCfg
+		} else {
+			cfg = reloginCfg
+		}
+		out.cfg = cfg
+		if updated, _, ok := cfg.FindAccountWorkspace(account.Email, workspaceID); ok {
+			account = updated
+		}
+	}
+
+	if saveErr := a.State.finishWorkspaceDispatchFailure(account.Email, workspaceID, time.Now(), err, retryable); saveErr != nil {
+		out.err, out.stop = fmt.Errorf("%w; saving account failure: %v", err, saveErr), true
+		return out
+	}
+	out.err, out.accountFailure = fmt.Errorf("%s: %w", account.Email, err), true
+	return out
 }

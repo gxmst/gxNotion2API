@@ -24,7 +24,7 @@
   "poll_max_rounds": 40,
   "user_name": "",
   "space_name": "",
-  "debug_upstream": true,
+  "debug_upstream": false,
   "stream_chunk_runes": 24,
   "admin": {
     "enabled": true,
@@ -62,9 +62,6 @@
     "accept_language": "zh-CN,zh;q=0.9,en;q=0.8",
     "ai_surface": "ai_module",
     "thread_type": "workflow",
-    "is_custom_agent": false,
-    "is_custom_agent_builder": false,
-    "use_custom_agent_draft": false,
     "search_scopes": []
   },
   "login_helper": {

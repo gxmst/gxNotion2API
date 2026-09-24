@@ -1322,10 +1322,19 @@ func (c *NotionAIClient) runInferenceTranscriptHTTP(ctx context.Context, payload
 	}
 	defer resp.Body.Close()
 
+	// The keepalive goroutine is joined before returning: a heartbeat written
+	// after the caller moved on would race its stream state and could land
+	// after the terminal [DONE] event.
 	stopKeepAlive := make(chan struct{})
-	defer close(stopKeepAlive)
+	var keepAliveWG sync.WaitGroup
+	defer func() {
+		close(stopKeepAlive)
+		keepAliveWG.Wait()
+	}()
 	if sink.KeepAlive != nil {
+		keepAliveWG.Add(1)
 		go func() {
+			defer keepAliveWG.Done()
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
@@ -1436,6 +1445,15 @@ func (c *NotionAIClient) captureDebugUpstreamRequest(url string, headers map[str
 	default:
 		return
 	}
+	// Dumps hold full prompts, so keep them out of the working directory (and
+	// out of deploy trees, release archives and docker build contexts).
+	dir := filepath.Join(os.TempDir(), "notion2api-debug")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("[debug_upstream] create dump dir failed: %v", err)
+		return
+	}
+	bodyPath = filepath.Join(dir, bodyPath)
+	metaPath = filepath.Join(dir, metaPath)
 	meta := map[string]any{
 		"url": url,
 		"headers": map[string]any{
@@ -3195,7 +3213,19 @@ func (c *NotionAIClient) pollFinalAnswer(ctx context.Context, threadID string) (
 	return nil, agentMessage{}, fmt.Errorf("thread %s did not produce any agent-inference message; last_message_ids=%v", threadID, lastMessageIDs)
 }
 
+// loadAttachmentData fetches an attachment and types the failure: anything
+// wrong with the client-supplied source is a clientInputError, so the
+// dispatcher rejects the request instead of blaming the serving account.
+// Cancellation and outbound-proxy failures keep their original type.
 func (c *NotionAIClient) loadAttachmentData(ctx context.Context, input InputAttachment) ([]byte, string, string, error) {
+	data, name, contentType, err := c.loadAttachmentDataUnclassified(ctx, input)
+	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) || isAttachmentProxyError(err) {
+		return data, name, contentType, err
+	}
+	return nil, "", "", newClientInputError(err)
+}
+
+func (c *NotionAIClient) loadAttachmentDataUnclassified(ctx context.Context, input InputAttachment) ([]byte, string, string, error) {
 	name := strings.TrimSpace(input.Name)
 	contentType := normalizeContentType(input.ContentType)
 	if strings.TrimSpace(input.Path) != "" {
@@ -3456,7 +3486,7 @@ func (c *NotionAIClient) uploadAttachments(ctx context.Context, threadID string,
 			return nil, currentThreadID, err
 		}
 		if err := c.validateAttachment(contentType); err != nil {
-			return nil, currentThreadID, err
+			return nil, currentThreadID, newClientInputError(err)
 		}
 		desc, err := c.getUploadDescriptor(ctx, currentThreadID, name, contentType, len(data), shouldCreateThread)
 		if err != nil {

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import {
   CheckCircle2,
@@ -35,11 +35,12 @@ import {
 } from '@/components/admin/shared';
 import type { AccountItem, AccountsPayload, JsonResult, ModelItem, WorkspaceItem } from '@/lib/services/admin/types';
 
+// Scheduling limits are stored per workspace; `disabled` is account-level and
+// tracked separately (keyed by email) so it applies to every workspace.
 interface AccountEditState {
   priority: number;
   hourlyQuota: number;
   maxConcurrency: number;
-  disabled: boolean;
 }
 
 interface ManualImportState {
@@ -81,32 +82,12 @@ const defaultManualImportState: ManualImportState = {
 function buildAccountEditMap(items: AccountItem[]): Record<string, AccountEditState> {
   return items.reduce<Record<string, AccountEditState>>((accumulator, item) => {
     if (!item.email) return accumulator;
-    const workspaces = item.workspaces?.length
-      ? item.workspaces
-      : item.space_id
-        ? [{
-            id: item.space_id,
-            view_id: item.space_view_id,
-            name: item.space_name,
-            plan_type: item.plan_type,
-            priority: item.priority,
-            hourly_quota: item.hourly_quota,
-            max_concurrency: item.max_concurrency,
-            quota_limited: item.quota_limited,
-            remaining_quota: item.remaining_quota,
-            cooldown_active: item.cooldown_active,
-            cooldown_remaining_sec: item.cooldown_remaining_sec,
-            total_successes: item.total_successes,
-            total_failures: item.total_failures,
-            last_used_at: item.last_used_at,
-          } satisfies WorkspaceItem]
-        : [];
+    const workspaces = workspaceItems(item);
     if (!workspaces.length) {
-      accumulator[item.email] = {
+      accumulator[workspaceEditKey(item.email)] = {
         priority: Number(item.priority ?? 0),
         hourlyQuota: Number(item.hourly_quota ?? 0),
         maxConcurrency: Math.max(1, Number(item.max_concurrency ?? 1)),
-        disabled: Boolean(item.disabled),
       };
       return accumulator;
     }
@@ -115,11 +96,14 @@ function buildAccountEditMap(items: AccountItem[]): Record<string, AccountEditSt
         priority: Number(workspace.priority ?? 0),
         hourlyQuota: Number(workspace.hourly_quota ?? 0),
         maxConcurrency: Math.max(1, Number(workspace.max_concurrency ?? 1)),
-        disabled: Boolean(item.disabled),
       };
     }
     return accumulator;
   }, {});
+}
+
+function buildDisabledEditMap(items: AccountItem[]): Record<string, boolean> {
+  return Object.fromEntries(items.filter((item) => item.email).map((item) => [item.email as string, Boolean(item.disabled)]));
 }
 
 function workspaceEditKey(email: string, workspaceId?: string) {
@@ -145,6 +129,13 @@ function workspaceItems(item: AccountItem): WorkspaceItem[] {
     total_failures: item.total_failures,
     last_used_at: item.last_used_at,
   }];
+}
+
+// Models the workspace lets the caller pick explicitly (Auto excluded).
+function manualModelOptions(account: AccountItem | undefined, workspaceId: string | undefined, models: ModelItem[]): ModelItem[] {
+  const capability = account?.workspaces?.find((item) => item.id === workspaceId)?.model_capabilities;
+  if (capability?.mode !== 'manual') return [];
+  return (capability.models || []).filter((item) => item.enabled !== false && item.id !== 'auto' && models.find((model) => model.id === item.id)?.enabled !== false);
 }
 
 function workspaceTitle(workspace: WorkspaceItem) {
@@ -256,7 +247,7 @@ export function AccountsPanel({
   onDelete: (email: string) => Promise<unknown>;
   onSaveAccountSettings: (payload: JsonResult) => Promise<unknown>;
 }) {
-  const items = accountsPayload?.items || [];
+  const items = useMemo(() => accountsPayload?.items || [], [accountsPayload]);
   const activeAccount = accountsPayload?.active_account || '';
   const activeWorkspaceID = accountsPayload?.active_workspace_id || '';
   const loginHelper = accountsPayload?.login_helper;
@@ -285,8 +276,11 @@ export function AccountsPanel({
   const [quickTestMessage, setQuickTestMessage] = useState('');
   const [quickTestOutput, setQuickTestOutput] = useState('等待测试...');
   const [quickTesting, setQuickTesting] = useState(false);
+  const quickTestInFlight = useRef(false);
 
   const [accountEdits, setAccountEdits] = useState<Record<string, AccountEditState>>({});
+  const [disabledEdits, setDisabledEdits] = useState<Record<string, boolean>>({});
+  const [savingAccount, setSavingAccount] = useState(false);
   const [selectedEmail, setSelectedEmail] = useState('');
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState('');
 
@@ -297,6 +291,7 @@ export function AccountsPanel({
 
   useEffect(() => {
     setAccountEdits(buildAccountEditMap(items));
+    setDisabledEdits(buildDisabledEditMap(items));
     const preferredEmail = activeAccount || items[0]?.email || '';
     setQuickTestEmail((current) => (current && items.some((item) => item.email === current) ? current : preferredEmail));
     setStartEmail((current) => current || preferredEmail);
@@ -365,15 +360,21 @@ export function AccountsPanel({
     return workspaceItems(selectedAccount).find((workspace) => workspace.id === selectedWorkspaceId) || null;
   }, [selectedAccount, selectedWorkspaceId]);
 
-  const modelOptions = useMemo(() => {
-    const capability = accountOptions.find((item) => item.email === quickTestEmail)?.workspaces?.find((item) => item.id === quickTestWorkspaceId)?.model_capabilities;
-    return [{ id: 'auto', name: 'Auto' }, ...(capability?.mode === 'manual' ? capability.models || [] : []).filter((item) => item.enabled !== false && item.id !== 'auto' && models.find((model) => model.id === item.id)?.enabled !== false)];
-  }, [accountOptions, quickTestEmail, quickTestWorkspaceId, models]);
+  const modelOptions = useMemo(() => [
+    { id: 'auto', name: 'Auto' },
+    ...manualModelOptions(accountOptions.find((item) => item.email === quickTestEmail), quickTestWorkspaceId, models),
+  ], [accountOptions, quickTestEmail, quickTestWorkspaceId, models]);
   useEffect(() => { if (!modelOptions.some((item) => item.id === quickTestModel)) setQuickTestModel('auto'); }, [modelOptions, quickTestModel]);
 
-  const selectedEdit = selectedAccount?.email
-    ? accountEdits[workspaceEditKey(selectedAccount.email, selectedWorkspace?.id)] || accountEdits[selectedAccount.email] || { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false }
-    : { priority: 0, hourlyQuota: 0, maxConcurrency: 1, disabled: false };
+  const selectedEditKey = selectedAccount?.email ? workspaceEditKey(selectedAccount.email, selectedWorkspace?.id) : '';
+  const selectedEdit: AccountEditState = (selectedEditKey && accountEdits[selectedEditKey]) || {
+    priority: Number(selectedWorkspace?.priority ?? selectedAccount?.priority ?? 0),
+    hourlyQuota: Number(selectedWorkspace?.hourly_quota ?? selectedAccount?.hourly_quota ?? 0),
+    maxConcurrency: Math.max(1, Number(selectedWorkspace?.max_concurrency ?? selectedAccount?.max_concurrency ?? 1)),
+  };
+  const selectedDisabled = selectedAccount?.email
+    ? disabledEdits[selectedAccount.email] ?? Boolean(selectedAccount.disabled)
+    : false;
 
   const summaryCards = [
     {
@@ -418,27 +419,38 @@ export function AccountsPanel({
     setManual((current) => ({ ...current, email }));
   }
 
-  function updateAccountEdit(email: string, patch: Partial<AccountEditState>) {
+  function updateWorkspaceEdit(email: string, workspaceId: string | undefined, patch: Partial<AccountEditState>) {
+    const key = workspaceEditKey(email, workspaceId);
     setAccountEdits((current) => ({
       ...current,
-      [email]: {
-        priority: current[email]?.priority ?? 0,
-        hourlyQuota: current[email]?.hourlyQuota ?? 0,
-        maxConcurrency: current[email]?.maxConcurrency ?? 1,
-        disabled: current[email]?.disabled ?? false,
+      [key]: {
+        priority: current[key]?.priority ?? selectedEdit.priority,
+        hourlyQuota: current[key]?.hourlyQuota ?? selectedEdit.hourlyQuota,
+        maxConcurrency: current[key]?.maxConcurrency ?? selectedEdit.maxConcurrency,
         ...patch,
       },
     }));
   }
 
   async function runQuickTest(email: string, workspaceId = quickTestWorkspaceId) {
-    const capability = accountOptions.find((item) => item.email === email)?.workspaces?.find((item) => item.id === workspaceId)?.model_capabilities;
-    const selectedModel = capability?.mode === 'manual' && capability.models?.some((item) => item.id === quickTestModel && item.enabled !== false) ? quickTestModel : 'auto';
+    if (quickTestInFlight.current) return;
+    quickTestInFlight.current = true;
+    const account = accountOptions.find((item) => item.email === email);
+    const workspace = account ? workspaceItems(account).find((item) => item.id === workspaceId) : undefined;
+    const supported = manualModelOptions(account, workspaceId, models).some((item) => item.id === quickTestModel);
+    const selectedModel = quickTestModel === 'auto' || supported ? quickTestModel : 'auto';
+    const target = `${email}${workspace ? ` · ${workspaceTitle(workspace)}` : ''}`;
+    const fallbackNote = selectedModel !== quickTestModel
+      ? `该工作区不支持手动选择 ${quickTestModel}，本次改用 Auto。`
+      : '';
+    // Keep the sidebar in sync with what is actually being tested.
+    setQuickTestEmail(email);
+    setQuickTestWorkspaceId(workspaceId || '');
     setQuickTestModel(selectedModel);
     setQuickTesting(true);
-    setQuickTestEmail(email);
-    setQuickTestMessage('测试中...');
+    setQuickTestMessage(`测试中：${target} · 模型 ${selectedModel}${fallbackNote ? ` · ${fallbackNote}` : ''}`);
     setQuickTestOutput('运行中...');
+    if (fallbackNote) toast.warning(fallbackNote);
     try {
       const payload = await onQuickTest({
         email,
@@ -447,31 +459,36 @@ export function AccountsPanel({
         prompt: quickTestPrompt.trim() || 'Reply with NOTION2API_ACCOUNT_OK only.',
       });
       setQuickTestOutput(JSON.stringify(payload, null, 2));
-      setQuickTestMessage('测试成功');
-      toast.success(`账号 ${email} 测试成功`);
+      setQuickTestMessage(`测试成功：${target} · 模型 ${selectedModel}${fallbackNote ? ` · ${fallbackNote}` : ''}`);
+      toast.success(`${target} 测试成功`);
     } catch (error) {
       const message = error instanceof Error ? error.message : '账号测试失败';
-      setQuickTestMessage(message);
+      setQuickTestMessage(`${target}：${message}`);
       setQuickTestOutput(message);
       toast.error(message);
     } finally {
+      quickTestInFlight.current = false;
       setQuickTesting(false);
     }
   }
 
-  async function saveAccount(email: string, edit: AccountEditState) {
+  async function saveAccount(email: string, workspaceId: string | undefined, edit: AccountEditState, disabled: boolean) {
+    if (savingAccount) return;
+    setSavingAccount(true);
     try {
       await onSaveAccountSettings({
         email,
-        workspace_id: selectedWorkspace?.id,
+        workspace_id: workspaceId,
         priority: edit.priority,
         hourly_quota: edit.hourlyQuota,
         max_concurrency: edit.maxConcurrency,
-        disabled: edit.disabled,
+        disabled,
       });
       toast.success(`已保存 ${email}`);
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存账号设置失败');
+    } finally {
+      setSavingAccount(false);
     }
   }
 
@@ -840,7 +857,7 @@ export function AccountsPanel({
                               type="number"
                               value={selectedEdit.priority}
                               onChange={(event) =>
-                                updateAccountEdit(selectedAccount.email, {
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
                                   priority: Number(event.target.value || 0),
                                 })
                               }
@@ -853,7 +870,7 @@ export function AccountsPanel({
                               min="0"
                               value={selectedEdit.hourlyQuota}
                               onChange={(event) =>
-                                updateAccountEdit(selectedAccount.email, {
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
                                   hourlyQuota: Math.max(0, Number(event.target.value || 0)),
                                 })
                               }
@@ -866,7 +883,7 @@ export function AccountsPanel({
                               min="1"
                               value={selectedEdit.maxConcurrency}
                               onChange={(event) =>
-                                updateAccountEdit(selectedAccount.email, {
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
                                   maxConcurrency: Math.max(1, Number(event.target.value || 1)),
                                 })
                               }
@@ -877,11 +894,12 @@ export function AccountsPanel({
                         <div className="flex items-center justify-between gap-3 rounded-xl border bg-muted/40 px-3 py-3">
                           <div>
                             <div className="text-sm font-semibold tracking-tight">Disabled</div>
-                            <p className="text-xs leading-5 text-muted-foreground">禁用后仍保留账号数据，但不参与调度。</p>
+                            <p className="text-xs leading-5 text-muted-foreground">作用于整个账号（所有工作区）；禁用后仍保留账号数据，但不参与调度。</p>
                           </div>
                           <Switch
-                            checked={selectedEdit.disabled}
-                            onCheckedChange={(checked) => updateAccountEdit(selectedAccount.email, { disabled: checked })}
+                            aria-label="禁用账号"
+                            checked={selectedDisabled}
+                            onCheckedChange={(checked) => setDisabledEdits((current) => ({ ...current, [selectedAccount.email]: checked }))}
                           />
                         </div>
                       </div>
@@ -921,7 +939,7 @@ export function AccountsPanel({
                   </div>
 
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                    {selectedWorkspace ? <WorkspaceModelPolicy key={workspaceEditKey(selectedAccount.email || '', selectedWorkspace.id)} email={selectedAccount.email || ''} workspaceID={selectedWorkspace.id} workspaceName={workspaceTitle(selectedWorkspace)} coolingDown={selectedAccount.credential_cooldown_active} /> : null}
+                    {selectedWorkspace ? <WorkspaceModelPolicy key={workspaceEditKey(selectedAccount.email || '', selectedWorkspace.id)} email={selectedAccount.email || ''} workspaceID={selectedWorkspace.id} workspaceName={workspaceTitle(selectedWorkspace)} coolingDown={selectedAccount.credential_cooldown_active} onPolicyChanged={() => onRefreshModels(selectedAccount.email || '', selectedWorkspace.id)} /> : null}
                     <Button variant="outline" disabled={refreshingModels || !selectedWorkspace || selectedAccount.credential_cooldown_active} onClick={async () => {
                       if (!selectedWorkspace) return;
                       setRefreshingModels(true);
@@ -938,8 +956,8 @@ export function AccountsPanel({
                       finally { setRefreshingWorkspaces(false); }
                     }}>{refreshingWorkspaces ? '正在刷新…' : '刷新工作区套餐'}</Button>
                     <p className="col-span-full text-xs text-muted-foreground">{selectedWorkspace?.eligible ? '商业工作区 · 已通过套餐准入' : selectedWorkspace?.ai_disabled ? '此工作区已关闭 AI 功能。' : selectedWorkspace?.eligibility_reason?.startsWith('workspace_plan_excluded') ? '此套餐不支持聊天，请选择商业试用、Business 或 Enterprise 工作区。' : '套餐尚未确认，请刷新工作区套餐。'} · 套餐准入不代表所有模型均有额度。</p>
-                    <Button className="w-full" onClick={() => void saveAccount(selectedAccount.email, selectedEdit)}>
-                      保存工作区设置
+                    <Button className="w-full" disabled={savingAccount} onClick={() => void saveAccount(selectedAccount.email, selectedWorkspace?.id, selectedEdit, selectedDisabled)}>
+                      {savingAccount ? '保存中...' : '保存工作区设置'}
                     </Button>
                     <Button
                       className="w-full"
@@ -955,8 +973,8 @@ export function AccountsPanel({
                     <Button className="w-full" variant="outline" onClick={() => void activateAccount(selectedAccount.email, selectedWorkspace?.id)}>
                       激活工作区
                     </Button>
-                    <Button className="w-full" variant="outline" onClick={() => void runQuickTest(selectedAccount.email, selectedWorkspace?.id)}>
-                      测试工作区
+                    <Button className="w-full" variant="outline" disabled={quickTesting} onClick={() => void runQuickTest(selectedAccount.email, selectedWorkspace?.id)}>
+                      {quickTesting ? '测试中...' : '测试工作区'}
                     </Button>
                     <Button
                       variant="outline"

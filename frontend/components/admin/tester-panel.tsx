@@ -5,6 +5,7 @@ import { Bot, Copy, FileImage, LoaderCircle, Paperclip, Plus, RefreshCcw, SendHo
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
+import { safeMarkdownComponents } from '@/components/admin/safe-markdown';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
@@ -187,7 +188,7 @@ export function TesterPanel({
               </div>
               <div className="space-y-3 break-words text-sm leading-7 [overflow-wrap:anywhere] [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_h1]:text-lg [&_h2]:text-base [&_h3]:font-semibold [&_li]:ml-5 [&_ol]:list-decimal [&_ul]:list-disc [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_code]:text-xs [&_img]:max-w-full">
                 {message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content || ''}</p> : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                  a: ({ children, ...props }) => <a {...props} target="_blank" rel="noreferrer">{children}</a>,
+                  ...safeMarkdownComponents,
                   table: ({ children }) => <div className="overflow-x-auto"><table className="w-full border-collapse [&_td]:border [&_td]:p-2 [&_th]:border [&_th]:p-2">{children}</table></div>,
                 }}>{message.content || ''}</ReactMarkdown>}
                 {!message.content && message.status === 'streaming' ? <LoaderCircle className="size-4 animate-spin" aria-label="正在生成" /> : null}

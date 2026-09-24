@@ -7,7 +7,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked \
 COPY frontend ./
 RUN npm run build
 
-FROM --platform=$BUILDPLATFORM golang:1.25.0-bookworm AS builder
+FROM --platform=$BUILDPLATFORM golang:1.25-bookworm AS builder
 ARG BUILDPLATFORM
 ARG TARGETPLATFORM
 ARG TARGETOS
@@ -22,6 +22,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 COPY cmd ./cmd
 COPY internal ./internal
 COPY static ./static
+# Replace (not merge) the committed admin build, so chunks it no longer
+# references do not linger in the image.
+RUN rm -rf /src/static/admin
 COPY --from=frontend-builder /frontend/out /src/static/admin
 
 RUN --mount=type=cache,target=/go/pkg/mod \

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -69,6 +71,43 @@ func (u NotionUpstream) CookieURL() *url.URL {
 		return nil
 	}
 	return parsed
+}
+
+// validateUpstreamEndpoints limits the upstream set through the admin API to
+// Notion's own hosts. Every account's token_v2 cookie is sent to BaseURL, so a
+// single forged or mistaken config write naming another host would hand all
+// credentials to it. Loopback stays allowed for local mocks; anything else has
+// to be set in the config file or on the command line.
+func validateUpstreamEndpoints(cfg AppConfig) error {
+	for name, raw := range map[string]string{"upstream_base_url": cfg.UpstreamBaseURL, "upstream_origin": cfg.UpstreamOrigin} {
+		if strings.TrimSpace(raw) == "" {
+			continue
+		}
+		parsed, err := url.Parse(raw)
+		if err != nil || parsed.Host == "" {
+			return fmt.Errorf("%s is not a valid URL", name)
+		}
+		host := strings.ToLower(parsed.Hostname())
+		if isLoopbackHost(host) {
+			continue
+		}
+		if parsed.Scheme != "https" || !(isDomainOrSubdomain(host, "notion.so") || isDomainOrSubdomain(host, "notion.com")) {
+			return fmt.Errorf("%s must be an https notion.so or notion.com URL when changed through the admin API", name)
+		}
+	}
+	return nil
+}
+
+func isDomainOrSubdomain(host, domain string) bool {
+	return host == domain || strings.HasSuffix(host, "."+domain)
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func proxyFromEnvironmentFresh(req *http.Request) (*url.URL, error) {

@@ -129,7 +129,7 @@ func TestRefreshSessionUsesRealSaveWithoutDeadlock(t *testing.T) {
 			if account.LastRefreshAt != "2026-01-01T00:00:00Z" {
 				t.Fatal("refresh result was not applied by the real save path")
 			}
-			if _, started, err := app.State.beginAccountDispatch(account.Email, time.Now()); err != nil || !started {
+			if _, started, err := app.State.beginWorkspaceDispatch(account.Email, accountWorkspaceID(account), time.Now()); err != nil || !started {
 				t.Fatalf("dispatch did not resume after refresh: started=%v err=%v", started, err)
 			}
 		})
@@ -269,7 +269,7 @@ func TestSillyTavernContinueKeepsInstructionDuringQuotaFailover(t *testing.T) {
 			result := InferenceResult{Text: "unfinished story", ThreadID: "thread-story", AccountEmail: "primary@example.com"}
 			app.completeConversation(entry.ID, result)
 			app.persistConversationSession(entry.ID, PromptRunRequest{RawMessageCount: 1}, result)
-			if err := app.State.finishAccountDispatchFailure("primary@example.com", time.Now(), errors.New(syntheticQuotaExhaustedError), false); err != nil {
+			if err := app.State.finishWorkspaceDispatchFailure("primary@example.com", testDefaultWorkspaceID(app.State, "primary@example.com"), time.Now(), errors.New(syntheticQuotaExhaustedError), false); err != nil {
 				t.Fatal(err)
 			}
 			dispatched := false

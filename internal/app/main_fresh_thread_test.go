@@ -818,7 +818,7 @@ func TestServeHealthzIncludesRefreshRuntimeFieldsWhenStaticCacheExists(t *testin
 	if got, _ := payload["last_session_refresh"].(string); got != "2026-01-02T03:04:05Z" {
 		t.Fatalf("unexpected last_session_refresh: %q", got)
 	}
-	if got, _ := payload["last_session_refresh_error"].(string); got != "refresh failed" {
+	if got, _ := payload["last_session_refresh_error"].(string); got != "session refresh failed" {
 		t.Fatalf("unexpected last_session_refresh_error: %q", got)
 	}
 }
@@ -1835,10 +1835,10 @@ func TestRunPromptWithAccountPoolReturnsCapacityErrorWhenAllSlotsOccupied(t *tes
 		_ = state.Close()
 	}()
 
-	if !state.TryAcquireAccountDispatchSlot("alice@example.com") {
+	if !state.TryAcquireWorkspaceDispatchSlot("alice@example.com", "") {
 		t.Fatal("expected pre-acquire slot success")
 	}
-	defer state.ReleaseAccountDispatchSlot("alice@example.com")
+	defer state.ReleaseWorkspaceDispatchSlot("alice@example.com", "")
 
 	app := &App{State: state}
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)

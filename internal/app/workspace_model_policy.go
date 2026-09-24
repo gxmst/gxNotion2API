@@ -9,6 +9,8 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +21,10 @@ import (
 type workspaceModelPolicy struct {
 	DisabledModels    []string `json:"disabledModels"`
 	DisabledProviders []string `json:"disabledProviders"`
+	// The web client's schema also allows these two; they are carried through
+	// unchanged so reading a workspace that uses them does not fail.
+	AllowedRestrictedModels []string `json:"allowedRestrictedModels,omitempty"`
+	DefaultModel            string   `json:"defaultModel,omitempty"`
 }
 
 type policyCatalogModel struct {
@@ -40,17 +46,29 @@ type workspaceModelPolicySnapshot struct {
 	PolicyPresent  bool                 `json:"policy_present"`
 	Revision       string               `json:"revision"`
 	Models         []policyCatalogModel `json:"models"`
+	// RestorePoint is the policy as it was before this service first changed it,
+	// kept on disk so it survives page reloads and restarts.
+	RestorePoint *modelPolicyRestorePoint `json:"restore_point"`
+}
+
+type modelPolicyRestorePoint struct {
+	Policy  workspaceModelPolicy `json:"policy"`
+	Present bool                 `json:"present"`
+	SavedAt string               `json:"saved_at"`
+	Email   string               `json:"email"`
 }
 
 type modelPolicyEdit struct {
-	Email          string                `json:"email"`
-	WorkspaceID    string                `json:"workspace_id"`
-	Scope          string                `json:"scope"`
-	Revision       string                `json:"revision"`
-	Action         string                `json:"action"`
-	ModelID        string                `json:"model_id"`
-	RestorePolicy  *workspaceModelPolicy `json:"restore_policy"`
-	RestorePresent bool                  `json:"restore_present"`
+	Email         string                `json:"email"`
+	WorkspaceID   string                `json:"workspace_id"`
+	Scope         string                `json:"scope"`
+	Revision      string                `json:"revision"`
+	Action        string                `json:"action"`
+	ModelID       string                `json:"model_id"`
+	RestorePolicy *workspaceModelPolicy `json:"restore_policy"`
+	// RestorePresent must accompany RestorePolicy: a missing flag would
+	// otherwise read as "no policy" and silently delete the setting.
+	RestorePresent *bool `json:"restore_present"`
 }
 
 func modelPolicyKey(scope string) (string, bool) {
@@ -80,7 +98,15 @@ func canonicalPolicyList(values []string) []string {
 }
 
 func normalizeModelPolicy(policy workspaceModelPolicy) workspaceModelPolicy {
-	return workspaceModelPolicy{canonicalPolicyList(policy.DisabledModels), canonicalPolicyList(policy.DisabledProviders)}
+	normalized := workspaceModelPolicy{
+		DisabledModels:    canonicalPolicyList(policy.DisabledModels),
+		DisabledProviders: canonicalPolicyList(policy.DisabledProviders),
+		DefaultModel:      strings.TrimSpace(policy.DefaultModel),
+	}
+	if allowed := canonicalPolicyList(policy.AllowedRestrictedModels); len(allowed) > 0 {
+		normalized.AllowedRestrictedModels = allowed
+	}
+	return normalized
 }
 
 func modelPolicyRevision(scope string, policy workspaceModelPolicy, present bool) string {
@@ -177,19 +203,13 @@ func (c *NotionAIClient) readWorkspaceModelPolicy(ctx context.Context, scope str
 	}
 	var catalog struct {
 		Models []struct {
-			Model    string `json:"model"`
-			Name     string `json:"modelMessage"`
-			Provider string `json:"modelProvider"`
-			Disabled bool   `json:"isDisabled"`
-			Reason   string `json:"disabledReason"`
-			Workflow struct {
-				Disabled bool   `json:"isDisabled"`
-				Reason   string `json:"disabledReason"`
-			} `json:"workflow"`
-			CustomAgent struct {
-				Disabled bool   `json:"isDisabled"`
-				Reason   string `json:"disabledReason"`
-			} `json:"customAgent"`
+			Model       string              `json:"model"`
+			Name        string              `json:"modelMessage"`
+			Provider    string              `json:"modelProvider"`
+			Disabled    bool                `json:"isDisabled"`
+			Reason      string              `json:"disabledReason"`
+			Workflow    *policySurfaceEntry `json:"workflow"`
+			CustomAgent *policySurfaceEntry `json:"customAgent"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(body, &catalog); err != nil {
@@ -205,15 +225,27 @@ func (c *NotionAIClient) readWorkspaceModelPolicy(ctx context.Context, scope str
 			return out, errors.New("上游模型设置目录缺少模型标识或存在重复标识，请重新读取")
 		}
 		seen[id] = true
-		disabled, reason := model.Workflow.Disabled, model.Workflow.Reason
+		surface := model.Workflow
 		if scope == "custom" {
-			disabled, reason = model.CustomAgent.Disabled, model.CustomAgent.Reason
+			surface = model.CustomAgent
+		}
+		// The web client drops a model from an agent type's list when the
+		// catalog has no entry for that surface; locking onto one would leave
+		// Auto without a usable candidate there.
+		disabled, reason := true, "not_offered_for_agent_type"
+		if surface != nil {
+			disabled, reason = surface.Disabled, surface.Reason
 		}
 		available := !model.Disabled && !disabled && provider != ""
 		out.Models = append(out.Models, policyCatalogModel{ID: id, Name: firstNonEmpty(model.Name, id), Provider: provider, Available: available, DisabledReason: firstNonEmpty(reason, model.Reason)})
 	}
 	updatePolicyAllowedModels(&out)
 	return out, nil
+}
+
+type policySurfaceEntry struct {
+	Disabled bool   `json:"isDisabled"`
+	Reason   string `json:"disabledReason"`
 }
 
 func policyContains(values []string, value string) bool {
@@ -263,22 +295,31 @@ func lockWorkspaceModel(snapshot workspaceModelPolicySnapshot, id string) (works
 	}
 	policy.DisabledModels = remove(policy.DisabledModels, id)
 	policy.DisabledProviders = remove(policy.DisabledProviders, target.Provider)
+	if policy.DefaultModel != "" {
+		// A default pointing at a now-disabled model would contradict the lock.
+		policy.DefaultModel = id
+	}
 	return normalizeModelPolicy(policy), nil
 }
 
 func (a *App) writeModelPolicyUpstreamError(w http.ResponseWriter, started NotionAccount, err error, writing bool) {
 	if until := credentialBackoff(err, time.Now()); !until.IsZero() {
-		a.State.refreshMu.Lock()
-		cfg, _, _ := a.State.Snapshot()
-		current, index, ok := cfg.FindAccount(started.Email)
-		if ok && workspaceDiscoveryIdentityUnchanged(started, current) && until.After(parseOptionalRFC3339(current.CredentialCooldownUntil)) {
-			cfg.Accounts = cloneAccounts(cfg.Accounts)
-			cfg.Accounts[index].CredentialCooldownUntil = until.UTC().Format(time.RFC3339)
-			if saveErr := a.State.saveAndApplyCommitted(cfg); saveErr != nil {
-				log.Printf("[model-policy] failed to save credential cooldown: %v", saveErr)
+		// Scoped so the unlock is deferred: this block calls ApplyConfig, and
+		// leaving refreshMu held after a panic would wedge every later config
+		// write and dispatch.
+		func() {
+			a.State.refreshMu.Lock()
+			defer a.State.refreshMu.Unlock()
+			cfg, _, _ := a.State.Snapshot()
+			current, index, ok := cfg.FindAccount(started.Email)
+			if ok && workspaceDiscoveryIdentityUnchanged(started, current) && until.After(parseOptionalRFC3339(current.CredentialCooldownUntil)) {
+				cfg.Accounts = cloneAccounts(cfg.Accounts)
+				cfg.Accounts[index].CredentialCooldownUntil = until.UTC().Format(time.RFC3339)
+				if saveErr := a.State.saveAndApplyCommitted(cfg); saveErr != nil {
+					log.Printf("[model-policy] failed to save credential cooldown: %v", saveErr)
+				}
 			}
-		}
-		a.State.refreshMu.Unlock()
+		}()
 	}
 	var apiErr *notionAPIError
 	if errors.As(err, &apiErr) {
@@ -321,7 +362,11 @@ func (a *App) handleAdminModelPolicy(w http.ResponseWriter, r *http.Request) {
 		}
 		// Serialize manual edits across accounts that share a workspace. The
 		// upstream has no captured compare-and-swap API, so also re-read below.
-		a.State.modelPolicyMu.Lock()
+		// A second edit fails fast instead of queueing behind upstream calls.
+		if !a.State.modelPolicyMu.TryLock() {
+			writeJSON(w, http.StatusConflict, map[string]any{"detail": "另一个工作区模型设置正在保存，请稍后重新读取"})
+			return
+		}
 		defer a.State.modelPolicyMu.Unlock()
 	}
 	key, validScope := modelPolicyKey(request.Scope)
@@ -357,6 +402,8 @@ func (a *App) handleAdminModelPolicy(w http.ResponseWriter, r *http.Request) {
 		a.writeModelPolicyUpstreamError(w, account, err, false)
 		return
 	}
+	restoreKey := modelPolicyRestoreKey(request.WorkspaceID, request.Scope)
+	snapshot.RestorePoint = a.State.modelPolicyRestorePoint(cfg, restoreKey)
 	if r.Method == http.MethodGet {
 		writeJSON(w, 200, snapshot)
 		return
@@ -371,21 +418,29 @@ func (a *App) handleAdminModelPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	var policy workspaceModelPolicy
 	present := true
+	auditResult := "not_sent"
 	switch request.Action {
 	case "lock":
 		policy, err = lockWorkspaceModel(snapshot, request.ModelID)
 	case "restore":
-		present = request.RestorePresent
-		if request.RestorePolicy == nil {
-			err = errors.New("缺少恢复前的设置快照")
-		} else {
-			policy = normalizeModelPolicy(*request.RestorePolicy)
+		switch {
+		case request.RestorePolicy != nil && request.RestorePresent == nil:
+			err = errors.New("restore_policy 必须同时提供 restore_present")
+		case request.RestorePolicy != nil:
+			policy, present = normalizeModelPolicy(*request.RestorePolicy), *request.RestorePresent
+		case snapshot.RestorePoint != nil:
+			policy, present = normalizeModelPolicy(snapshot.RestorePoint.Policy), snapshot.RestorePoint.Present
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"detail": "没有可恢复的原设置；可以改用“清除限制”恢复为 Notion 默认"})
+			return
 		}
 		if !present {
 			policy = normalizeModelPolicy(workspaceModelPolicy{})
 		}
+	case "clear":
+		policy, present = normalizeModelPolicy(workspaceModelPolicy{}), false
 	default:
-		err = errors.New("请选择手动应用或恢复设置")
+		err = errors.New("请选择手动应用、恢复或清除设置")
 	}
 	if len(policy.DisabledModels) > 512 || len(policy.DisabledProviders) > 64 {
 		err = errors.New("模型策略条目过多")
@@ -408,9 +463,34 @@ func (a *App) handleAdminModelPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	wanted := modelPolicyRevision(request.Scope, policy, present)
 	if wanted == snapshot.Revision {
+		if request.Action != "lock" {
+			a.State.setModelPolicyRestorePoint(cfg, restoreKey, nil)
+			snapshot.RestorePoint = nil
+		}
 		writeJSON(w, 200, snapshot)
 		return
 	}
+	// Record the pre-change policy before the write goes out: if the result
+	// cannot be confirmed, the operator still needs a way back.
+	createdRestorePoint := false
+	if request.Action == "lock" && snapshot.RestorePoint == nil {
+		point := &modelPolicyRestorePoint{Policy: snapshot.Policy, Present: snapshot.PolicyPresent, SavedAt: time.Now().UTC().Format(time.RFC3339), Email: account.Email}
+		if err := a.State.setModelPolicyRestorePoint(cfg, restoreKey, point); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "无法保存原设置快照，未修改 Notion 设置"})
+			return
+		}
+		snapshot.RestorePoint, createdRestorePoint = point, true
+	}
+	// Capture the pre-change policy now: the success path below reassigns
+	// snapshot.Policy, and the deferred entry must record what was replaced,
+	// not what replaced it.
+	beforePolicy, beforePresent := snapshot.Policy, snapshot.PolicyPresent
+	defer func() {
+		appendModelPolicyAudit(cfg, modelPolicyAuditEntry{
+			At: time.Now().UTC().Format(time.RFC3339), Email: account.Email, WorkspaceID: request.WorkspaceID, Scope: request.Scope, Action: request.Action,
+			Before: beforePolicy, BeforePresent: beforePresent, After: policy, AfterPresent: present, Result: auditResult,
+		})
+	}()
 	patch, unset := map[string]any{}, []string{}
 	if present {
 		patch[key] = policy
@@ -419,20 +499,157 @@ func (a *App) handleAdminModelPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	body, err := client.postJSON(ctx, cfg.NotionUpstream().API("updateSpaceSettings"), map[string]any{"spaceId": request.WorkspaceID, "settingsPatch": patch, "unsetSettingKeys": unset}, "application/json")
 	if err != nil {
+		var apiErr *notionAPIError
+		if createdRestorePoint && errors.As(err, &apiErr) && apiErr.StatusCode >= 400 && apiErr.StatusCode < 500 {
+			// Explicitly rejected: nothing changed, so there is nothing to restore.
+			a.State.setModelPolicyRestorePoint(cfg, restoreKey, nil)
+			auditResult = "rejected"
+		} else {
+			auditResult = "unconfirmed"
+		}
 		a.writeModelPolicyUpstreamError(w, account, err, true)
 		return
 	}
 	var response map[string]any
 	if err := json.Unmarshal(body, &response); err != nil {
+		// The write went out and came back; only the confirmation is unusable.
+		// Recording "not_sent" here would understate what Notion was asked to do.
+		auditResult = "unconfirmed"
 		a.writeModelPolicyUpstreamError(w, account, err, true)
 		return
 	}
 	confirmed, confirmedPresent, err := parseModelPolicyRecord(mapValue(response["recordMap"]), request.WorkspaceID, request.Scope)
 	if err != nil || wanted != modelPolicyRevision(request.Scope, confirmed, confirmedPresent) {
+		auditResult = "unconfirmed"
 		writeJSON(w, 502, map[string]any{"detail": "Notion 已接收保存请求，但返回的策略未确认一致；请重新读取设置，没有自动重试"})
 		return
+	}
+	auditResult = "ok"
+	if request.Action != "lock" {
+		a.State.setModelPolicyRestorePoint(cfg, restoreKey, nil)
+		snapshot.RestorePoint = nil
 	}
 	snapshot.Policy, snapshot.PolicyPresent, snapshot.Revision = confirmed, confirmedPresent, wanted
 	updatePolicyAllowedModels(&snapshot)
 	writeJSON(w, 200, snapshot)
+}
+
+func modelPolicyRestoreKey(workspaceID, scope string) string {
+	return strings.TrimSpace(workspaceID) + "/" + scope
+}
+
+// modelPolicyStateDir keeps restore points and the audit log beside the config
+// (or database). Without either, restore points live in memory only.
+func modelPolicyStateDir(cfg AppConfig) string {
+	if path := strings.TrimSpace(cfg.ConfigPath); path != "" {
+		return filepath.Dir(path)
+	}
+	if path := strings.TrimSpace(cfg.Storage.SQLitePath); path != "" {
+		return filepath.Dir(path)
+	}
+	return ""
+}
+
+func (s *ServerState) loadModelPolicyRestorePointsLocked(cfg AppConfig) {
+	if s.modelPolicyRestorePoints != nil {
+		return
+	}
+	s.modelPolicyRestorePoints = map[string]*modelPolicyRestorePoint{}
+	dir := modelPolicyStateDir(cfg)
+	if dir == "" {
+		return
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "model_policy_restore_points.json"))
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("[model-policy] read restore points: %v", err)
+		}
+		return
+	}
+	if err := json.Unmarshal(raw, &s.modelPolicyRestorePoints); err != nil {
+		log.Printf("[model-policy] parse restore points: %v", err)
+		s.modelPolicyRestorePoints = map[string]*modelPolicyRestorePoint{}
+	}
+}
+
+func (s *ServerState) modelPolicyRestorePoint(cfg AppConfig, key string) *modelPolicyRestorePoint {
+	s.modelPolicyStateMu.Lock()
+	defer s.modelPolicyStateMu.Unlock()
+	s.loadModelPolicyRestorePointsLocked(cfg)
+	if point := s.modelPolicyRestorePoints[key]; point != nil {
+		copied := *point
+		copied.Policy = normalizeModelPolicy(point.Policy)
+		return &copied
+	}
+	return nil
+}
+
+// setModelPolicyRestorePoint stores (or, with nil, deletes) a restore point
+// and persists the whole set with owner-only permissions.
+func (s *ServerState) setModelPolicyRestorePoint(cfg AppConfig, key string, point *modelPolicyRestorePoint) error {
+	s.modelPolicyStateMu.Lock()
+	defer s.modelPolicyStateMu.Unlock()
+	s.loadModelPolicyRestorePointsLocked(cfg)
+	if point == nil {
+		if _, ok := s.modelPolicyRestorePoints[key]; !ok {
+			return nil
+		}
+		delete(s.modelPolicyRestorePoints, key)
+	} else {
+		s.modelPolicyRestorePoints[key] = point
+	}
+	dir := modelPolicyStateDir(cfg)
+	if dir == "" {
+		return nil
+	}
+	body, err := json.MarshalIndent(s.modelPolicyRestorePoints, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomically(filepath.Join(dir, "model_policy_restore_points.json"), append(body, '\n'), 0o600); err != nil {
+		log.Printf("[model-policy] save restore points: %v", err)
+		return err
+	}
+	return nil
+}
+
+type modelPolicyAuditEntry struct {
+	At            string               `json:"at"`
+	Email         string               `json:"email"`
+	WorkspaceID   string               `json:"workspace_id"`
+	Scope         string               `json:"scope"`
+	Action        string               `json:"action"`
+	Result        string               `json:"result"`
+	Before        workspaceModelPolicy `json:"before"`
+	BeforePresent bool                 `json:"before_present"`
+	After         workspaceModelPolicy `json:"after"`
+	AfterPresent  bool                 `json:"after_present"`
+}
+
+// appendModelPolicyAudit records every attempted workspace-wide write, since
+// the setting affects all members and is otherwise only visible in Notion.
+func appendModelPolicyAudit(cfg AppConfig, entry modelPolicyAuditEntry) {
+	log.Printf("[model-policy] %s %s scope=%s workspace=%s by=%s", entry.Action, entry.Result, entry.Scope, entry.WorkspaceID, entry.Email)
+	dir := modelPolicyStateDir(cfg)
+	if dir == "" {
+		return
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	file, err := os.OpenFile(filepath.Join(dir, "model_policy_audit.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		log.Printf("[model-policy] open audit log: %v", err)
+		return
+	}
+	defer file.Close()
+	// O_CREATE's mode only applies when the file is created, so an audit log
+	// written by an earlier build could still be group/world readable.
+	if err := file.Chmod(0o600); err != nil {
+		log.Printf("[model-policy] tighten audit log permissions: %v", err)
+	}
+	if _, err := file.Write(append(line, '\n')); err != nil {
+		log.Printf("[model-policy] write audit log: %v", err)
+	}
 }

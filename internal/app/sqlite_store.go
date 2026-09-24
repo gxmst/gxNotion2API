@@ -115,7 +115,6 @@ func (s *SQLiteStore) init() error {
 			updated_at TEXT NOT NULL,
 			data_json TEXT NOT NULL
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_accounts_position ON accounts(position);`,
 		`CREATE TABLE IF NOT EXISTS conversations (
 			id TEXT PRIMARY KEY,
 			status TEXT NOT NULL,
@@ -123,7 +122,6 @@ func (s *SQLiteStore) init() error {
 			updated_at TEXT NOT NULL,
 			data_json TEXT NOT NULL
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC);`,
 		`CREATE TABLE IF NOT EXISTS responses (
 			response_id TEXT PRIMARY KEY,
 			created_at TEXT NOT NULL,
@@ -132,7 +130,6 @@ func (s *SQLiteStore) init() error {
 			thread_id TEXT NOT NULL DEFAULT '',
 			account_email TEXT NOT NULL DEFAULT ''
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_responses_created_at ON responses(created_at DESC);`,
 		`CREATE TABLE IF NOT EXISTS conversation_sessions (
 			id TEXT PRIMARY KEY,
 			conversation_id TEXT NOT NULL,
@@ -151,9 +148,6 @@ func (s *SQLiteStore) init() error {
 			last_used_at TEXT NOT NULL,
 			deleted_at TEXT NOT NULL DEFAULT ''
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_conversation_id ON conversation_sessions(conversation_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_thread_id ON conversation_sessions(thread_id);`,
-		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_fingerprint ON conversation_sessions(fingerprint);`,
 		`CREATE TABLE IF NOT EXISTS conversation_session_steps (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			session_id TEXT NOT NULL,
@@ -165,7 +159,6 @@ func (s *SQLiteStore) init() error {
 			UNIQUE(session_id, step_index),
 			UNIQUE(updated_config_id)
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_conversation_session_steps_session_id ON conversation_session_steps(session_id, step_index ASC);`,
 		`CREATE TABLE IF NOT EXISTS sillytavern_bindings (
 			conversation_id TEXT PRIMARY KEY,
 			profile_key TEXT NOT NULL DEFAULT '',
@@ -176,32 +169,102 @@ func (s *SQLiteStore) init() error {
 			raw_message_count INTEGER NOT NULL DEFAULT 0,
 			updated_at TEXT NOT NULL
 		);`,
-		`CREATE INDEX IF NOT EXISTS idx_sillytavern_bindings_profile_key ON sillytavern_bindings(profile_key, updated_at DESC);`,
 	}
 	for _, stmt := range schema {
 		if _, err := s.db.Exec(stmt); err != nil {
 			return fmt.Errorf("sqlite schema failed: %w", err)
 		}
 	}
-	for _, stmt := range []string{
-		`ALTER TABLE responses ADD COLUMN conversation_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE responses ADD COLUMN thread_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE responses ADD COLUMN account_email TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE conversation_sessions ADD COLUMN space_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE conversation_sessions ADD COLUMN space_view_id TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE accounts ADD COLUMN active_workspace_id TEXT NOT NULL DEFAULT ''`,
+	// Older databases may predate some columns. CREATE TABLE IF NOT EXISTS
+	// leaves an existing table untouched, so every column that was added after
+	// a table first shipped is added here -- before any index that references
+	// it is created. Both steps are idempotent.
+	for _, column := range []struct{ table, name, ddl string }{
+		{"accounts", "active_workspace_id", "TEXT NOT NULL DEFAULT ''"},
+		{"responses", "conversation_id", "TEXT NOT NULL DEFAULT ''"},
+		{"responses", "thread_id", "TEXT NOT NULL DEFAULT ''"},
+		{"responses", "account_email", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "fingerprint", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "account_email", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "model_used", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "turn_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"conversation_sessions", "raw_message_count", "INTEGER NOT NULL DEFAULT 0"},
+		{"conversation_sessions", "status", "TEXT NOT NULL DEFAULT 'active'"},
+		{"conversation_sessions", "deleted_at", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "space_id", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_sessions", "space_view_id", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_session_steps", "response_id", "TEXT NOT NULL DEFAULT ''"},
+		{"conversation_session_steps", "message_id", "TEXT NOT NULL DEFAULT ''"},
+		{"sillytavern_bindings", "profile_key", "TEXT NOT NULL DEFAULT ''"},
+		{"sillytavern_bindings", "thread_id", "TEXT NOT NULL DEFAULT ''"},
+		{"sillytavern_bindings", "account_email", "TEXT NOT NULL DEFAULT ''"},
+		{"sillytavern_bindings", "mode", "TEXT NOT NULL DEFAULT ''"},
+		{"sillytavern_bindings", "transcript_json", "TEXT NOT NULL DEFAULT '[]'"},
+		{"sillytavern_bindings", "raw_message_count", "INTEGER NOT NULL DEFAULT 0"},
 	} {
-		if _, err := s.db.Exec(stmt); err != nil {
-			lower := strings.ToLower(err.Error())
-			if !strings.Contains(lower, "duplicate column name") {
-				return fmt.Errorf("sqlite migration failed: %w", err)
-			}
+		if err := s.ensureColumn(column.table, column.name, column.ddl); err != nil {
+			return fmt.Errorf("sqlite migration failed: %w", err)
 		}
 	}
-	if _, err := s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_responses_conversation_id ON responses(conversation_id);`); err != nil {
-		return fmt.Errorf("sqlite schema failed: %w", err)
+	for _, stmt := range []string{
+		`CREATE INDEX IF NOT EXISTS idx_accounts_position ON accounts(position);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversations_updated_at ON conversations(updated_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_responses_created_at ON responses(created_at DESC);`,
+		`CREATE INDEX IF NOT EXISTS idx_responses_conversation_id ON responses(conversation_id);`,
+		// Only rows that still carry a payload are candidates for expiry, so
+		// the periodic cleanup never rescans already-cleared history.
+		`CREATE INDEX IF NOT EXISTS idx_responses_live_created_at ON responses(created_at) WHERE payload_json != '{}';`,
+		// The mirror image: cleared rows are only walked by the link-retention
+		// sweep, which also filters on created_at.
+		`CREATE INDEX IF NOT EXISTS idx_responses_cleared_created_at ON responses(created_at) WHERE payload_json = '{}';`,
+		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_conversation_id ON conversation_sessions(conversation_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_thread_id ON conversation_sessions(thread_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversation_sessions_fingerprint ON conversation_sessions(fingerprint);`,
+		`CREATE INDEX IF NOT EXISTS idx_conversation_session_steps_session_id ON conversation_session_steps(session_id, step_index ASC);`,
+		`CREATE INDEX IF NOT EXISTS idx_sillytavern_bindings_profile_key ON sillytavern_bindings(profile_key, updated_at DESC);`,
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return fmt.Errorf("sqlite schema failed: %w", err)
+		}
 	}
 	return nil
+}
+
+// ensureColumn adds a column when the table lacks it. PRAGMA table_info is
+// checked first so the migration is idempotent without parsing error text.
+func (s *SQLiteStore) ensureColumn(table string, column string, ddl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	exists := false
+	for rows.Next() {
+		var (
+			cid        int
+			name       string
+			columnType string
+			notNull    int
+			defaultVal sql.NullString
+			primaryKey int
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultVal, &primaryKey); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		if strings.EqualFold(name, column) {
+			exists = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return err
+	}
+	_ = rows.Close()
+	if exists {
+		return nil
+	}
+	_, err = s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + ddl)
+	return err
 }
 
 func (s *SQLiteStore) readDB() *sql.DB {
@@ -406,6 +469,72 @@ func (s *SQLiteStore) LoadConversations() ([]ConversationEntry, error) {
 	return items, nil
 }
 
+// LoadConversation reads one conversation, including one that has been
+// evicted from the in-memory store.
+func (s *SQLiteStore) LoadConversation(id string) (ConversationEntry, bool, error) {
+	startedAt := time.Now()
+	defer observeSQLiteDuration("load_conversation", startedAt)
+	db := s.readDB()
+	id = strings.TrimSpace(id)
+	if db == nil || id == "" {
+		return ConversationEntry{}, false, nil
+	}
+	var body string
+	if err := db.QueryRow(`SELECT data_json FROM conversations WHERE id = ?`, id).Scan(&body); err != nil {
+		if err == sql.ErrNoRows {
+			return ConversationEntry{}, false, nil
+		}
+		return ConversationEntry{}, false, err
+	}
+	var entry ConversationEntry
+	if err := json.Unmarshal([]byte(body), &entry); err != nil {
+		return ConversationEntry{}, false, fmt.Errorf("decode conversation %s: %w", id, err)
+	}
+	if strings.TrimSpace(entry.ID) == "" {
+		entry.ID = id
+	}
+	return entry, true, nil
+}
+
+// ListConversationsForSweep returns the oldest persisted conversations last
+// updated before the cutoff, ephemeral or not as requested. The cleanup loop
+// uses it to reach conversations that are no longer resident in memory.
+func (s *SQLiteStore) ListConversationsForSweep(updatedBefore time.Time, ephemeral bool, limit int) ([]ConversationEntry, error) {
+	startedAt := time.Now()
+	defer observeSQLiteDuration("list_conversations_for_sweep", startedAt)
+	db := s.readDB()
+	if db == nil {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 100
+	}
+	flag := 0
+	if ephemeral {
+		flag = 1
+	}
+	rows, err := db.Query(`SELECT data_json FROM conversations
+		WHERE updated_at < ? AND COALESCE(json_extract(data_json, '$.ephemeral'), 0) = ?
+		ORDER BY updated_at ASC LIMIT ?`, updatedBefore.UTC().Format(time.RFC3339Nano), flag, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConversationEntry
+	for rows.Next() {
+		var body string
+		if err := rows.Scan(&body); err != nil {
+			return nil, err
+		}
+		var entry ConversationEntry
+		if err := json.Unmarshal([]byte(body), &entry); err != nil || strings.TrimSpace(entry.ID) == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out, rows.Err()
+}
+
 func (s *SQLiteStore) SaveResponse(responseID string, payload map[string]any, createdAt time.Time, conversationID string, threadID string, accountEmail string) error {
 	startedAt := time.Now()
 	defer observeSQLiteDuration("save_response", startedAt)
@@ -442,7 +571,40 @@ func (s *SQLiteStore) DeleteExpiredResponses(ttl time.Duration) error {
 		return nil
 	}
 	cutoff := time.Now().UTC().Add(-ttl).Format(time.RFC3339Nano)
-	_, err := s.db.Exec(`UPDATE responses SET payload_json = '{}' WHERE created_at < ? AND payload_json != '{}'`, cutoff)
+	// An expired row is kept only as a response_id -> conversation link, and
+	// only while that conversation exists: getContinuationResponse can resume
+	// nothing else. Rows without a live conversation are deleted outright.
+	// Both statements walk the partial index of rows that still carry a
+	// payload, so cleared history is never rescanned.
+	if _, err := s.db.Exec(`DELETE FROM responses
+		WHERE created_at < ? AND payload_json != '{}'
+		  AND (conversation_id = '' OR NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = responses.conversation_id))`, cutoff); err != nil {
+		return err
+	}
+	if _, err := s.db.Exec(`UPDATE responses SET payload_json = '{}' WHERE created_at < ? AND payload_json != '{}'`, cutoff); err != nil {
+		return err
+	}
+	// A cleared link is kept only for a bounded window: a long-lived
+	// conversation would otherwise accumulate one dead row per turn forever.
+	// The link is only useful for a client resending a recent response id, so
+	// dropping it after the retention window only costs a fresh thread.
+	linkCutoff := time.Now().UTC().Add(-responseLinkRetention(ttl)).Format(time.RFC3339Nano)
+	_, err := s.db.Exec(`DELETE FROM responses WHERE payload_json = '{}' AND created_at < ?`, linkCutoff)
+	return err
+}
+
+// DeleteOrphanedResponseLinks drops cleared response rows whose conversation
+// no longer exists. Conversation deletion removes its responses directly;
+// this catches links left behind by older versions or by deleted records.
+func (s *SQLiteStore) DeleteOrphanedResponseLinks() error {
+	startedAt := time.Now()
+	defer observeSQLiteDuration("delete_orphaned_response_links", startedAt)
+	if s == nil || s.db == nil {
+		return nil
+	}
+	_, err := s.db.Exec(`DELETE FROM responses
+		WHERE payload_json = '{}'
+		  AND (conversation_id = '' OR NOT EXISTS (SELECT 1 FROM conversations c WHERE c.id = responses.conversation_id))`)
 	return err
 }
 
@@ -456,7 +618,15 @@ func (s *SQLiteStore) LoadResponses(ttl time.Duration) (map[string]StoredRespons
 	if err := s.DeleteExpiredResponses(ttl); err != nil {
 		return nil, err
 	}
-	rows, err := db.Query(`SELECT response_id, created_at, payload_json, conversation_id, thread_id, account_email FROM responses ORDER BY created_at DESC`)
+	// Startup is the one place a full scan is acceptable: purge links left by
+	// versions that only ever blanked expired rows.
+	if err := s.DeleteOrphanedResponseLinks(); err != nil {
+		return nil, err
+	}
+	// The newest rows are the ones a client is most likely to reference, so a
+	// bounded load keeps the most useful links when a table predates the
+	// retention window.
+	rows, err := db.Query(`SELECT response_id, created_at, payload_json, conversation_id, thread_id, account_email FROM responses ORDER BY created_at DESC LIMIT ?`, maxResponsesLoadedAtStartup)
 	if err != nil {
 		return nil, err
 	}
@@ -492,6 +662,9 @@ func (s *SQLiteStore) LoadResponses(ttl time.Duration) (map[string]StoredRespons
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
+	}
+	if len(out) >= maxResponsesLoadedAtStartup {
+		log.Printf("[sqlite] loaded %d responses, at the startup cap; older continuation links were not restored", len(out))
 	}
 	return out, nil
 }

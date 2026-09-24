@@ -551,7 +551,7 @@ func defaultConfig() AppConfig {
 		TimeoutSec:       180,
 		PollIntervalSec:  1.5,
 		PollMaxRounds:    40,
-		DebugUpstream:    true,
+		DebugUpstream:    false,
 		StreamChunkRunes: 24,
 		Admin: AdminConfig{
 			Enabled:       true,
@@ -1001,7 +1001,9 @@ func saveConfigFile(cfg AppConfig) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(cfg.ConfigPath, body, 0o644)
+	// The file holds the API key, the admin password and proxy credentials, and
+	// a crash mid-write must not leave a truncated config behind.
+	return writeFileAtomically(cfg.ConfigPath, body, 0o600)
 }
 
 func parseCLI() AppConfig {

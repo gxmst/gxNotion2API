@@ -5,7 +5,7 @@
 __pycache__
 _tmp_login_check
 config_snapshots
-probe_files
+**/probe_files
 data
 *.log
 *.tmp
@@ -19,3 +19,11 @@ _admin_preview_base64.txt
 frontend/node_modules
 frontend/.next
 frontend/out
+config.local.json
+config.*.local.json
+.env
+.env.*
+**/tmp_last_*
+docs
+frontend/test-results
+frontend/playwright-report

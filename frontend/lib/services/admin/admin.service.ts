@@ -10,6 +10,7 @@ import type {
   JsonResult,
   VersionPayload,
   AIUsagePayload,
+  WorkspaceAIUsagePayload,
   ChatRunInput,
   ChatRunResult,
   ModelPolicySnapshot,
@@ -58,6 +59,11 @@ export const AdminService = {
   },
   getAIUsage(refresh = false) {
     return apiFetch<AIUsagePayload>(`/admin/accounts/ai-usage${refresh ? '?refresh=1' : ''}`);
+  },
+  getWorkspaceAIUsage(email: string, workspaceId: string, refresh = false) {
+    const query = new URLSearchParams({ email, workspace_id: workspaceId });
+    if (refresh) query.set('refresh', '1');
+    return apiFetch<WorkspaceAIUsagePayload>(`/admin/accounts/ai-usage/workspace?${query}`, { cache: 'no-store' });
   },
   async streamTestPrompt(payload: ChatRunInput, onDelta: (text: string) => void, signal: AbortSignal): Promise<ChatRunResult> {
     let text = '';

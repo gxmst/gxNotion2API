@@ -20,6 +20,20 @@ import (
 
 var errLocalAttachmentPath = errors.New("server file paths are not allowed as attachments; send inline data or a public HTTP(S) URL")
 
+// attachmentProxyError marks an attachment download that failed inside the
+// configured outbound proxy rather than at the client-supplied URL. It is an
+// infrastructure problem, so unlike other download failures it is not reported
+// back to the client as invalid input.
+type attachmentProxyError struct{ err error }
+
+func (e *attachmentProxyError) Error() string { return e.err.Error() }
+func (e *attachmentProxyError) Unwrap() error { return e.err }
+
+func isAttachmentProxyError(err error) bool {
+	var target *attachmentProxyError
+	return errors.As(err, &target)
+}
+
 func parseAttachmentURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u == nil || u.Hostname() == "" || u.Opaque != "" || u.User != nil ||
@@ -119,7 +133,7 @@ func (t *attachmentTransport) RoundTrip(req *http.Request) (*http.Response, erro
 	}
 	proxyURL, _, err := t.resolver.ResolveProxyForRequest(t.email, u)
 	if err != nil {
-		return nil, err
+		return nil, &attachmentProxyError{err: err}
 	}
 	port := u.Port()
 	if port == "" {
@@ -176,16 +190,16 @@ func dialAttachmentTarget(ctx context.Context, target string, proxyURL *url.URL,
 	if proxyURL.Scheme == "socks5" || proxyURL.Scheme == "socks5h" {
 		d, err := proxy.FromURL(proxyURL, attachmentProxyDialer{ctx: ctx, dial: dial})
 		if err != nil {
-			return nil, errors.New("invalid attachment SOCKS proxy")
+			return nil, &attachmentProxyError{err: errors.New("invalid attachment SOCKS proxy")}
 		}
 		conn, err := d.(proxy.ContextDialer).DialContext(ctx, "tcp", target)
 		if err != nil {
-			return nil, errors.New("attachment SOCKS proxy connection failed")
+			return nil, &attachmentProxyError{err: errors.New("attachment SOCKS proxy connection failed")}
 		}
 		return conn, nil
 	}
 	if proxyURL.Scheme != "http" && proxyURL.Scheme != "https" {
-		return nil, errors.New("unsupported attachment proxy scheme")
+		return nil, &attachmentProxyError{err: errors.New("unsupported attachment proxy scheme")}
 	}
 	port := proxyURL.Port()
 	if port == "" {
@@ -196,7 +210,7 @@ func dialAttachmentTarget(ctx context.Context, target string, proxyURL *url.URL,
 	}
 	conn, err := dial(ctx, "tcp", net.JoinHostPort(proxyURL.Hostname(), port))
 	if err != nil {
-		return nil, errors.New("attachment proxy connection failed")
+		return nil, &attachmentProxyError{err: errors.New("attachment proxy connection failed")}
 	}
 	// Context cancellation must also interrupt CONNECT's reads and writes.
 	rawConn := conn
@@ -216,7 +230,7 @@ func dialAttachmentTarget(ctx context.Context, target string, proxyURL *url.URL,
 	if proxyURL.Scheme == "https" {
 		tlsConn := tls.Client(conn, &tls.Config{ServerName: proxyURL.Hostname(), MinVersion: tls.VersionTLS12})
 		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			return nil, errors.New("attachment HTTPS proxy TLS handshake failed")
+			return nil, &attachmentProxyError{err: errors.New("attachment HTTPS proxy TLS handshake failed")}
 		}
 		conn = tlsConn
 	}
@@ -229,13 +243,15 @@ func dialAttachmentTarget(ctx context.Context, target string, proxyURL *url.URL,
 		connect.Header.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
 	}
 	if err := connect.Write(conn); err != nil {
-		return nil, errors.New("attachment proxy CONNECT write failed")
+		return nil, &attachmentProxyError{err: errors.New("attachment proxy CONNECT write failed")}
 	}
 	reader := bufio.NewReader(conn)
 	response, err := http.ReadResponse(reader, connect)
 	if err != nil {
-		return nil, errors.New("attachment proxy CONNECT response failed")
+		return nil, &attachmentProxyError{err: errors.New("attachment proxy CONNECT response failed")}
 	}
+	// A CONNECT the proxy answered but refused is about the destination the
+	// client supplied, so it stays an ordinary (client input) failure.
 	if response.StatusCode != http.StatusOK {
 		_, targetPort, _ := net.SplitHostPort(target)
 		if targetPort != "443" && (response.StatusCode == http.StatusForbidden || response.StatusCode == http.StatusMethodNotAllowed) {

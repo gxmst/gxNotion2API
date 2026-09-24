@@ -27,11 +27,14 @@ go build ./cmd/notion2api
 
 ## Docker 部署
 
-先按实际环境修改 `config.docker.json`，再启动：
+`config.docker.json` 是受 git 跟踪的模板，不要直接改它：服务会把管理台的每次保存整体写回挂载的配置文件，里面有 API Key 和管理密码。先复制一份未跟踪的本地配置（`config.*.local.json` 已被忽略），把 `api_key` 和 `admin.password` 改成真实值，再启动：
 
 ```bash
+cp config.docker.json config.docker.local.json
 docker compose up -d --build
 ```
+
+`api_key` 或管理密码仍是 `change-me` 开头的示例值时，服务拒绝启动。compose 默认只把端口发布到宿主机回环（`127.0.0.1:8787`）；确实需要对外监听时设 `N2A_BIND=0.0.0.0`，并在前面加反代。
 
 如果使用偏生产配置：
 
@@ -111,7 +114,8 @@ HTTP 请求优先顺序：
 - `api_key`：OpenAI 兼容接口密钥
 - `admin.password`：WebUI 登录密码
 - `admin.trusted_proxies`：仅在反代场景需要，见下方「把管理台放到公网」
-- `upstream_base_url` / `upstream_origin`
+- `upstream_base_url` / `upstream_origin`：所有账号的 Cookie 都会发往这里。通过管理台修改时只接受 `https` 的 notion.so / notion.com 域名（或回环地址的本地 mock），其他地址只能写在配置文件或命令行里
+- `debug_upstream`：默认 `false`。开启后会把完整的推理请求体（含对话内容）写到系统临时目录下的 `notion2api-debug/`，只在排查时临时打开
 - `proxy_mode` / `proxy_url` / `proxy_http_url` / `proxy_https_url`
 - `resin_enabled` / `resin_url` / `resin_platform` / `resin_mode`
 - `accounts[*].sticky_proxy_account`
@@ -134,7 +138,7 @@ HTTP 请求优先顺序：
 | `features.force_fresh_thread_per_request` | `false` | 开启后每个请求都新建上游线程并重放全部历史。需要隔离每次请求时再开启。 |
 | `features.conversation_idle_ttl_hours` | `0` | 默认长期保留普通会话及上游线程。显式设为正数后才按空闲小时数删除；已有配置中的正数仍然生效。 |
 | `features.ephemeral_all_conversations` | `false` | 开启后每轮结束清理线程，下次需重新创建并处理上下文。需要临时会话时再开启。 |
-| `responses.store_ttl_seconds` | `3600` | 响应正文的保留时间；正文过期后 GET 返回 404，`previous_response_id` 仍可通过保留的关联继续现有会话。 |
+| `responses.store_ttl_seconds` | `3600` | 响应正文的保留时间；正文过期后 GET 返回 404，`previous_response_id` 仍可通过保留的关联继续现有会话。关联本身只在有限窗口内保留（正文 TTL 的 24 倍，最少 7 天）：超过后该 `response_id` 不再能续聊，客户端会重新开始一个线程，避免 responses 表随每一轮无限增长。 |
 | `features.ephemeral_ttl_seconds` | 未设置 | 仅作用于 `ephemeral_all_conversations` 标记的会话。不设置时该路径用 2 分钟。 |
 | `features.continuation_failover` | `true` | 绑定账号的上游 AI 额度耗尽后，将对话历史重放到备用账号的新线程；没有可用备用账号时保留原始额度错误。 |
 
@@ -159,7 +163,7 @@ SillyTavern 的 `quiet` / `impersonate` 属于辅助请求（摘要、世界书�
 | `features.timezone` | `Asia/Shanghai` | 上报给上游的 IANA 时区。 |
 | `features.accept_language` | 跟随时区推导 | `Accept-Language` 头。留空时按时区推导匹配值，避免出现「Windows/en-US 浏览器却报 Asia/Shanghai」这类组合。账号 cookie 里的 `NEXT_LOCALE` / `notion_locale` 优先级更高。 |
 
-证书校验默认开启，仅在显式设置 `upstream_tls_server_name` 或 `upstream_host`（域前置场景，证书本就不匹配）时才跳过。
+证书校验默认开启，仅在显式设置 `upstream_tls_server_name` 或 `upstream_host_header`（域前置场景，证书本就不匹配）时才跳过。
 
 遇到 `trust-rule-denied` 后不会切换 HTTP 客户端重发或通过登录刷新重试，同一账号的全部工作区暂停 30 分钟。HTTP 429 会保留并遵守 `Retry-After`，账号至少暂停 2 分钟；上游要求更长时间时以其为准。已确认的 `quota-exhausted` 使用 6 小时本地退避，这不是对上游额度重置时间的预测。不同工作区共享 `dispatch.account_max_concurrency`（默认 `1`），同时仍受各工作区的并发上限约束。
 
@@ -180,7 +184,7 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 
 `/v1/models` 返回 Auto 和已有合资格工作区明确支持的手动模型。指定模型时，调度只选择确认支持该模型的工作区，并使用该工作区最新的上游代号；会话仍绑定原工作区。能力未知或仅支持 Auto 时，指定模型默认返回 HTTP 400、`model_selection_unavailable`，不消耗本地请求额度，也不触发登录刷新。
 
-旧客户端必须传固定模型名时，可以显式设置 `dispatch.restricted_model_fallback: true`（默认 `false`）。这样已确认“仅 Auto”的工作区允许按 Auto 兼容执行，优先使用真正支持目标模型的工作区；未知能力不会被当成 Auto 限制。客户端请求名称保留在兼容响应中，管理台每轮消息及日志会标记实际采用 Auto。建议试用区直接使用 `model: "auto"`。
+旧客户端必须传固定模型名时，可以显式设置 `dispatch.restricted_model_fallback: true`（默认 `false`）。这样已确认“仅 Auto”或能力尚未刷新的工作区允许按 Auto 兼容执行，优先使用真正支持目标模型的工作区。客户端请求名称保留在兼容响应中，管理台每轮消息及日志会标记实际采用 Auto。建议试用区直接使用 `model: "auto"`。
 
 聊天消息和会话详情分别展示请求模型与上游报告的模型。`model_observations` 记录推理步骤的模型代号、供应商（若有）和来源；不从请求名称猜测，未报告时显示“未知”。这些信息随消息持久化，可包含同一轮的多个模型。兼容 API 的 `model` 字段及旧会话表 `model_used` 仍是请求标识，不作为实际模型证据。默认思考强度只作目录说明，本轮不自动构造或发送推测的强度参数。
 
@@ -190,7 +194,11 @@ curl -X POST http://127.0.0.1:8787/admin/accounts/refresh-models \
 
 在“账号与工作区”选择目标工作区，在“工作区模型设置”中选择普通 Notion 代理或自定义代理，点击“读取模型设置”。后端读取当前登录账号的 `space_user.membership_type`；只有确认是 `owner` 的工作区所有者才显示可操作的模型选择和应用按钮，其他成员或权限不明时只可查看。最终权限仍由 Notion 检查。
 
-选择模型后，点击“应用到整个工作区”才会调用 `updateSpaceSettings`。它仅修改所选代理类型的模型策略，保留其他设置；应用前重新核对权限和策略版本，保存后检查 Notion 返回的策略。接口拒绝、网络错误或结果不确定时不会自动重试，也不会自动重新登录。页面保留本页首次修改前的快照，可点击“恢复本次修改前设置”；离开此面板或切换工作区/代理类型后快照不再保留。上游未提供已验证的原子条件更新接口，读取与保存之间仍可能发生其他管理员的网页修改，操作期间应避免同时修改同一策略。
+选择模型后，点击“应用到整个工作区”才会调用 `updateSpaceSettings`。它仅修改所选代理类型的模型策略，保留其他设置；应用前重新核对权限和策略版本，保存后检查 Notion 返回的策略。接口拒绝、网络错误或结果不确定时不会自动重试，也不会自动重新登录。
+
+首次锁定前，服务端会把原策略保存为“恢复点”（配置文件旁的 `model_policy_restore_points.json`，权限 0600），刷新页面或重启后仍可点击“恢复原设置”；恢复成功或点“清除限制”（删除策略、回到 Notion 默认的全部模型可用）后恢复点即删除。上游明确拒绝的写入不会留下恢复点，结果不确定的写入会保留。每次写入尝试都会追加到同目录的 `model_policy_audit.jsonl`，记录操作账号、工作区、代理类型、修改前后策略和结果。锁定、恢复或清除成功后，管理台会自动刷新该工作区的模型能力。
+
+目录中没有对应代理类型条目的模型（例如只提供给自定义代理的模型）视为不可锁定，避免 Auto 在该代理类型里没有可用候选。策略里的 `allowedRestrictedModels`、`defaultModel` 会原样保留；锁定时若已设置 `defaultModel`，会一并改为目标模型。上游未提供已验证的原子条件更新接口，读取与保存之间仍可能发生其他管理员的网页修改，操作期间应避免同时修改同一策略。
 
 此设置影响整个工作区中对应代理的所有成员与会话。它通过排除其他模型及供应商限制 Auto 的候选范围，不解除 `trial_not_allowed` 等上游限制，也不保证同一工作区中的不同会话各自使用不同模型。上游新增模型后需重新读取确认。普通聊天、定时任务和请求调度不会自动修改设置。
 
