@@ -45,6 +45,9 @@ type ConversationMessage struct {
 	CreatedAt          time.Time                `json:"created_at"`
 	UpdatedAt          time.Time                `json:"updated_at"`
 	Attachments        []ConversationAttachment `json:"attachments,omitempty"`
+	// EditedAt marks content an operator rewrote by hand, so the UI can show
+	// that the stored text is no longer exactly what the model produced.
+	EditedAt *time.Time `json:"edited_at,omitempty"`
 }
 
 type ConversationEntry struct {
@@ -265,10 +268,19 @@ func summarizeUploadedAttachments(items []UploadedAttachment) []ConversationAtta
 	return out
 }
 
+// maxConversationTitleRunes bounds a title, whether derived from the first
+// prompt or typed by an operator.
+const maxConversationTitleRunes = 72
+
+// maxConversationMessageRunes bounds a hand-edited message. The HTTP body limit
+// already caps the request, so this only exists to keep a single message from
+// dominating the in-memory store and the persisted snapshot.
+const maxConversationMessageRunes = 200000
+
 func conversationTitle(prompt string, attachments []ConversationAttachment) string {
 	prompt = collapseWhitespace(prompt)
 	if prompt != "" {
-		return truncateRunes(prompt, 72)
+		return truncateRunes(prompt, maxConversationTitleRunes)
 	}
 	if len(attachments) > 0 {
 		names := make([]string, 0, minInt(len(attachments), 2))
@@ -279,7 +291,7 @@ func conversationTitle(prompt string, attachments []ConversationAttachment) stri
 			}
 			names = append(names, name)
 		}
-		return truncateRunes("Attachment · "+strings.Join(names, ", "), 72)
+		return truncateRunes("Attachment · "+strings.Join(names, ", "), maxConversationTitleRunes)
 	}
 	return "Untitled conversation"
 }
@@ -362,6 +374,7 @@ func cloneStringAnyMap(input map[string]any) map[string]any {
 func cloneConversationMessage(msg ConversationMessage) ConversationMessage {
 	msg.ModelObservations = append([]ModelObservation(nil), msg.ModelObservations...)
 	msg.Attachments = cloneConversationAttachments(msg.Attachments)
+	msg.EditedAt = cloneTimePointer(msg.EditedAt)
 	return msg
 }
 
@@ -1114,6 +1127,109 @@ func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID s
 		Summary:        &summary,
 	})
 	return true
+}
+
+// SetTitle replaces a conversation title. Titles are otherwise derived from the
+// first prompt at creation time, so this is the only way for an operator to
+// name a conversation themselves. It returns the updated entry for the caller
+// to persist; the in-memory store is updated either way.
+func (s *ConversationStore) SetTitle(conversationID string, title string) (ConversationEntry, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	if conversationID == "" {
+		return ConversationEntry{}, fmt.Errorf("conversation id is required")
+	}
+	title = collapseWhitespace(title)
+	if title == "" {
+		return ConversationEntry{}, fmt.Errorf("title is required")
+	}
+	if len([]rune(title)) > maxConversationTitleRunes {
+		return ConversationEntry{}, fmt.Errorf("title must be at most %d characters", maxConversationTitleRunes)
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	entry := s.items[conversationID]
+	if entry == nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("conversation not found")
+	}
+	if conversationStatusBusy(entry.Status) {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("conversation is running; stop it before renaming")
+	}
+	next := cloneConversationEntry(entry)
+	next.Title = title
+	next.UpdatedAt = now
+	s.items[conversationID] = &next
+	summary := buildConversationSummary(&next)
+	s.mu.Unlock()
+
+	s.broadcast(ConversationEvent{
+		Type:           "conversation.updated",
+		ConversationID: conversationID,
+		At:             now,
+		Summary:        &summary,
+	})
+	return copyConversationEntryValue(&next), nil
+}
+
+// SetMessageContent rewrites the stored text of one message, for either role.
+// It refuses to touch a running conversation: an in-flight turn keeps appending
+// deltas to the assistant message, so an edit there would be overwritten or
+// interleaved. The edit is recorded with EditedAt so the transcript can say the
+// text is no longer verbatim model output.
+func (s *ConversationStore) SetMessageContent(conversationID string, messageID string, content string) (ConversationEntry, error) {
+	conversationID = strings.TrimSpace(conversationID)
+	messageID = strings.TrimSpace(messageID)
+	if conversationID == "" {
+		return ConversationEntry{}, fmt.Errorf("conversation id is required")
+	}
+	if messageID == "" {
+		return ConversationEntry{}, fmt.Errorf("message id is required")
+	}
+	if len([]rune(content)) > maxConversationMessageRunes {
+		return ConversationEntry{}, fmt.Errorf("message must be at most %d characters", maxConversationMessageRunes)
+	}
+
+	now := time.Now().UTC()
+	s.mu.Lock()
+	entry := s.items[conversationID]
+	if entry == nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("conversation not found")
+	}
+	if conversationStatusBusy(entry.Status) {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("conversation is running; stop it before editing")
+	}
+	index := -1
+	for i := range entry.Messages {
+		if strings.TrimSpace(entry.Messages[i].ID) == messageID {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		s.mu.Unlock()
+		return ConversationEntry{}, fmt.Errorf("message not found")
+	}
+	next := cloneConversationEntry(entry)
+	editedAt := now
+	next.Messages[index].Content = content
+	next.Messages[index].UpdatedAt = now
+	next.Messages[index].EditedAt = &editedAt
+	next.UpdatedAt = now
+	s.items[conversationID] = &next
+	summary := buildConversationSummary(&next)
+	s.mu.Unlock()
+
+	s.broadcast(ConversationEvent{
+		Type:           "conversation.updated",
+		ConversationID: conversationID,
+		At:             now,
+		Summary:        &summary,
+	})
+	return copyConversationEntryValue(&next), nil
 }
 
 // ClaimForDeletion marks a conversation as being deleted upstream. While the

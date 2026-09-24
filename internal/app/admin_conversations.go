@@ -15,6 +15,17 @@ type adminConversationBatchDeleteRequest struct {
 	IDs []string `json:"ids"`
 }
 
+// adminConversationRenameRequest is the body of PATCH /admin/conversations/{id}.
+type adminConversationRenameRequest struct {
+	Title string `json:"title"`
+}
+
+// adminConversationMessageEditRequest is the body of
+// PATCH /admin/conversations/{id}/messages/{messageID}.
+type adminConversationMessageEditRequest struct {
+	Content string `json:"content"`
+}
+
 func notionThreadConversationID(threadID string) string {
 	threadID = strings.TrimSpace(threadID)
 	if threadID == "" {
@@ -288,9 +299,17 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 		return
 	}
 	rawID := strings.TrimPrefix(r.URL.Path, "/admin/conversations/")
-	conversationID := strings.TrimSpace(rawID)
+	// A message edit addresses a sub-resource: {id}/messages/{messageID}. The
+	// router matches by prefix, so the split happens here rather than there.
+	conversationID, messageID, isMessageEdit := strings.Cut(rawID, "/messages/")
+	conversationID = strings.TrimSpace(conversationID)
+	messageID = strings.TrimSpace(messageID)
 	if conversationID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "conversation id is required"})
+		return
+	}
+	if isMessageEdit {
+		a.handleAdminConversationMessageEdit(w, r, conversationID, messageID)
 		return
 	}
 	switch r.Method {
@@ -337,9 +356,56 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 			"success": true,
 			"message": "conversation deleted",
 		})
+	case http.MethodPatch:
+		a.handleAdminConversationRename(w, r, conversationID)
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
 	}
+}
+
+// handleAdminConversationRename renames a stored conversation. The title is
+// persisted with the snapshot, so it survives a restart.
+func (a *App) handleAdminConversationRename(w http.ResponseWriter, r *http.Request, conversationID string) {
+	defer r.Body.Close()
+	var req adminConversationRenameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid json body"})
+		return
+	}
+	entry, err := a.State.conversations().SetTitle(conversationID, req.Title)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	a.State.persistConversationSnapshot(entry.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
+}
+
+// handleAdminConversationMessageEdit rewrites one stored message, for either
+// role. Editing is local to this bridge: nothing is pushed back to Notion, so
+// the upstream thread keeps the original text.
+func (a *App) handleAdminConversationMessageEdit(w http.ResponseWriter, r *http.Request, conversationID string, messageID string) {
+	if r.Method != http.MethodPatch {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
+		return
+	}
+	if messageID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "message id is required"})
+		return
+	}
+	defer r.Body.Close()
+	var req adminConversationMessageEditRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid json body"})
+		return
+	}
+	entry, err := a.State.conversations().SetMessageContent(conversationID, messageID, req.Content)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	a.State.persistConversationSnapshot(entry.ID)
+	writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
 }
 
 func (a *App) handleAdminEvents(w http.ResponseWriter, r *http.Request) {
