@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -247,5 +249,165 @@ func TestRunInferenceTranscriptInBrowserWithSurf_RejectsHTMLChallenge(t *testing
 	_, err := runInferenceTranscriptInBrowserWithSurf(context.Background(), client, map[string]any{"threadId": "t1"})
 	if err == nil || !strings.Contains(err.Error(), "challenge/html content") {
 		t.Fatalf("unexpected err: %v", err)
+	}
+}
+
+// Stored cookies are captured verbatim, and some values cannot be emitted as a
+// cookie value at all: Google's g_state is JSON, so it is full of double quotes.
+// net/http strips those bytes itself and logs a warning on every request. We now
+// strip them before handing the cookie over, so the header must stay byte-identical
+// to what net/http produced on its own -- the fix removes noise, not behaviour.
+func TestProbeCookieValuesSendExactlyWhatNetHTTPWould(t *testing.T) {
+	// Shaped like the real g_state value: JSON, so full of quotes.
+	raw := `{"i_l":0,"i_ll":1234567890,"i_b":"abc","i_e":1}`
+	if !strings.Contains(raw, `"`) {
+		t.Fatal("precondition failed: the sample carries no quote to strip")
+	}
+
+	headerFor := func(gState string) string {
+		t.Helper()
+		jar, err := cookiejar.New(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req := httptest.NewRequest(http.MethodGet, "https://www.notion.so/api/v3/getSpaces", nil)
+		loadProbeCookiesIntoJar(jar, req.URL, []ProbeCookie{
+			{Name: "g_state", Value: gState},
+			{Name: "token_v2", Value: "plain-value"},
+		})
+		for _, cookie := range jar.Cookies(req.URL) {
+			req.AddCookie(cookie)
+		}
+		return req.Header.Get("Cookie")
+	}
+
+	want := headerFor(raw)                    // net/http sanitizes internally
+	got := headerFor(cookieRequestValue(raw)) // we sanitize up front
+	if got != want {
+		t.Fatalf("pre-sanitized header differs from net/http's own result:\n got %q\nwant %q", got, want)
+	}
+
+	cleaned := cookieRequestValue(raw)
+	if strings.Contains(cleaned, `"`) {
+		t.Fatalf("cleaned value still carries the value's own quotes: %q", cleaned)
+	}
+	// The value keeps its commas, so net/http still wraps it in the one outer
+	// quote pair RFC 6265 requires. That pair is legitimate; what must be gone
+	// is the value's own inner quoting.
+	if n := strings.Count(got, `"`); n != 2 {
+		t.Fatalf("expected exactly one outer quote pair, found %d quotes in %q", n, got)
+	}
+	if !strings.Contains(got, "token_v2=plain-value") {
+		t.Fatalf("an unrelated cookie was altered: %q", got)
+	}
+}
+
+// The whole point of the change: the warning that used to fire on every single
+// request must stop, while net/http still warns about a value we failed to clean.
+func TestCleanedCookieValueNoLongerWarns(t *testing.T) {
+	raw := `{"i_l":0,"i_ll":1234567890}`
+	for _, tc := range []struct {
+		name      string
+		value     string
+		wantQuiet bool
+	}{
+		{name: "cleaned value stays quiet", value: cookieRequestValue(raw), wantQuiet: true},
+		{name: "raw value still warns", value: raw, wantQuiet: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&captured)
+			defer log.SetOutput(previous)
+
+			req := httptest.NewRequest(http.MethodGet, "https://www.notion.so/api/v3/getSpaces", nil)
+			req.AddCookie(&http.Cookie{Name: "g_state", Value: tc.value})
+
+			warned := strings.Contains(captured.String(), "invalid byte")
+			if tc.wantQuiet && warned {
+				t.Fatalf("still warned after cleaning: %s", captured.String())
+			}
+			if !tc.wantQuiet && !warned {
+				t.Fatal("net/http did not warn about the raw value; this test is no longer exercising the bug")
+			}
+		})
+	}
+}
+
+// The byte rule has to match net/http's own, or we would silently change what
+// gets sent.
+func TestCookieRequestValueMatchesNetHTTPByteRule(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain value untouched", in: "token_v2=abc123", want: "token_v2=abc123"},
+		{name: "quotes dropped", in: `a"b"c`, want: "abc"},
+		{name: "semicolon dropped", in: "a;b", want: "ab"},
+		{name: "backslash dropped", in: `a\b`, want: "ab"},
+		{name: "control byte dropped", in: "a\nb", want: "ab"},
+		{name: "high byte dropped", in: "a\xffb", want: "ab"},
+		{name: "empty stays empty", in: "", want: ""},
+		{name: "only invalid bytes becomes empty", in: `"""`, want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cookieRequestValue(tc.in); got != tc.want {
+				t.Fatalf("cookieRequestValue(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// Defining the cleaner is not enough -- the production path has to apply it, so
+// assert on what actually lands in the jar.
+func TestLoadProbeCookiesIntoJarStoresCleanValues(t *testing.T) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://www.notion.so/api/v3/getSpaces", nil)
+	loadProbeCookiesIntoJar(jar, req.URL, []ProbeCookie{
+		{Name: "g_state", Value: `{"i_l":0,"i_ll":1234567890}`},
+		{Name: "token_v2", Value: "plain-value"},
+	})
+
+	seen := map[string]string{}
+	for _, cookie := range jar.Cookies(req.URL) {
+		seen[cookie.Name] = cookie.Value
+	}
+	gState, ok := seen["g_state"]
+	if !ok {
+		t.Fatal("g_state was not loaded into the jar")
+	}
+	if strings.Contains(gState, `"`) {
+		t.Fatalf("loadProbeCookiesIntoJar kept an unrepresentable value: %q", gState)
+	}
+	if seen["token_v2"] != "plain-value" {
+		t.Fatalf("an unrelated cookie was altered: %q", seen["token_v2"])
+	}
+}
+
+// The login transport loads cookies into its own jar; it needs the same care.
+func TestApplyLoginTransportSetCookiesStoresCleanValues(t *testing.T) {
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "https://www.notion.so/api/v3/getSpaces", nil)
+	applyLoginTransportSetCookies(jar, req.URL.String(), []ProbeCookie{
+		{Name: "g_state", Value: `{"i_l":0,"i_b":"abc"}`},
+	})
+
+	seen := map[string]string{}
+	for _, cookie := range jar.Cookies(req.URL) {
+		seen[cookie.Name] = cookie.Value
+	}
+	gState, ok := seen["g_state"]
+	if !ok {
+		t.Fatal("g_state was not loaded into the login transport jar")
+	}
+	if strings.Contains(gState, `"`) {
+		t.Fatalf("applyLoginTransportSetCookies kept an unrepresentable value: %q", gState)
 	}
 }

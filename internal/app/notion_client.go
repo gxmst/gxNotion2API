@@ -875,6 +875,39 @@ func (c *NotionAIClient) cookieValue(name string) string {
 	return ""
 }
 
+// cookieRequestValue drops the bytes net/http refuses to put in a Cookie.Value.
+// Stored browser cookies are captured verbatim, and some of them are not
+// representable as a cookie value: Google's g_state is JSON, so it is full of
+// double quotes. net/http silently strips those bytes and logs a warning on
+// every request that carries the cookie, which buries real errors in the log.
+// Stripping them here yields exactly the header net/http would have produced
+// anyway, minus the noise.
+func cookieRequestValue(value string) string {
+	clean := true
+	for i := 0; i < len(value); i++ {
+		if !validCookieValueByte(value[i]) {
+			clean = false
+			break
+		}
+	}
+	if clean {
+		return value
+	}
+	out := make([]byte, 0, len(value))
+	for i := 0; i < len(value); i++ {
+		if validCookieValueByte(value[i]) {
+			out = append(out, value[i])
+		}
+	}
+	return string(out)
+}
+
+// validCookieValueByte mirrors net/http's own validCookieValueByte, so the
+// result matches what the standard library would have sent.
+func validCookieValueByte(b byte) bool {
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
+}
+
 func normalizeLocaleHeader(value string) string {
 	clean := strings.TrimSpace(value)
 	if clean == "" {

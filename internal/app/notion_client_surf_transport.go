@@ -39,7 +39,7 @@ func loadProbeCookiesIntoJar(jar http.CookieJar, target *url.URL, cookies []Prob
 		}
 		items = append(items, &http.Cookie{
 			Name:  name,
-			Value: c.Value,
+			Value: cookieRequestValue(c.Value),
 			Path:  "/",
 		})
 	}

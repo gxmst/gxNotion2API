@@ -120,7 +120,7 @@ func applyLoginTransportSetCookies(jar http.CookieJar, targetURL string, setCook
 		if name == "" {
 			continue
 		}
-		items = append(items, &http.Cookie{Name: name, Value: c.Value, Path: "/"})
+		items = append(items, &http.Cookie{Name: name, Value: cookieRequestValue(c.Value), Path: "/"})
 	}
 	if len(items) > 0 {
 		jar.SetCookies(parsed, items)
