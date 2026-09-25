@@ -1710,6 +1710,15 @@ func resolveContinuationAccount(cfg AppConfig, threadID string, requestedAccount
 // final turn from a completed conversation. It returns nil when the
 // conversation holds no completed assistant answer, leaving the turn to run
 // upstream as usual.
+//
+// An operator edit is served as-is, deliberately. RequestFingerprint describes
+// the request, not the answer, so editing the stored answer leaves the
+// fingerprint matching and a repeat of the same request replays the edited
+// text rather than the model's original output. That is the intended reading of
+// an edit: the stored transcript is the record, and a correction to it should
+// not be quietly reverted to text the model produced. Note the asymmetry with
+// editing the final *user* turn, which does invalidate the replay, because
+// requestMatchesConversationFinalTurn compares that text against the request.
 func replayResultFromConversation(conversation ConversationEntry) *InferenceResult {
 	if !strings.EqualFold(strings.TrimSpace(conversation.Status), "completed") {
 		return nil
