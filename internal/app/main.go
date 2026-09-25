@@ -2255,9 +2255,31 @@ func splitReplayChunks(text string, size int) []string {
 	return chunks
 }
 
+// replayStreamPacing returns the chunk size and the delay between chunks for a
+// result about to be written to an SSE stream.
+//
+// A cached replay has no upstream arrival spacing its chunks out. Writing them
+// back-to-back delivered the whole answer in one burst, which clients rendered
+// as a single block of text — the "no streaming effect" report. A live stream
+// keeps the configured chunk size and needs no delay, because upstream already
+// paces it.
+func replayStreamPacing(result InferenceResult, configuredChunkRunes int) (int, time.Duration) {
+	if !result.cachedReplay {
+		return configuredChunkRunes, 0
+	}
+	return replayChunkRunes, replayChunkDelay
+}
+
 // emitReplayStream delivers a cached answer through a streaming sink without
 // touching the account pool, so a repeated streamed request behaves like its
 // non-streamed counterpart.
+//
+// This is NOT the path a replayed answer takes in production. Both streaming
+// handlers check request.replayResult first and hand a cached result straight to
+// writeChatCompletionStream / writeResponsesStream, so nothing here is reached
+// once a replay is armed; it is the guard that keeps an armed replay from ever
+// dispatching upstream, and it is exercised by tests. Pacing a replayed answer
+// is the job of replayStreamPacing, on the handler above.
 func emitReplayStream(request PromptRunRequest, emit func(string) error) (InferenceResult, error) {
 	result := *request.replayResult
 	if emit == nil {
@@ -2785,7 +2807,8 @@ func (a *App) writeChatCompletionStream(w http.ResponseWriter, r *http.Request, 
 		}, nil),
 	}
 	cfg, _, _ := a.State.Snapshot()
-	for _, part := range splitTextChunks(reasoningText, cfg.StreamChunkRunes) {
+	chunkRunes, chunkDelay := replayStreamPacing(result, cfg.StreamChunkRunes)
+	for _, part := range splitTextChunks(reasoningText, chunkRunes) {
 		if part == "" {
 			continue
 		}
@@ -2793,7 +2816,7 @@ func (a *App) writeChatCompletionStream(w http.ResponseWriter, r *http.Request, 
 			buildChatStreamReasoningChoice(0, part),
 		}, nil))
 	}
-	for _, part := range splitTextChunks(assistantText, cfg.StreamChunkRunes) {
+	for _, part := range splitTextChunks(assistantText, chunkRunes) {
 		chunks = append(chunks, buildChatStreamChunk(completionID, created, modelID, []map[string]any{
 			buildChatStreamDeltaChoice(0, map[string]any{"content": part}),
 		}, nil))
@@ -2802,11 +2825,19 @@ func (a *App) writeChatCompletionStream(w http.ResponseWriter, r *http.Request, 
 	if includeUsage {
 		finalUsage = buildUsage(result.Prompt, assistantText, reasoningText)
 	}
+	// This is the landing point for a replayed answer (writeChatCompletionLiveStream
+	// delegates a cached result here), so it has to report truncation too.
+	// Hardcoding "stop" meant a replayed cut-off answer looked clean to the
+	// client, which is exactly what the live path already avoids.
+	finishReason := "stop"
+	if result.Truncated {
+		finishReason = "length"
+	}
 	chunks = append(chunks, buildChatStreamChunk(completionID, created, modelID, []map[string]any{
-		buildChatStreamFinishChoice(0, "stop"),
+		buildChatStreamFinishChoice(0, finishReason),
 	}, finalUsage))
 
-	for _, chunk := range chunks {
+	for index, chunk := range chunks {
 		if err := writeSSEData(w, flusher, chunk); err != nil {
 			return
 		}
@@ -2814,6 +2845,14 @@ func (a *App) writeChatCompletionStream(w http.ResponseWriter, r *http.Request, 
 		case <-r.Context().Done():
 			return
 		default:
+		}
+		// The terminal chunk is not followed by a delay: it ends the turn.
+		if chunkDelay > 0 && index < len(chunks)-1 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(chunkDelay):
+			}
 		}
 	}
 	writeSSEDone(w, flusher)
@@ -3321,7 +3360,9 @@ func (a *App) writeResponsesStream(w http.ResponseWriter, r *http.Request, resul
 		}
 	}
 
-	for _, part := range splitTextChunks(assistantText, cfg.StreamChunkRunes) {
+	chunkRunes, chunkDelay := replayStreamPacing(result, cfg.StreamChunkRunes)
+	parts := splitTextChunks(assistantText, chunkRunes)
+	for index, part := range parts {
 		if err := writeEvent("response.output_text.delta", buildResponsesOutputTextDeltaEvent(responseID, outputItemID, part)); err != nil {
 			return
 		}
@@ -3329,6 +3370,13 @@ func (a *App) writeResponsesStream(w http.ResponseWriter, r *http.Request, resul
 		case <-r.Context().Done():
 			return
 		default:
+		}
+		if chunkDelay > 0 && index < len(parts)-1 {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(chunkDelay):
+			}
 		}
 	}
 

@@ -3,6 +3,8 @@ package app
 import (
 	"encoding/json"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -261,6 +263,198 @@ func TestReplayStreamIsChunked(t *testing.T) {
 		if chunk == "" {
 			t.Fatalf("replay must not emit empty deltas")
 		}
+	}
+}
+
+// streamFinishReason reads the finish_reason out of the last terminal chunk in
+// an SSE body, so a test can assert on what the client actually receives rather
+// than on the result struct that fed it.
+func streamFinishReason(t *testing.T, body string) string {
+	t.Helper()
+	reason := ""
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var chunk struct {
+			Choices []struct {
+				FinishReason string `json:"finish_reason"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
+			t.Fatalf("stream chunk is not valid JSON: %v (%s)", err, payload)
+		}
+		for _, choice := range chunk.Choices {
+			if choice.FinishReason != "" {
+				reason = choice.FinishReason
+			}
+		}
+	}
+	return reason
+}
+
+// streamContentDeltas collects the assistant text deltas out of an SSE body,
+// reading both surfaces: chat completions carries choices[].delta.content, and
+// the Responses stream carries "delta" on response.output_text.delta events.
+// Non-text events and terminal chunks are skipped.
+func streamContentDeltas(t *testing.T, body string) []string {
+	t.Helper()
+	var deltas []string
+	for _, line := range strings.Split(body, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Type    string `json:"type"`
+			Delta   string `json:"delta"`
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(payload), &event); err != nil {
+			t.Fatalf("stream chunk is not valid JSON: %v (%s)", err, payload)
+		}
+		if event.Type == "response.output_text.delta" && event.Delta != "" {
+			deltas = append(deltas, event.Delta)
+			continue
+		}
+		for _, choice := range event.Choices {
+			if choice.Delta.Content != "" {
+				deltas = append(deltas, choice.Delta.Content)
+			}
+		}
+	}
+	return deltas
+}
+
+// replayedConversation builds the conversation a repeated final turn replays,
+// so the tests below go through the same wiring production does — including the
+// cachedReplay marker that drives chunk sizing and pacing.
+func replayedConversation(answer string) ConversationEntry {
+	return ConversationEntry{
+		ID:       "conv_replay",
+		Status:   "completed",
+		ThreadID: "replay-thread",
+		Messages: []ConversationMessage{
+			{ID: "m_user", Role: "user", Status: "completed", Content: "问题"},
+			{ID: "m_answer", Role: "assistant", Status: "completed", Content: answer},
+		},
+	}
+}
+
+// replayThroughChatStream writes a cached answer the way a repeated streamed
+// request does: the live handler sees an armed replay and delegates to
+// writeChatCompletionStream.
+func replayThroughChatStream(t *testing.T, app *App, conversation ConversationEntry) string {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	app.writeChatCompletionLiveStream(recorder, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), PromptRunRequest{
+		replayResult: replayResultFromConversation(conversation),
+	}, "test-model", false, "conv_replay")
+	return recorder.Body.String()
+}
+
+// A replayed answer that was cut short upstream must reach the client as
+// finish_reason "length". writeChatCompletionLiveStream hands a cached result to
+// writeChatCompletionStream, and that function hardcoded "stop", so the
+// truncation fix held on the live path and on the Responses path but not here.
+// Asserting on the result struct alone could not catch this: the bug was in the
+// output path, not in the flag.
+func TestReplayedTruncatedAnswerReportsLengthOverTheStream(t *testing.T) {
+	app := newConversationRequestTestApp(t)
+	conversation := replayedConversation("半截回答")
+	conversation.Messages[1].Truncated = true
+
+	body := replayThroughChatStream(t, app, conversation)
+	if got := streamFinishReason(t, body); got != "length" {
+		t.Fatalf("finish_reason = %q, want length for a replayed truncated answer", got)
+	}
+	if !strings.Contains(body, "半截回答") {
+		t.Fatalf("the replayed text never reached the stream: %s", body)
+	}
+	if !strings.Contains(body, "[DONE]") {
+		t.Fatal("the replay stream did not terminate with [DONE]")
+	}
+}
+
+// The control case, so the fix above cannot be satisfied by always reporting
+// "length" on the replay path.
+func TestReplayedCompleteAnswerReportsStopOverTheStream(t *testing.T) {
+	app := newConversationRequestTestApp(t)
+	if got := streamFinishReason(t, replayThroughChatStream(t, app, replayedConversation("完整回答"))); got != "stop" {
+		t.Fatalf("finish_reason = %q, want stop for a replayed complete answer", got)
+	}
+}
+
+// A replayed answer has to arrive progressively. Chunking alone was not enough:
+// writeChatCompletionStream wrote every chunk back-to-back, so the whole answer
+// landed in one burst and clients rendered it as a single block. The paced
+// emitter written for this was never on the production path — the live handlers
+// divert a replay before reaching it — so the pacing is asserted here, through
+// the handler a replayed answer actually uses.
+func TestReplayedAnswerIsPacedOverTheStream(t *testing.T) {
+	previousRunes, previousDelay := replayChunkRunes, replayChunkDelay
+	replayChunkRunes, replayChunkDelay = 16, 2*time.Millisecond
+	defer func() { replayChunkRunes, replayChunkDelay = previousRunes, previousDelay }()
+
+	app := newConversationRequestTestApp(t)
+	answer := strings.Repeat("a", 16*4)
+
+	started := time.Now()
+	body := replayThroughChatStream(t, app, replayedConversation(answer))
+	elapsed := time.Since(started)
+
+	deltas := streamContentDeltas(t, body)
+	if len(deltas) != 4 {
+		t.Fatalf("content deltas = %d, want the replay chunked into 4", len(deltas))
+	}
+	if joined := strings.Join(deltas, ""); joined != answer {
+		t.Fatalf("replayed text = %q, want %q", joined, answer)
+	}
+	// time.Sleep never returns early, so this lower bound is deterministic.
+	if minimum := time.Duration(len(deltas)-1) * replayChunkDelay; elapsed < minimum {
+		t.Fatalf("replay took %v, want at least %v: the chunks were not paced", elapsed, minimum)
+	}
+}
+
+// The Responses replay goes through its own writer, so it needs the same
+// treatment and its own check.
+func TestReplayedAnswerIsPacedOverTheResponsesStream(t *testing.T) {
+	previousRunes, previousDelay := replayChunkRunes, replayChunkDelay
+	replayChunkRunes, replayChunkDelay = 16, 2*time.Millisecond
+	defer func() { replayChunkRunes, replayChunkDelay = previousRunes, previousDelay }()
+
+	app := newConversationRequestTestApp(t)
+	answer := strings.Repeat("a", 16*4)
+	recorder := httptest.NewRecorder()
+
+	started := time.Now()
+	app.writeResponsesLiveStream(recorder, httptest.NewRequest(http.MethodPost, "/v1/responses", nil), PromptRunRequest{
+		replayResult: replayResultFromConversation(replayedConversation(answer)),
+	}, "test-model", false, "conv_replay")
+	elapsed := time.Since(started)
+
+	deltas := streamContentDeltas(t, recorder.Body.String())
+	if len(deltas) != 4 {
+		t.Fatalf("output_text deltas = %d, want the replay chunked into 4", len(deltas))
+	}
+	if joined := strings.Join(deltas, ""); joined != answer {
+		t.Fatalf("replayed text = %q, want %q", joined, answer)
+	}
+	if minimum := time.Duration(len(deltas)-1) * replayChunkDelay; elapsed < minimum {
+		t.Fatalf("replay took %v, want at least %v: the chunks were not paced", elapsed, minimum)
 	}
 }
 
