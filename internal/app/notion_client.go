@@ -279,7 +279,10 @@ type InferenceResult struct {
 	ConfigID           string               `json:"config_id,omitempty"`
 	ContextID          string               `json:"context_id,omitempty"`
 	OriginalDatetime   string               `json:"original_datetime,omitempty"`
-	cachedReplay       bool
+	// Truncated reports that the upstream stream was cut short after some text
+	// had already been produced, so the answer is incomplete.
+	Truncated    bool `json:"truncated,omitempty"`
+	cachedReplay bool
 }
 
 type InferenceTranscriptSummary struct {
@@ -488,6 +491,15 @@ type ndjsonParseResult struct {
 	MessageIDs []string
 	FinalAgent agentMessage
 	Reasoning  string
+	// Truncated marks a stream that was closed on the idle-after-answer timer
+	// rather than by a terminal answer or EOF. The text is real but incomplete,
+	// so callers must not report a clean stop for it.
+	Truncated bool
+	// ContentPatchCount and LargestContentPatchRunes describe how the upstream
+	// delivered the answer. A handful of very large patches means upstream is
+	// not streaming progressively and no client-side change can smooth it.
+	ContentPatchCount        int
+	LargestContentPatchRunes int
 }
 
 type ndjsonTranscriptState struct {
@@ -501,6 +513,21 @@ type ndjsonTranscriptState struct {
 	patchValueTypes  map[string]string
 	patchValueText   map[string]string
 	patchValueCounts map[string]int
+	// contentPatches and largestPatchSize record the shape of the upstream
+	// stream: many small content patches means upstream streams progressively,
+	// one huge patch means it does not.
+	contentPatches   int
+	largestPatchSize int
+}
+
+// recordContentPatch tracks how the upstream chops up the answer so a request
+// can be diagnosed without re-running it: many small patches means upstream
+// streams progressively, one huge patch means it does not.
+func (s *ndjsonTranscriptState) recordContentPatch(runes int) {
+	s.contentPatches++
+	if runes > s.largestPatchSize {
+		s.largestPatchSize = runes
+	}
 }
 
 func (s *ndjsonTranscriptState) hasTerminalAnswer() bool {
@@ -1383,7 +1410,14 @@ func (c *NotionAIClient) runInferenceTranscriptHTTP(ctx context.Context, payload
 		}()
 	}
 
-	return consumeNDJSONStreamWithIdleClose(resp.Body, threadID, sink, ndjsonIdleAfterAnswerTimeout)
+	parsed, err := consumeNDJSONStreamWithIdleClose(resp.Body, threadID, sink, ndjsonIdleAfterAnswerTimeout)
+	if c.Config.DebugUpstream {
+		// Distinguishes "upstream streams the answer" from "upstream hands us one
+		// block at the end", which decides whether client-side pacing can help.
+		log.Printf("[debug_upstream] stream shape thread_id=%s content_patches=%d largest_content_patch_runes=%d ndjson_lines=%d truncated=%v",
+			threadID, parsed.ContentPatchCount, parsed.LargestContentPatchRunes, parsed.LineCount, parsed.Truncated)
+	}
+	return parsed, err
 }
 
 func (c *NotionAIClient) runInferenceTranscriptInBrowser(ctx context.Context, payload map[string]any) (string, error) {
@@ -2541,14 +2575,15 @@ func appendAgentPatchDelta(existing string, delta string) string {
 	}
 	existingClean := sanitizeAssistantVisibleText(existing)
 	deltaClean := sanitizeAssistantVisibleText(delta)
+	// "x" is an append, so the payload is only a cumulative snapshot when it is
+	// a strict growth of what we already hold. Everything else is a fragment and
+	// must be concatenated. Matching on a shared suffix (or on equality) instead
+	// used to swallow real text: the second L of "Hello" and the second 谢 of
+	// "谢谢" both looked like a repeat of the tail.
 	switch {
-	case strings.HasSuffix(existing, delta):
-		return existing
-	case deltaClean != "" && strings.HasSuffix(existingClean, deltaClean):
-		return existing
-	case strings.HasPrefix(delta, existing):
+	case len([]rune(delta)) > len([]rune(existing)) && strings.HasPrefix(delta, existing):
 		return delta
-	case deltaClean != "" && existingClean != "" && strings.HasPrefix(deltaClean, existingClean):
+	case deltaClean != "" && len([]rune(deltaClean)) > len([]rune(existingClean)) && strings.HasPrefix(deltaClean, existingClean):
 		return delta
 	default:
 		return existing + delta
@@ -2623,6 +2658,7 @@ func (s *ndjsonTranscriptState) applyAgentPatchField(stepIndex int, rest string,
 	if entryKey, ok := patchEntryKeyFromRest(stepIndex, rest, "/content"); ok {
 		s.ensurePatchMaps()
 		if content := extractAssistantPartContent(rawValue); content != "" {
+			s.recordContentPatch(len([]rune(content)))
 			s.patchValueText[entryKey] = applyAgentPatchContent(s.patchValueText[entryKey], opType, content)
 		}
 		return true, s.refreshAgentStepFromPatchState(stepIndex, sink)
@@ -2757,10 +2793,12 @@ func (s *ndjsonTranscriptState) result() ndjsonParseResult {
 		s.FinalAgent.ModelObservations = mergeModelObservations(s.FinalAgent.ModelObservations, step.ModelObservations)
 	}
 	out := ndjsonParseResult{
-		LineCount:  s.LineCount,
-		MessageIDs: append([]string(nil), s.MessageIDs...),
-		FinalAgent: s.FinalAgent,
-		Reasoning:  s.composeReasoningText(),
+		LineCount:                s.LineCount,
+		MessageIDs:               append([]string(nil), s.MessageIDs...),
+		FinalAgent:               s.FinalAgent,
+		Reasoning:                s.composeReasoningText(),
+		ContentPatchCount:        s.contentPatches,
+		LargestContentPatchRunes: s.largestPatchSize,
 	}
 	if strings.TrimSpace(out.FinalAgent.Text) == "" {
 		out.FinalAgent.Text = s.EmittedText
@@ -2910,8 +2948,13 @@ func consumeNDJSONStreamWithIdleClose(reader io.ReadCloser, threadID string, sin
 				return state.result(), event.err
 			}
 		case <-idleC:
+			// The answer went quiet without a terminal step. Whatever text we
+			// already forwarded is a prefix of a longer answer, so flag it and
+			// let the caller report a length stop instead of a clean one.
 			_ = reader.Close()
-			return state.result(), nil
+			result := state.result()
+			result.Truncated = !state.hasTerminalAnswer()
+			return result, nil
 		}
 	}
 }
@@ -4261,7 +4304,11 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 	parsed, parseErr := c.runInferenceTranscriptWithFallback(ctx, payload, actualThreadID, InferenceStreamSink{})
 	messageIDs := parsed.MessageIDs
 	finalAgent := parsed.FinalAgent
+	// A recovered answer is complete by definition, so only keep the flag when
+	// the parsed stream itself supplied the text.
+	truncated := parsed.Truncated
 	if strings.TrimSpace(finalAgent.Text) == "" {
+		truncated = false
 		var stepErr *inferenceStepError
 		var transportErr *inferenceTransportError
 		if parseErr != nil && errors.As(parseErr, &stepErr) {
@@ -4281,6 +4328,7 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 			}
 		}
 	} else if parseErr != nil {
+		truncated = false
 		messageIDs, finalAgent, err = c.loadFinalAnswerOnce(ctx, actualThreadID)
 		if err != nil {
 			return InferenceResult{}, parseErr
@@ -4311,6 +4359,7 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 		ConfigID:           meta.ConfigID,
 		ContextID:          meta.ContextID,
 		OriginalDatetime:   meta.OriginalDatetime,
+		Truncated:          truncated,
 	}, nil
 }
 
@@ -4341,7 +4390,9 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 	}
 	messageIDs := parsed.MessageIDs
 	finalAgent := parsed.FinalAgent
+	truncated := parsed.Truncated
 	if strings.TrimSpace(finalAgent.Text) == "" {
+		truncated = false
 		messageIDs, finalAgent, err = c.loadFinalAnswerOnce(ctx, actualThreadID)
 		if err != nil {
 			messageIDs, finalAgent, err = c.pollFinalAnswerStream(ctx, actualThreadID, sink.Text)
@@ -4374,5 +4425,6 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 		ConfigID:           meta.ConfigID,
 		ContextID:          meta.ContextID,
 		OriginalDatetime:   meta.OriginalDatetime,
+		Truncated:          truncated,
 	}, nil
 }

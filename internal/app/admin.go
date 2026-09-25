@@ -970,6 +970,10 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	request.ConversationID = conversationID
+	// Every handler that starts a turn must release it. Without this a panic or
+	// an early return left the conversation "running" forever, so the next test
+	// on it was rejected as busy.
+	defer a.abandonConversationTurn(conversationID)
 	setConversationIDHeader(w, conversationID)
 	if stream, _ := payload["stream"].(bool); stream {
 		a.writeChatCompletionLiveStream(w, r, request, entry.ID, false, conversationID)
@@ -993,6 +997,37 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// adminStaticFilePath maps a request path (already stripped of its /admin
+// prefix) onto a file inside staticDir, reporting ok=false for anything that
+// resolves outside the root.
+//
+// Two things have to hold, and the original guard had neither:
+//
+//   - A bare HasPrefix against the root is not a containment test. With
+//     staticDir "static/admin", "../admin-backup/db.json" cleaned to
+//     "static/admin-backup/db.json", which still starts with "static/admin",
+//     so a sibling directory whose name merely shared the prefix was accepted.
+//     The boundary has to be a path separator.
+//   - Relying on http.ServeFile to catch the traversal is not enough. It only
+//     rejects a path element that is literally "..", and a backslash separator
+//     on Windows produces no such element, so the read would go through.
+//
+// The climb is therefore rejected outright rather than re-anchored: rooting the
+// path first (filepath.Clean("/"+path)) would silently resolve
+// "../assets/app.js" onto a real file inside the root and answer 200 for a URL
+// that should not exist.
+func adminStaticFilePath(staticDir string, path string) (string, bool) {
+	clean := filepath.Clean(path)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) || filepath.IsAbs(clean) {
+		return "", false
+	}
+	full := filepath.Join(staticDir, filepath.Clean("/"+clean))
+	if !strings.HasPrefix(full, staticDir+string(os.PathSeparator)) {
+		return "", false
+	}
+	return full, true
+}
+
 func (a *App) serveAdminStatic(w http.ResponseWriter, r *http.Request) {
 	cfg, _, _ := a.State.Snapshot()
 	staticDir := resolveStaticAdminDir(cfg.Admin.StaticDir)
@@ -1003,8 +1038,8 @@ func (a *App) serveAdminStatic(w http.ResponseWriter, r *http.Request) {
 	path := strings.TrimPrefix(r.URL.Path, "/admin")
 	path = strings.TrimPrefix(path, "/")
 	if path != "" && strings.Contains(path, ".") {
-		full := filepath.Join(staticDir, filepath.Clean(path))
-		if !strings.HasPrefix(full, staticDir) {
+		full, ok := adminStaticFilePath(staticDir, path)
+		if !ok {
 			http.NotFound(w, r)
 			return
 		}

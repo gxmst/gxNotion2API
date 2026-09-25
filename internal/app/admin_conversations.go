@@ -96,7 +96,10 @@ func mergeConversationSummary(local ConversationSummary, remote ConversationSumm
 	out := local
 	out.Origin = "merged"
 	out.RemoteOnly = false
-	if title := strings.TrimSpace(remote.Title); title != "" {
+	// An operator rename outranks the title Notion generated for the thread.
+	// Without this the sidebar reverted to the old title the moment the list was
+	// refreshed, while the rename itself reported success.
+	if title := strings.TrimSpace(remote.Title); title != "" && local.TitleEditedAt == nil {
 		out.Title = title
 	}
 	out.ThreadID = firstNonEmpty(strings.TrimSpace(out.ThreadID), strings.TrimSpace(remote.ThreadID))
@@ -113,7 +116,7 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 	out := local
 	out.Origin = "merged"
 	out.RemoteOnly = false
-	if title := strings.TrimSpace(remote.Title); title != "" {
+	if title := strings.TrimSpace(remote.Title); title != "" && local.TitleEditedAt == nil {
 		out.Title = title
 	}
 	out.ThreadID = firstNonEmpty(strings.TrimSpace(out.ThreadID), strings.TrimSpace(remote.ThreadID))
@@ -145,6 +148,16 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 				message.RequestedModel = firstNonEmpty(prior.RequestedModel, message.RequestedModel)
 				message.ModelSelectionMode = firstNonEmpty(prior.ModelSelectionMode, message.ModelSelectionMode)
 				message.ModelObservations = mergeModelObservations(prior.ModelObservations, message.ModelObservations)
+				// Notion still holds the pre-edit text, so a hand-edited body has
+				// to survive the merge or the edit is lost on the next refresh.
+				if prior.EditedAt != nil {
+					message.Content = prior.Content
+					message.EditedAt = prior.EditedAt
+				}
+				// Truncation is only known locally; a remote record cannot carry it.
+				if prior.Truncated {
+					message.Truncated = true
+				}
 			}
 			out.Messages[i] = message
 		}

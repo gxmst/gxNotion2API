@@ -1731,6 +1731,9 @@ func replayResultFromConversation(conversation ConversationEntry) *InferenceResu
 			AccountEmail: strings.TrimSpace(conversation.AccountEmail),
 			SpaceID:      conversation.SpaceID,
 			SpaceViewID:  conversation.SpaceViewID,
+			// A replayed answer that was cut short upstream must not come back
+			// looking like a clean stop.
+			Truncated:    message.Truncated,
 			cachedReplay: true,
 		}
 	}
@@ -2213,13 +2216,51 @@ func (a *App) runPrompt(r *http.Request, request PromptRunRequest) (InferenceRes
 	return a.runPromptWithAccountPool(r, request, nil)
 }
 
+// Replayed answers are chunked and paced so a cached response still arrives as
+// a stream. Sending the whole text as one delta made every repeated request
+// render as a non-streamed response, which clients that drive incremental
+// rendering show as a single block of text appearing at once.
+var (
+	replayChunkRunes = 32
+	replayChunkDelay = 15 * time.Millisecond
+)
+
+// splitReplayChunks cuts text into rune-counted chunks, never splitting a
+// multi-byte character.
+func splitReplayChunks(text string, size int) []string {
+	if size <= 0 {
+		return []string{text}
+	}
+	runes := []rune(text)
+	if len(runes) == 0 {
+		return nil
+	}
+	chunks := make([]string, 0, len(runes)/size+1)
+	for start := 0; start < len(runes); start += size {
+		end := start + size
+		if end > len(runes) {
+			end = len(runes)
+		}
+		chunks = append(chunks, string(runes[start:end]))
+	}
+	return chunks
+}
+
 // emitReplayStream delivers a cached answer through a streaming sink without
 // touching the account pool, so a repeated streamed request behaves like its
 // non-streamed counterpart.
 func emitReplayStream(request PromptRunRequest, emit func(string) error) (InferenceResult, error) {
 	result := *request.replayResult
-	if err := emit(result.Text); err != nil {
-		return InferenceResult{}, err
+	if emit == nil {
+		return result, nil
+	}
+	for _, chunk := range splitReplayChunks(result.Text, replayChunkRunes) {
+		if err := emit(chunk); err != nil {
+			return InferenceResult{}, err
+		}
+		if replayChunkDelay > 0 {
+			time.Sleep(replayChunkDelay)
+		}
 	}
 	return result, nil
 }
@@ -2957,8 +2998,12 @@ func (a *App) writeChatCompletionLiveStream(w http.ResponseWriter, r *http.Reque
 	if err := startStream(); err != nil {
 		return
 	}
+	finishReason := "stop"
+	if result.Truncated {
+		finishReason = "length"
+	}
 	_ = safeWriteData(buildChatStreamChunk(completionID, created, modelID, []map[string]any{
-		buildChatStreamFinishChoice(0, "stop"),
+		buildChatStreamFinishChoice(0, finishReason),
 	}, finalUsage))
 	safeWriteDone()
 }
@@ -3155,7 +3200,7 @@ func (a *App) writeResponsesLiveStream(w http.ResponseWriter, r *http.Request, r
 	a.State.saveResponseWithAccount(responseID, completedResponse, conversationID, result.ThreadID, result.AccountEmail)
 	a.completeConversation(conversationID, result)
 	a.persistConversationSession(conversationID, request, result)
-	streamCompletedItem := buildResponsesStreamTerminalItem(outputItemID, "completed")
+	streamCompletedItem := buildResponsesStreamTerminalItem(outputItemID, responsesTerminalStatus(result.Truncated))
 	streamCompletedResponse := buildResponsesStreamCompletedResponse(completedResponse, outputItemID)
 	if err := startStream(); err != nil {
 		return
@@ -3183,7 +3228,7 @@ func (a *App) writeResponsesLiveStream(w http.ResponseWriter, r *http.Request, r
 			return
 		}
 	}
-	if err := safeWriteEvent("response.completed", buildResponsesCompletedEvent(streamCompletedResponse)); err != nil {
+	if err := safeWriteEvent(responsesTerminalEventName(result.Truncated), buildResponsesCompletedEvent(streamCompletedResponse)); err != nil {
 		return
 	}
 	safeWriteDone()
@@ -3232,7 +3277,7 @@ func (a *App) writeResponsesStream(w http.ResponseWriter, r *http.Request, resul
 	attachConversationResponseMetadata(inProgressResponse, conversationID, "")
 	attachConversationResponseMetadata(completedResponse, conversationID, result.ThreadID)
 	a.State.saveResponseWithAccount(responseID, completedResponse, conversationID, result.ThreadID, result.AccountEmail)
-	streamCompletedItem := buildResponsesStreamTerminalItem(outputItemID, "completed")
+	streamCompletedItem := buildResponsesStreamTerminalItem(outputItemID, responsesTerminalStatus(result.Truncated))
 	streamCompletedResponse := buildResponsesStreamCompletedResponse(completedResponse, outputItemID)
 	inProgressItem := buildResponsesMessageItem(outputItemID, "", "in_progress")
 	cfg, _, _ := a.State.Snapshot()
@@ -3296,7 +3341,7 @@ func (a *App) writeResponsesStream(w http.ResponseWriter, r *http.Request, resul
 		default:
 		}
 	}
-	if err := writeEvent("response.completed", buildResponsesCompletedEvent(streamCompletedResponse)); err != nil {
+	if err := writeEvent(responsesTerminalEventName(result.Truncated), buildResponsesCompletedEvent(streamCompletedResponse)); err != nil {
 		return
 	}
 	select {

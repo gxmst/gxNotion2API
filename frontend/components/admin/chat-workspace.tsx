@@ -203,6 +203,10 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const [model, setModel] = useState(defaultModel || models[0]?.id || 'auto');
   const [useWebSearch, setUseWebSearch] = useState(defaultWebSearch);
   const [conversationID, setConversationID] = useState('');
+  // Remote-only transcripts live in Notion, not in this bridge's store, so
+  // rename and per-message edit have nothing local to write to. Their controls
+  // are hidden rather than offered and then failing on save.
+  const [remoteOnly, setRemoteOnly] = useState(false);
   const [messages, setMessages] = useState<ConversationMessage[]>([]);
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -254,6 +258,9 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const shellRef = useRef<HTMLDivElement>(null);
   const mounted = useRef(false);
   const loadRevision = useRef(0);
+  // Mirrors conversationID so an in-flight save can tell whether the operator
+  // moved to another conversation before its response landed.
+  const activeConversationRef = useRef('');
   const followBottom = useRef(true);
   const propsRef = useRef({ onLoad, onResumeHandled, onDeleteConversation, onRefreshConversations });
   propsRef.current = { onLoad, onResumeHandled, onDeleteConversation, onRefreshConversations };
@@ -335,6 +342,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       if (!mounted.current || revision !== loadRevision.current) return;
       setMessages(item.messages || []); setOwner(item.account_email || '');
       setTitle(item.title || item.request_prompt?.slice(0, 60) || '对话');
+      setRemoteOnly(Boolean(item.remote_only));
       if (item.account_email && item.space_id) setTarget(targetID(item.account_email, item.space_id));
       if (item.model && models.some((model) => model.id === item.model)) setModel(item.model);
       setRemoteRunning(item.status === 'running' || item.status === 'queued');
@@ -424,6 +432,8 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     if (element && visible && followBottom.current) { element.scrollTop = element.scrollHeight; setAtBottom(true); }
   }, [messages, visible]);
 
+  useEffect(() => { activeConversationRef.current = conversationID; }, [conversationID]);
+
   useEffect(() => {
     if (!remoteRunning || !conversationID) return;
     let cancelled = false;
@@ -442,6 +452,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     loadRevision.current++;
     setConversationID(''); setMessages([]); setOwner(''); setTitle('新对话'); setError(''); setPrompt(''); setFiles([]);
     setLoading(false); setLoadFailed(false); setRemoteRunning(false); setMobileOpen(false); setQuotaOpen(false);
+    setRemoteOnly(false);
     cancelRename(); cancelEdit();
     if (!targets.some((item) => item.id === target)) setTarget('auto');
     followBottom.current = true;
@@ -507,6 +518,9 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const conversationLabel = (item: ConversationSummary) => item.title || item.request_prompt || item.preview || '新对话';
 
   function startRename(item: ConversationSummary) {
+    // Remote-only transcripts have no row in this bridge's store, so a rename
+    // would be accepted by the UI and then silently fail to persist.
+    if (item.remote_only) { toast.info('该对话只存在于 Notion，无法在此重命名'); return; }
     setRenamingID(item.id); setRenameValue(conversationLabel(item));
   }
 
@@ -531,6 +545,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   async function removeConversation(item: ConversationSummary) {
     // Deleting removes the stored transcript, so the confirmation names the
     // conversation and says plainly that it cannot be undone.
+    if (item.remote_only) { toast.info('该对话只存在于 Notion，无法在此删除'); return; }
     if (!window.confirm(`删除「${conversationLabel(item)}」？该对话的记录会一并移除，且不可恢复。`)) return;
     if (item.status === 'running' || item.status === 'queued') { toast.info('此对话正在生成，完成后再删除'); return; }
     setBusyID(item.id);
@@ -580,10 +595,20 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     if (next === (message.content || '').trim()) { cancelEdit(); return; }
     if (!next) { toast.error('内容不能为空'); return; }
     setSavingEdit(true);
+    const targetID = conversationID;
     try {
       // The response carries the whole conversation, so the transcript is
       // replaced with the server's own view instead of a local guess.
-      const { item } = await AdminService.editConversationMessage(conversationID, message.id, next);
+      const { item } = await AdminService.editConversationMessage(targetID, message.id, next);
+      if (!mounted.current) return;
+      // Switching conversations while this save was in flight must not paste
+      // one conversation's messages (and their message IDs) under another one.
+      if (activeConversationRef.current !== targetID) {
+        cancelEdit();
+        await propsRef.current.onRefreshConversations();
+        toast.success('已保存');
+        return;
+      }
       setMessages(item.messages || []);
       if (item.title) setTitle(item.title);
       cancelEdit();
@@ -622,7 +647,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       }, controller.signal);
       if (!mounted.current) return;
       setConversationID(result.conversation_id || id);
-      setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: result.text, status: 'completed' } : message));
+      setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: result.text, status: 'completed', truncated: result.truncated } : message));
       // The turn just spent allowance; re-read so the indicator is not stale.
       refreshQuota();
       try {
@@ -713,9 +738,12 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
             <MessageSquare size={14} /><span>{label}</span>{item.status === 'running' ? <LoaderCircle size={12} className="animate-spin" /> : null}
           </button>
           <div className="chat-conversation-actions">
-            <button className="chat-icon" aria-label={`重命名 ${label}`} disabled={busy || running} onClick={() => startRename(item)}><Pencil size={13} /></button>
+            {/* Rename and delete both write to the local store; a remote-only
+                transcript has nothing local to write to, so those two controls
+                are withheld instead of offered and then failing on save. */}
+            {item.remote_only ? null : <button className="chat-icon" aria-label={`重命名 ${label}`} disabled={busy || running} onClick={() => startRename(item)}><Pencil size={13} /></button>}
             <button className="chat-icon" aria-label={`导出 ${label}`} disabled={busy} onClick={() => void exportConversation(item.id, label)}>{busy ? <LoaderCircle size={13} className="animate-spin" /> : <Download size={13} />}</button>
-            <button className="chat-icon" aria-label={`删除 ${label}`} disabled={busy || running} onClick={() => void removeConversation(item)}><Trash2 size={13} /></button>
+            {item.remote_only ? null : <button className="chat-icon" aria-label={`删除 ${label}`} disabled={busy || running} onClick={() => void removeConversation(item)}><Trash2 size={13} /></button>}
           </div>
         </div>;
       })}
@@ -808,8 +836,9 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
             <div className="chat-message-actions">
               {message.edited_at ? <span className="chat-edited">已编辑</span> : null}
               {message.status === 'failed' ? <span>未完成</span> : null}
+              {message.truncated ? <span className="chat-truncated" title="上游在回答写完之前结束了流，这段回答可能不完整">已截断</span> : null}
               {message.content ? <span className="chat-token-hint" title="按字符数估算，非上游计数">≈ {formatTokens(estimateTokens(message.content))} tokens</span> : null}
-              <button className="chat-icon" aria-label="编辑消息" disabled={running || !message.id} onClick={() => startEdit(message)}><Pencil size={14} /></button>
+              <button className="chat-icon" aria-label="编辑消息" disabled={running || !message.id || remoteOnly} onClick={() => startEdit(message)}><Pencil size={14} /></button>
               <button className="chat-icon" aria-label="复制消息" disabled={!message.content} onClick={() => void copyText(message.content || '').then(() => { setCopied(String(index)); setTimeout(() => setCopied(''), 1600); }).catch(() => toast.error('复制失败'))}>{copied === String(index) ? <Check size={14} /> : <Copy size={14} />}</button>
             </div>
           </article>;

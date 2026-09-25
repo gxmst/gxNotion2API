@@ -1118,6 +1118,12 @@ func buildChatCompletion(result InferenceResult, modelID string, includeTrace bo
 		"content": assistantText,
 	}
 	attachChatReasoningFields(message, reasoningText)
+	// An answer that stopped on the idle timer is incomplete; "stop" would tell
+	// the client it was finished and hide the truncation.
+	finishReason := "stop"
+	if result.Truncated {
+		finishReason = "length"
+	}
 	payload := map[string]any{
 		"id":      "chatcmpl-" + strings.ReplaceAll(randomUUID(), "-", ""),
 		"object":  "chat.completion",
@@ -1126,7 +1132,7 @@ func buildChatCompletion(result InferenceResult, modelID string, includeTrace bo
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       message,
-			"finish_reason": "stop",
+			"finish_reason": finishReason,
 		}},
 		"usage":              buildUsage(result.Prompt, assistantText, reasoningText),
 		"system_fingerprint": "notion2api-local-go",
@@ -1191,7 +1197,13 @@ func buildResponsesStreamCompletedResponse(response map[string]any, itemID strin
 	}
 	cloned["output_text"] = ""
 	if itemID != "" {
-		cloned["output"] = []any{buildResponsesStreamTerminalItem(itemID, "completed")}
+		// Mirror the response's own status so an incomplete response does not
+		// advertise a completed output item.
+		status := "completed"
+		if got, ok := response["status"].(string); ok && strings.TrimSpace(got) != "" {
+			status = strings.TrimSpace(got)
+		}
+		cloned["output"] = []any{buildResponsesStreamTerminalItem(itemID, status)}
 	} else {
 		cloned["output"] = []any{}
 	}
@@ -1252,22 +1264,42 @@ func buildResponsesFailedObject(responseID string, modelID string, createdAt int
 	}
 }
 
+// responsesTerminalStatus names the terminal state of a response. An answer cut
+// short upstream is "incomplete", not "completed": the Responses API reserves
+// that status for a response the client should treat as unfinished.
+func responsesTerminalStatus(truncated bool) string {
+	if truncated {
+		return "incomplete"
+	}
+	return "completed"
+}
+
+// responsesIncompleteDetails explains an incomplete response, or nil when the
+// response finished normally.
+func responsesIncompleteDetails(truncated bool) any {
+	if !truncated {
+		return nil
+	}
+	return map[string]any{"reason": "max_output_tokens"}
+}
+
 func buildResponsesOutputWithIDs(result InferenceResult, modelID string, includeTrace bool, responseID string, outputItemID string, createdAt int64) map[string]any {
 	assistantText := sanitizeAssistantVisibleText(result.Text)
 	reasoningText := sanitizeAssistantVisibleText(result.Reasoning)
 	usage := buildUsage(result.Prompt, assistantText, reasoningText)
+	status := responsesTerminalStatus(result.Truncated)
 	payload := map[string]any{
 		"id":         responseID,
 		"object":     "response",
 		"created_at": createdAt,
-		"status":     "completed",
+		"status":     status,
 		"model":      modelID,
 		"output": []any{
-			buildResponsesMessageItemWithReasoning(outputItemID, assistantText, reasoningText, "completed"),
+			buildResponsesMessageItemWithReasoning(outputItemID, assistantText, reasoningText, status),
 		},
 		"output_text":        assistantText,
 		"error":              nil,
-		"incomplete_details": nil,
+		"incomplete_details": responsesIncompleteDetails(result.Truncated),
 		"usage": map[string]any{
 			"input_tokens":  usage["prompt_tokens"],
 			"output_tokens": usage["completion_tokens"],
@@ -1469,6 +1501,16 @@ func buildResponsesOutputItemDoneEvent(responseID string, item map[string]any) m
 
 func buildResponsesCompletedEvent(response map[string]any) map[string]any {
 	return buildResponsesStreamEvent("response.completed", map[string]any{"response": response})
+}
+
+// responsesTerminalEventName is the stream event that closes a response. A
+// truncated answer closes with response.incomplete so a streaming client can
+// tell it apart from a finished one.
+func responsesTerminalEventName(truncated bool) string {
+	if truncated {
+		return "response.incomplete"
+	}
+	return "response.completed"
 }
 
 func buildResponsesFailedEvent(response map[string]any) map[string]any {

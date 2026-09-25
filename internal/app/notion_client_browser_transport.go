@@ -9,7 +9,6 @@ import (
 )
 
 const (
-	notionTransportDefaultBrowserProfile = "chrome_142"
 	notionTransportDefaultRequestTimeout = 120 * time.Second
 )
 
@@ -20,7 +19,6 @@ type browserTransportRequest struct {
 	Headers           map[string]string `json:"headers"`
 	Payload           map[string]any    `json:"payload"`
 	Cookies           []ProbeCookie     `json:"cookies"`
-	BrowserProfile    string            `json:"browser_profile,omitempty"`
 	Proxy             string            `json:"proxy,omitempty"`
 	RequestTimeoutMS  int               `json:"request_timeout_ms"`
 	IdleAfterAnswerMS int               `json:"idle_after_answer_ms"`
@@ -98,7 +96,6 @@ func buildBrowserTransportRequest(client *NotionAIClient, payload map[string]any
 		Headers:           headers,
 		Payload:           payload,
 		Cookies:           client.Session.Cookies,
-		BrowserProfile:    notionTransportDefaultBrowserProfile,
 		Proxy:             proxyValue,
 		RequestTimeoutMS:  int(notionTransportDefaultRequestTimeout / time.Millisecond),
 		IdleAfterAnswerMS: int(ndjsonIdleAfterAnswerTimeout / time.Millisecond),

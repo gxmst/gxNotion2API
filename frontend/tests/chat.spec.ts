@@ -3,9 +3,26 @@ import type { ChatRunInput, ConversationDetail, ConversationMessage } from '../l
 
 const businessAccount = 'test@example.com';
 
-async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: boolean; gradual?: boolean; restricted?: boolean } = {}) {
+async function mockAdmin(page: Page, options: { truncated?: boolean; lengthStop?: boolean; deferred?: boolean; gradual?: boolean; restricted?: boolean; remoteOnly?: boolean } = {}) {
   const requests: Array<ChatRunInput & { stream: boolean }> = [];
   const conversations = new Map<string, ConversationDetail>();
+  if (options.remoteOnly) {
+    // A transcript that only exists in Notion: the bridge holds no local row,
+    // so rename, delete, and per-message edit have nothing to write to.
+    conversations.set('conv_notion_thread_remote', {
+      id: 'conv_notion_thread_remote',
+      title: 'Notion 上的历史对话',
+      messages: [
+        { id: 'remote-user', role: 'user', content: 'Notion 里的问题', status: 'completed' },
+        { id: 'remote-assistant', role: 'assistant', content: 'Notion 里的回答', status: 'completed' },
+      ],
+      model: 'test-model',
+      status: 'completed',
+      account_email: businessAccount,
+      space_id: 'business-trial',
+      remote_only: true,
+    });
+  }
   let release = () => {};
   const pending = new Promise<void>((resolve) => { release = resolve; });
   const responses: Record<string, unknown> = {
@@ -40,6 +57,7 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: 
       const messages: ConversationMessage[] = [
         { id: `user-${requests.length}`, role: 'user', content: input.prompt, status: 'completed' },
         { id: `answer-${requests.length}`, role: 'assistant', content: answer, status: options.truncated ? 'failed' : 'completed', requested_model: input.model,
+          truncated: options.lengthStop,
           model_selection_mode: input.model === 'auto' ? 'auto' : 'manual', model_observations: [{ model: 'test-codename', source: 'thread_record' }] },
       ];
       const item: ConversationDetail = conversations.get(input.conversation_id) || {
@@ -56,10 +74,15 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; deferred?: 
       }
       const parts = ['**Reply ', `${requests.length}**\n\n`, input.prompt];
       const body = parts.map((content) => `data: ${JSON.stringify({ choices: [{ delta: { content } }] })}\r\n\r\n`).join('');
+      // A length stop is a completed connection carrying an incomplete answer,
+      // which is a different case from a dropped stream.
+      const finish = options.lengthStop
+        ? `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: 'length' }] })}\r\n\r\n`
+        : '';
       return route.fulfill({
         contentType: 'text/event-stream',
         headers: { 'x-conversation-id': input.conversation_id },
-        body: body + (options.truncated ? '' : 'data: [DONE]\r\n\r\n'),
+        body: body + finish + (options.truncated ? '' : 'data: [DONE]\r\n\r\n'),
       });
     }
     return route.continue();
@@ -126,6 +149,56 @@ test('a truncated stream preserves partial text and allows recovery', async ({ p
   await expect(history.getByText('未完成', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveValue('Interrupted question');
+});
+
+test('a length finish reason marks the answer as truncated', async ({ page }) => {
+  await mockAdmin(page, { lengthStop: true });
+  await openChat(page);
+  await send(page, 'Long question');
+  const history = page.getByLabel('聊天记录');
+  await expect(history.locator('strong')).toHaveText('Reply 1');
+  await expect(history.getByText('已截断', { exact: true })).toBeVisible();
+  // The stream completed cleanly, so this is not the dropped-connection case.
+  await expect(page.locator('.chat-error')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+});
+
+test('a remote-only transcript hides the controls that need a local row', async ({ page }) => {
+  await mockAdmin(page, { remoteOnly: true });
+  await openChat(page);
+  const label = 'Notion 上的历史对话';
+  const sidebar = page.getByLabel('历史会话');
+  // The sidebar is an off-canvas drawer on narrow viewports, so it has to be
+  // opened before any of its controls are in the accessibility tree.
+  await openChatNavigation(page);
+
+  // Rename and delete both write to the bridge's own store, which holds no row
+  // for this transcript, so offering them would mean failing on save.
+  await expect(sidebar.getByRole('button', { name: `重命名 ${label}` })).toHaveCount(0);
+  await expect(sidebar.getByRole('button', { name: `删除 ${label}` })).toHaveCount(0);
+  // Export only reads, so it stays available.
+  await expect(sidebar.getByRole('button', { name: `导出 ${label}` })).toBeVisible();
+
+  await sidebar.getByRole('button', { name: label, exact: true }).click();
+  const history = page.getByLabel('聊天记录');
+  await expect(history.getByText('Notion 里的回答')).toBeVisible();
+  await expect(history.getByRole('button', { name: '编辑消息' }).first()).toBeDisabled();
+});
+
+test('a locally stored conversation keeps its rename and delete controls', async ({ page }) => {
+  await mockAdmin(page);
+  await openChat(page);
+  await send(page, 'A question that creates a local row');
+  await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+  // Check the transcript first: on mobile the sidebar is an overlay that takes
+  // the main pane out of the accessibility tree while it is open.
+  const history = page.getByLabel('聊天记录');
+  await expect(history.getByRole('button', { name: '编辑消息' }).first()).toBeEnabled();
+  const sidebar = page.getByLabel('历史会话');
+  await openChatNavigation(page);
+  // The gating must be specific to remote-only transcripts.
+  await expect(sidebar.getByRole('button', { name: /^重命名 / }).first()).toBeEnabled();
+  await expect(sidebar.getByRole('button', { name: /^删除 / }).first()).toBeEnabled();
 });
 
 test('new chats select an eligible workspace and existing chats keep their owner', async ({ page }) => {

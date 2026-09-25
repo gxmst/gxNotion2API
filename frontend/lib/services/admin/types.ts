@@ -353,7 +353,7 @@ export interface ChatRunInput {
   conversation_id?: string;
 }
 
-export interface ChatRunResult { conversation_id: string; text: string }
+export interface ChatRunResult { conversation_id: string; text: string; truncated?: boolean }
 
 export interface ConversationMessageAttachment {
   name?: string;
@@ -376,6 +376,8 @@ export interface ConversationMessage {
   updated_at?: string;
   /** Set when an operator rewrote the text, so the UI can mark it as edited. */
   edited_at?: string;
+  /** Set when the upstream stream ended before the answer was finished. */
+  truncated?: boolean;
   /**
    * Set on process entries (role "step") and on attachment steps. The raw
    * upstream type is passed through, so the UI labels it without depending on
@@ -394,6 +396,12 @@ export interface ConversationMutationPayload {
 export interface ConversationSummary {
   id: string;
   title?: string;
+  /**
+   * Marks a title an operator set by hand. A remote merge only overwrites a
+   * title when this is absent, so the sidebar keeps an explicit rename instead
+   * of reverting to the title Notion generated for the thread.
+   */
+  title_edited_at?: string;
   origin?: 'local' | 'notion' | 'merged' | string;
   remote_only?: boolean;
   preview?: string;

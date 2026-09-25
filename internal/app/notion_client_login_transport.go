@@ -15,7 +15,6 @@ type loginTransportRequest struct {
 	Headers          map[string]string `json:"headers"`
 	Body             string            `json:"body,omitempty"`
 	Cookies          []ProbeCookie     `json:"cookies"`
-	BrowserProfile   string            `json:"browser_profile,omitempty"`
 	Proxy            string            `json:"proxy,omitempty"`
 	RequestTimeoutMS int               `json:"request_timeout_ms"`
 }
@@ -100,7 +99,6 @@ func buildLoginTransportRequest(session *loginHTTPSession, method string, target
 		Headers:          cleanHeaders,
 		Body:             string(body),
 		Cookies:          cookies,
-		BrowserProfile:   notionTransportDefaultBrowserProfile,
 		Proxy:            proxyValue,
 		RequestTimeoutMS: timeoutMS,
 	}, nil

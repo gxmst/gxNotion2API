@@ -68,13 +68,18 @@ export const AdminService = {
   },
   async streamTestPrompt(payload: ChatRunInput, onDelta: (text: string) => void, signal: AbortSignal): Promise<ChatRunResult> {
     let text = '';
+    let truncated = false;
     const headers = await apiEventStream('/admin/test', { ...payload, stream: true }, (data) => {
       const event = JSON.parse(data);
       if (event.error) throw new Error(event.error.message || '生成失败');
-      const delta = event.choices?.[0]?.delta?.content;
+      const choice = event.choices?.[0];
+      // A length stop means the upstream stream ended before the answer did, so
+      // the transcript must say so instead of presenting it as complete.
+      if (choice?.finish_reason === 'length') truncated = true;
+      const delta = choice?.delta?.content;
       if (typeof delta === 'string') { text += delta; onDelta(delta); }
     }, signal);
-    return { conversation_id: headers.get('x-conversation-id') || payload.conversation_id || '', text };
+    return { conversation_id: headers.get('x-conversation-id') || payload.conversation_id || '', text, truncated };
   },
   getConversations() {
     return apiFetch<ConversationsPayload>('/admin/conversations');

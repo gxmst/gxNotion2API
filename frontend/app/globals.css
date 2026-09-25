@@ -114,6 +114,8 @@
 .chat-user .chat-message-actions { opacity: 0; }.chat-user:hover .chat-message-actions, .chat-user:focus-within .chat-message-actions { opacity: 1; }
 .chat-message-actions .chat-icon { width: 26px; height: 26px; }
 .chat-edited, .chat-token-hint { color: var(--chat-soft); opacity: .85; white-space: nowrap; }
+/* A truncated answer is still shown, but it must not read as complete. */
+.chat-truncated { color: #b45309; white-space: nowrap; }
 .chat-token-total { color: var(--chat-soft); font-size: 10px; white-space: nowrap; opacity: .8; }
 /* An inline edit replaces the rendered bubble in place, so the transcript keeps
    its shape and the reader never loses their position in the thread. */

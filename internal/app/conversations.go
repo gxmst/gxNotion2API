@@ -55,11 +55,18 @@ type ConversationMessage struct {
 	// mapped onto a fixed vocabulary, so an unfamiliar step still renders with
 	// its own name rather than being dropped or mislabelled.
 	StepType string `json:"step_type,omitempty"`
+	// Truncated marks an assistant message whose upstream stream ended before
+	// the answer was finished, so a reopened transcript still says so.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 type ConversationEntry struct {
-	ID                 string                   `json:"id"`
-	Title              string                   `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// TitleEditedAt marks a title an operator set by hand. Remote merges only
+	// overwrite a title when it is absent or still machine-generated, so an
+	// explicit rename is not silently reverted to Notion's thread title.
+	TitleEditedAt      *time.Time               `json:"title_edited_at,omitempty"`
 	Origin             string                   `json:"origin,omitempty"`
 	RemoteOnly         bool                     `json:"remote_only,omitempty"`
 	Ephemeral          bool                     `json:"ephemeral,omitempty"`
@@ -94,8 +101,11 @@ type ConversationEntry struct {
 }
 
 type ConversationSummary struct {
-	ID                    string     `json:"id"`
-	Title                 string     `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// TitleEditedAt marks a title an operator set by hand, so a remote merge
+	// does not silently revert an explicit rename.
+	TitleEditedAt         *time.Time `json:"title_edited_at,omitempty"`
 	Origin                string     `json:"origin,omitempty"`
 	RemoteOnly            bool       `json:"remote_only,omitempty"`
 	Ephemeral             bool       `json:"ephemeral,omitempty"`
@@ -417,6 +427,7 @@ func buildConversationSummary(entry *ConversationEntry) ConversationSummary {
 	return ConversationSummary{
 		ID:                    entry.ID,
 		Title:                 entry.Title,
+		TitleEditedAt:         cloneTimePointer(entry.TitleEditedAt),
 		Origin:                firstNonEmpty(strings.TrimSpace(entry.Origin), "local"),
 		RemoteOnly:            entry.RemoteOnly,
 		Ephemeral:             entry.Ephemeral,
@@ -868,6 +879,7 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 		assistant := s.ensureAssistantMessageLocked(&next, now)
 		assistant.ID = firstNonEmpty(strings.TrimSpace(result.MessageID), assistant.ID)
 		assistant.Status = "completed"
+		assistant.Truncated = result.Truncated
 		assistant.Content = sanitizeAssistantVisibleText(result.Text)
 		assistant.RequestedModel = firstNonEmpty(result.Model, next.Model)
 		assistant.ModelSelectionMode = result.ModelSelectionMode
@@ -1171,6 +1183,7 @@ func (s *ConversationStore) SetTitle(conversationID string, title string) (Conve
 	}
 	next := cloneConversationEntry(entry)
 	next.Title = title
+	next.TitleEditedAt = timePointer(now)
 	next.UpdatedAt = now
 	s.items[conversationID] = &next
 	summary := buildConversationSummary(&next)
