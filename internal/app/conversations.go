@@ -35,6 +35,9 @@ type ConversationAttachment struct {
 }
 
 type ConversationMessage struct {
+	// UpstreamMessageID pairs a local message with its Notion transcript step
+	// without changing the stable ID used by editing clients.
+	UpstreamMessageID  string                   `json:"upstream_message_id,omitempty"`
 	RequestedModel     string                   `json:"requested_model,omitempty"`
 	ModelSelectionMode string                   `json:"model_selection_mode,omitempty"`
 	ModelObservations  []ModelObservation       `json:"model_observations,omitempty"`
@@ -553,10 +556,15 @@ func (s *ConversationStore) moveToFrontLocked(id string) {
 }
 
 func (s *ConversationStore) trimLocked() {
-	for len(s.order) > maxConversationEntries {
-		last := s.order[len(s.order)-1]
-		delete(s.items, last)
-		s.order = s.order[:len(s.order)-1]
+	for i := len(s.order) - 1; len(s.order) > maxConversationEntries && i >= 0; i-- {
+		id := s.order[i]
+		// A running turn or deletion claim must remain the single owner of
+		// its thread until it finishes, even under cache pressure.
+		if entry := s.items[id]; entry != nil && (conversationStatusBusy(entry.Status) || entry.Status == "deleting") {
+			continue
+		}
+		delete(s.items, id)
+		s.order = append(s.order[:i], s.order[i+1:]...)
 	}
 }
 
@@ -876,6 +884,14 @@ func (s *ConversationStore) Complete(conversationID string, result InferenceResu
 		next.SpaceViewID = firstNonEmpty(result.SpaceViewID, next.SpaceViewID)
 		next.Error = ""
 		next.OutputAttachments = cloneUploadedAttachments(result.Attachments)
+		if userID := strings.TrimSpace(result.UserMessageID); userID != "" {
+			for i := len(next.Messages) - 1; i >= 0; i-- {
+				if next.Messages[i].Role == "user" {
+					next.Messages[i].UpstreamMessageID = userID
+					break
+				}
+			}
+		}
 		assistant := s.ensureAssistantMessageLocked(&next, now)
 		assistant.ID = firstNonEmpty(strings.TrimSpace(result.MessageID), assistant.ID)
 		assistant.Status = "completed"
@@ -1416,6 +1432,50 @@ func (s *ServerState) conversations() *ConversationStore {
 	return store
 }
 
+// loadConversation restores a cache miss from SQLite before callers inspect
+// history or start a turn. Holding mu through the read prevents two restores
+// from replacing a live entry with the same stale snapshot.
+func (s *ServerState) loadConversation(id string) (ConversationEntry, bool, error) {
+	id = strings.TrimSpace(id)
+	convs := s.conversations()
+	if entry, ok := convs.Get(id); ok || id == "" {
+		return entry, ok, nil
+	}
+	s.mu.RLock()
+	store := s.Store
+	enabled := conversationSnapshotsPersistenceEnabled(s.Config)
+	s.mu.RUnlock()
+	if store == nil || !enabled {
+		return ConversationEntry{}, false, nil
+	}
+	convs.mu.Lock()
+	defer convs.mu.Unlock()
+	if entry := convs.items[id]; entry != nil {
+		return copyConversationEntryValue(entry), true, nil
+	}
+	entry, found, err := store.LoadConversation(id)
+	if err != nil || !found {
+		return ConversationEntry{}, found, err
+	}
+	// Active entries cannot be evicted. A busy persisted-only record is an
+	// interrupted turn from a previous process, including rows beyond the
+	// startup cache limit.
+	if conversationStatusBusy(entry.Status) || entry.Status == "deleting" {
+		entry.Status = "failed"
+		entry.Error = "turn was interrupted by a restart"
+		for i := range entry.Messages {
+			if entry.Messages[i].Status == "streaming" || entry.Messages[i].Status == "running" {
+				entry.Messages[i].Status = "failed"
+			}
+		}
+	}
+	refreshConversationDerivedFields(&entry)
+	convs.items[id] = &entry
+	convs.moveToFrontLocked(id)
+	convs.trimLocked()
+	return copyConversationEntryValue(&entry), true, nil
+}
+
 // persistConversationSnapshot writes the conversation's current state to
 // SQLite. Writes are serialised and each one reads the entry inside the
 // critical section, so an older snapshot can never land after a newer one.
@@ -1810,9 +1870,12 @@ func (a *App) deleteConversation(conversationID string) error {
 	if conversationID == "" {
 		return fmt.Errorf("conversation id is required")
 	}
-	entry, ok := a.State.conversations().Get(conversationID)
+	entry, ok, err := a.State.loadConversation(conversationID)
+	if err != nil {
+		return err
+	}
 	if !ok {
-		return a.deletePersistedConversation(conversationID)
+		return fmt.Errorf("conversation not found")
 	}
 	if conversationStatusBusy(entry.Status) {
 		return fmt.Errorf("conversation is still running")
@@ -1828,35 +1891,19 @@ func (a *App) deleteConversation(conversationID string) error {
 		_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 		return err
 	}
-	if err := a.State.conversations().Delete(conversationID); err != nil {
+	// Retain the in-memory deletion claim until the durable row is gone,
+	// so a simultaneous cache restore cannot resurrect it.
+	if err := a.deleteConversationLocalRecords(conversationID, entry.ThreadID); err != nil {
+		_ = a.State.conversations().RestoreDeletionClaim(conversationID, previousStatus)
 		return err
 	}
-	return a.deleteConversationLocalRecords(conversationID, entry.ThreadID)
+	return a.State.conversations().Delete(conversationID)
 }
 
-// deletePersistedConversation deletes a conversation that exists only in
-// SQLite. No turn can be running on it: every turn executes against the
-// in-memory entry, so a "running" status here is stale from a crash.
+// Durable-only entries use the same restoration and deletion claim as cached
+// conversations, so a concurrent continuation cannot bypass the claim.
 func (a *App) deletePersistedConversation(conversationID string) error {
-	store := a.State.conversationPersistenceStore()
-	if store == nil {
-		return fmt.Errorf("conversation not found")
-	}
-	entry, found, err := store.LoadConversation(conversationID)
-	if err != nil {
-		return err
-	}
-	if !found {
-		return fmt.Errorf("conversation not found")
-	}
-	if a.State.conversations().Contains(conversationID) {
-		// A turn recreated it in memory meanwhile; go through the claim path.
-		return a.deleteConversation(conversationID)
-	}
-	if err := a.deleteConversationThread(entry); err != nil {
-		return err
-	}
-	return a.deleteConversationLocalRecords(conversationID, entry.ThreadID)
+	return a.deleteConversation(conversationID)
 }
 
 // deleteConversationThread deletes the upstream thread of a conversation. It

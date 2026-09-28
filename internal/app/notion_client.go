@@ -259,6 +259,7 @@ type UploadedAttachment struct {
 }
 
 type InferenceResult struct {
+	UserMessageID      string               `json:"user_message_id,omitempty"`
 	ModelSelectionMode string               `json:"model_selection_mode,omitempty"`
 	ModelObservations  []ModelObservation   `json:"model_observations,omitempty"`
 	Prompt             string               `json:"prompt"`
@@ -3693,6 +3694,7 @@ func (c *NotionAIClient) doMultipartUpload(ctx context.Context, uploadURL string
 }
 
 type inferencePayloadMeta struct {
+	UserMessageID    string
 	ConfigID         string
 	ContextID        string
 	OriginalDatetime string
@@ -4140,6 +4142,7 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 		payload["attachments"] = attachmentPayloads
 	}
 	return payload, inferencePayloadMeta{
+		UserMessageID:    userStepID,
 		ConfigID:         configID,
 		ContextID:        contextID,
 		OriginalDatetime: originalDatetime,
@@ -4357,6 +4360,7 @@ func (c *NotionAIClient) RunPrompt(ctx context.Context, req PromptRunRequest) (I
 		RawMessageIDs:      messageIDs,
 		Attachments:        uploadedAttachments,
 		ConfigID:           meta.ConfigID,
+		UserMessageID:      meta.UserMessageID,
 		ContextID:          meta.ContextID,
 		OriginalDatetime:   meta.OriginalDatetime,
 		Truncated:          truncated,
@@ -4423,6 +4427,7 @@ func (c *NotionAIClient) RunPromptStreamWithSink(ctx context.Context, req Prompt
 		RawMessageIDs:      messageIDs,
 		Attachments:        uploadedAttachments,
 		ConfigID:           meta.ConfigID,
+		UserMessageID:      meta.UserMessageID,
 		ContextID:          meta.ContextID,
 		OriginalDatetime:   meta.OriginalDatetime,
 		Truncated:          truncated,

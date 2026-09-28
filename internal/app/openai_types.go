@@ -34,6 +34,7 @@ type chatCompletionsRequestBody struct {
 }
 
 type responsesRequestBody struct {
+	Instructions       string `json:"instructions,omitempty"`
 	Model              string `json:"model,omitempty"`
 	Stream             bool   `json:"stream,omitempty"`
 	PreviousResponseID string `json:"previous_response_id,omitempty"`
@@ -162,6 +163,7 @@ func extractResponsesRequestBody(payload map[string]any) responsesRequestBody {
 		return responsesRequestBody{}
 	}
 	body := responsesRequestBody{
+		Instructions:       stringValue(payload["instructions"]),
 		Model:              strings.TrimSpace(stringValue(payload["model"])),
 		PreviousResponseID: strings.TrimSpace(stringValue(payload["previous_response_id"])),
 		ConversationID:     strings.TrimSpace(stringValue(payload["conversation_id"])),

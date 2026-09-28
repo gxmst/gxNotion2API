@@ -449,7 +449,10 @@ func conversationSegmentsEqual(a []conversationPromptSegment, b []conversationPr
 	return true
 }
 
-func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string]any, ctx sillyTavernContext, fingerprint string, clientScope string) (sillyTavernContinuationMatch, bool) {
+func (a *App) resolveSillyTavernContinuation(r *http.Request, payload map[string]any, ctx sillyTavernContext, fingerprint string, clientScope string) (match sillyTavernContinuationMatch, found bool) {
+	defer func() {
+		match.Target, found = a.restoreContinuationTarget(match.Target, found)
+	}()
 	if ctx.Mode == sillyTavernModeQuiet || ctx.Mode == sillyTavernModeImpersona {
 		return sillyTavernContinuationMatch{}, false
 	}

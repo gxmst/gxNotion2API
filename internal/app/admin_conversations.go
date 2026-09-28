@@ -112,6 +112,66 @@ func mergeConversationSummary(local ConversationSummary, remote ConversationSumm
 	return out
 }
 
+// precedingTurnUser finds a single user text step in the turn immediately
+// before an assistant. Ambiguous turns are left unmatched; positional pairing
+// across whole transcripts would attach edits to unrelated imported history.
+func precedingTurnUser(messages []ConversationMessage, assistantIndex int) (ConversationMessage, bool) {
+	var user ConversationMessage
+	for i := assistantIndex - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role == "assistant" {
+			break
+		}
+		if message.Role != "user" || message.StepType == "attachment" {
+			continue
+		}
+		if user.ID != "" {
+			return ConversationMessage{}, false
+		}
+		user = message
+	}
+	return user, user.ID != ""
+}
+
+func conversationMergeMessages(local, remote ConversationEntry) map[string]ConversationMessage {
+	messages := make(map[string]ConversationMessage, len(local.Messages)*2)
+	assistantIndexes := map[string]int{}
+	for i, message := range local.Messages {
+		for _, id := range []string{message.ID, message.UpstreamMessageID} {
+			if id != "" {
+				messages[id] = message
+				if message.Role == "assistant" {
+					assistantIndexes[id] = i
+				}
+			}
+		}
+	}
+	if local.Status == "completed" && local.MessageID != "" && len(local.Messages) > 0 {
+		i := len(local.Messages) - 1
+		if last := local.Messages[i]; last.Role == "assistant" {
+			messages[local.MessageID] = last
+			assistantIndexes[local.MessageID] = i
+		}
+	}
+	// Older snapshots lack user step IDs. A shared assistant ID anchors the
+	// same turn on both sides, including when the preceding user text was edited.
+	for i, message := range remote.Messages {
+		localIndex, ok := assistantIndexes[message.ID]
+		if !ok || message.Role != "assistant" {
+			continue
+		}
+		localUser, localOK := precedingTurnUser(local.Messages, localIndex)
+		remoteUser, remoteOK := precedingTurnUser(remote.Messages, i)
+		if !localOK || !remoteOK || localUser.UpstreamMessageID != "" {
+			continue
+		}
+		if _, exists := messages[remoteUser.ID]; !exists {
+			messages[remoteUser.ID] = localUser
+		}
+	}
+	return messages
+}
+
 func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) ConversationEntry {
 	out := local
 	out.Origin = "merged"
@@ -127,24 +187,13 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 	out.UpdatedAt = mergeConversationTimes(out.UpdatedAt, remote.UpdatedAt, true)
 	out.CreatedByDisplay = firstNonEmpty(strings.TrimSpace(remote.CreatedByDisplay), strings.TrimSpace(out.CreatedByDisplay))
 	if len(remote.Messages) > 0 {
-		localMessages := make(map[string]ConversationMessage, len(local.Messages))
-		for _, message := range local.Messages {
-			if message.ID != "" {
-				localMessages[message.ID] = message
-			}
-		}
-		// Older local records used a synthetic assistant ID. The final upstream
-		// message ID is still available on a completed conversation.
-		if local.Status == "completed" && local.MessageID != "" && len(local.Messages) > 0 {
-			last := local.Messages[len(local.Messages)-1]
-			if last.Role == "assistant" {
-				localMessages[local.MessageID] = last
-			}
-		}
+		localMessages := conversationMergeMessages(local, remote)
 		out.Messages = make([]ConversationMessage, len(remote.Messages))
 		for i, message := range remote.Messages {
 			message = cloneConversationMessage(message)
 			if prior, ok := localMessages[message.ID]; ok && prior.Role == message.Role {
+				message.UpstreamMessageID = message.ID
+				message.ID = prior.ID
 				message.RequestedModel = firstNonEmpty(prior.RequestedModel, message.RequestedModel)
 				message.ModelSelectionMode = firstNonEmpty(prior.ModelSelectionMode, message.ModelSelectionMode)
 				message.ModelObservations = mergeModelObservations(prior.ModelObservations, message.ModelObservations)
@@ -330,7 +379,12 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 		cfg, _, _ := a.State.Snapshot()
 		timedRequest, cancel := cloneRequestWithTimeout(r, adminSyncRequestTimeout(cfg))
 		defer cancel()
-		if item, ok := a.State.conversations().Get(conversationID); ok {
+		item, ok, loadErr := a.State.loadConversation(conversationID)
+		if loadErr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
+			return
+		}
+		if ok {
 			if strings.TrimSpace(item.Origin) == "" {
 				item.Origin = "local"
 			}

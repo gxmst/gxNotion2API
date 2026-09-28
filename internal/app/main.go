@@ -132,7 +132,7 @@ const (
 	// into idle cleanup; ephemeral conversations retain their separate policy.
 	defaultConversationIdleTTLHours = 0
 	corsAllowOrigin                 = "*"
-	corsAllowHeaders                = "Authorization, Content-Type, X-Admin-Token"
+	corsAllowHeaders                = "Authorization, Content-Type, X-Admin-Token, X-Client-ID, X-Session-ID, OpenAI-Organization, X-Conversation-ID, X-Notion-Conversation-ID, X-Thread-ID, X-Notion-Thread-ID, X-Account-Email, X-Notion-Account-Email, X-Workspace-ID, X-Notion-Workspace-ID, X-Notion-Space-ID"
 	corsAllowMethods                = "GET, POST, PUT, DELETE, OPTIONS"
 )
 
@@ -143,6 +143,7 @@ var testHookResponseStoreCleanupInterval time.Duration
 type continuationTarget struct {
 	Conversation ConversationEntry
 	Session      *conversationContinuationState
+	Err          error
 }
 
 type panicSafeResponseWriter struct {
@@ -1754,7 +1755,25 @@ func replayResultFromConversation(conversation ConversationEntry) *InferenceResu
 // fingerprint the caller will also persist on the session; recomputing it here
 // from a hidden prompt would produce a different key and silently kill the
 // fingerprint hit path.
-func (a *App) resolveContinuationConversationWithExplicit(previousResponseID string, fingerprint string, clientScope string, segments []conversationPromptSegment, explicitConversationID string, explicitThreadID string) (continuationTarget, bool) {
+func (a *App) resolveContinuationConversationWithExplicit(previousResponseID string, fingerprint string, clientScope string, segments []conversationPromptSegment, explicitConversationID string, explicitThreadID string) (target continuationTarget, found bool) {
+	var loadErr error
+	lookup := func(id string) (ConversationEntry, bool) {
+		entry, ok, err := a.State.loadConversation(id)
+		if err != nil {
+			loadErr = err
+		}
+		return entry, ok
+	}
+	defer func() {
+		if loadErr != nil {
+			target, found = continuationTarget{Err: loadErr}, true
+			return
+		}
+		target, found = a.restoreContinuationTarget(target, found)
+		if found && target.Err == nil && len(target.Conversation.Messages) > 0 && (explicitConversationID != "" || explicitThreadID != "") && !conversationHistoryCompatible(target.Conversation, segments, true) {
+			target, found = continuationTarget{}, false
+		}
+	}()
 	rawCount := sessionRawMessageCount(segments)
 	validateState := func(state *conversationContinuationState) bool {
 		if state == nil {
@@ -1766,7 +1785,7 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 		return true
 	}
 	if explicitConversationID != "" {
-		if entry, ok := a.State.conversations().Get(explicitConversationID); ok && strings.TrimSpace(entry.ThreadID) != "" {
+		if entry, ok := lookup(explicitConversationID); ok && strings.TrimSpace(entry.ThreadID) != "" {
 			if !conversationHistoryCompatible(entry, segments, true) {
 				return continuationTarget{}, false
 			}
@@ -1806,7 +1825,7 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 	if previousResponseID != "" {
 		if stored, ok := a.State.getContinuationResponse(previousResponseID); ok {
 			if stored.ConversationID != "" {
-				if entry, found := a.State.conversations().Get(stored.ConversationID); found && strings.TrimSpace(entry.ThreadID) != "" {
+				if entry, found := lookup(stored.ConversationID); found && strings.TrimSpace(entry.ThreadID) != "" {
 					if strings.TrimSpace(entry.AccountEmail) == "" {
 						entry.AccountEmail = strings.TrimSpace(stored.AccountEmail)
 					}
@@ -1894,7 +1913,7 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 					ThreadID:     strings.TrimSpace(state.Session.ThreadID),
 					AccountEmail: strings.TrimSpace(state.Session.AccountEmail),
 				}
-				if existing, ok := a.State.conversations().Get(entry.ID); ok {
+				if existing, ok := lookup(entry.ID); ok {
 					entry = existing
 				}
 				if conversationHistoryCompatible(entry, segments, false) {
@@ -1929,13 +1948,10 @@ func (a *App) resolveContinuationConversationWithExplicit(previousResponseID str
 // the same thread in parallel.
 func (a *App) startConversationTurn(existingConversationID string, preferredConversationID string, source string, transport string, displayPrompt string, request PromptRunRequest) (string, error) {
 	if existingConversationID != "" && (strings.TrimSpace(request.UpstreamThreadID) != "" || request.ForceLocalConversationContinue) {
-		conversationID, err := a.continueConversation(existingConversationID, source, transport, displayPrompt, request)
-		if err == nil {
-			return conversationID, nil
-		}
-		if isConversationTurnConflict(err) {
+		if _, _, err := a.State.loadConversation(existingConversationID); err != nil {
 			return "", err
 		}
+		return a.continueConversation(existingConversationID, source, transport, displayPrompt, request)
 	}
 	return a.beginConversation(preferredConversationID, source, transport, displayPrompt, request), nil
 }
@@ -2390,6 +2406,10 @@ func (a *App) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
 	if matched, ok := a.resolveContinuationConversationWithExplicit("", originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+		if matched.Err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to load conversation", "api_error", "conversation_load_failed")
+			return
+		}
 		conversation = matched.Conversation
 		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
 			writeOpenAIError(w, http.StatusBadRequest, errConversationWorkspaceMismatch.Error(), "invalid_request_error", "conversation_workspace_mismatch")
@@ -2516,6 +2536,10 @@ func (a *App) handleSillyTavernChatCompletionsPayload(w http.ResponseWriter, r *
 	preferredConversationID := requestedConversationID(r, payload)
 	conversation := ConversationEntry{}
 	if matched, ok := a.resolveSillyTavernContinuation(r, payload, ctx, originalFingerprint, continuationScope); ok {
+		if matched.Target.Err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to load conversation", "api_error", "conversation_load_failed")
+			return
+		}
 		request.SuppressUpstreamThreadPersistence = matched.SuppressPersist
 		conversation = matched.Target.Conversation
 		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
@@ -2623,7 +2647,7 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	normalized, err := normalizeResponsesInputFromParts(typed.Input, typed.Attachments, previousResponse)
+	normalized, err := normalizeResponsesInputWithInstructions(typed.Input, typed.Attachments, previousResponse, typed.Instructions)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, err.Error(), "invalid_request_error", nilString())
 		return
@@ -2667,6 +2691,10 @@ func (a *App) handleResponses(w http.ResponseWriter, r *http.Request) {
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
 	conversation := ConversationEntry{}
 	if matched, ok := a.resolveContinuationConversationWithExplicit(previousResponseID, originalFingerprint, continuationScope, normalized.Segments, preferredConversationID, explicitThreadID); ok {
+		if matched.Err != nil {
+			writeOpenAIError(w, http.StatusInternalServerError, "failed to load conversation", "api_error", "conversation_load_failed")
+			return
+		}
 		conversation = matched.Conversation
 		if requestedWorkspace != "" && requestedWorkspace != strings.TrimSpace(conversation.SpaceID) {
 			writeOpenAIError(w, http.StatusBadRequest, errConversationWorkspaceMismatch.Error(), "invalid_request_error", "conversation_workspace_mismatch")

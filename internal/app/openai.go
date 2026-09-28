@@ -260,7 +260,16 @@ func buildConversationTranscriptPrompt(segments []conversationPromptSegment) str
 }
 
 func normalizeResponsesInput(payload map[string]any, previousResponse map[string]any) (NormalizedInput, error) {
-	return normalizeResponsesInputFromParts(payload["input"], payload["attachments"], previousResponse)
+	return normalizeResponsesInputWithInstructions(payload["input"], payload["attachments"], previousResponse, stringValue(payload["instructions"]))
+}
+
+func normalizeResponsesInputWithInstructions(input, attachments any, previousResponse map[string]any, instructions string) (NormalizedInput, error) {
+	normalized, err := normalizeResponsesInputFromParts(input, attachments, previousResponse)
+	if err != nil {
+		return NormalizedInput{}, err
+	}
+	normalized.HiddenPrompt = strings.TrimSpace(strings.Join([]string{strings.TrimSpace(instructions), normalized.HiddenPrompt}, "\n\n"))
+	return normalized, nil
 }
 
 func normalizeResponsesInputFromParts(rawInput any, attachmentsRaw any, previousResponse map[string]any) (NormalizedInput, error) {

@@ -59,6 +59,26 @@ func continuationTargetWithSession(entry ConversationEntry, state *conversationC
 	return continuationTarget{Conversation: entry, Session: state}
 }
 
+func (a *App) restoreContinuationTarget(target continuationTarget, found bool) (continuationTarget, bool) {
+	if !found || target.Err != nil || target.Conversation.ID == "" {
+		return target, found
+	}
+	entry, exists, err := a.State.loadConversation(target.Conversation.ID)
+	if err != nil {
+		return continuationTarget{Err: err}, true
+	}
+	if exists {
+		entry.AccountEmail = firstNonEmpty(entry.AccountEmail, target.Conversation.AccountEmail)
+		entry.SpaceID = firstNonEmpty(entry.SpaceID, target.Conversation.SpaceID)
+		entry.SpaceViewID = firstNonEmpty(entry.SpaceViewID, target.Conversation.SpaceViewID)
+		return continuationTargetWithSession(entry, target.Session), true
+	}
+	if a.conversationDeleted(target.Conversation.ID) {
+		return continuationTarget{}, false
+	}
+	return target, true
+}
+
 func canonicalConversationFingerprintScoped(scope string, hiddenPrompt string, segments []conversationPromptSegment) string {
 	h := sha256.New()
 	if cleanScope := collapseWhitespace(scope); cleanScope != "" {

@@ -48,8 +48,8 @@ func (s *ServerState) getContinuationResponse(id string) (StoredResponse, bool) 
 	if !ok || record.ConversationID == "" {
 		return StoredResponse{}, false
 	}
-	entry, exists := s.conversations().Get(record.ConversationID)
-	return record, exists && entry.ThreadID != "" && entry.ThreadID == record.ThreadID
+	entry, exists, err := s.loadConversation(record.ConversationID)
+	return record, err == nil && exists && entry.ThreadID != "" && entry.ThreadID == record.ThreadID
 }
 
 type responseExpiryEntry struct {

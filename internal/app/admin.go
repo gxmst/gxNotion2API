@@ -942,6 +942,10 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	conversation := ConversationEntry{}
 	if preferredConversationID != "" {
 		if matched, ok := a.resolveContinuationConversation(r, payload, "", "", nil); ok {
+			if matched.Err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
+				return
+			}
 			conversation = matched.Conversation
 			if _, err := resolveContinuationAccount(cfg, conversation.ThreadID, request.PinnedAccountEmail, conversation); err != nil {
 				writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
