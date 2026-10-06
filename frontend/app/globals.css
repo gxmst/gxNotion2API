@@ -182,8 +182,8 @@
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) + 4px);
-  --font-sans: var(--font-jakarta), "Plus Jakarta Sans", "Inter", "Noto Sans SC", "Microsoft YaHei UI", system-ui, sans-serif;
-  --font-mono: var(--font-jetbrains), "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  --font-sans: system-ui, -apple-system, "Segoe UI", "Noto Sans SC", "Microsoft YaHei UI", sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", Consolas, "Liberation Mono", monospace;
 }
 
 
