@@ -141,3 +141,37 @@ test('failed note switch clears the previous reference', async ({ page }) => {
   await expect(dialog.getByRole('button', { name: '引用到输入框' })).toHaveCount(0);
   await expect(dialog).not.toContainText('旧正文');
 });
+
+
+test('notes remain available for a conversation without workspace metadata', async ({ page }) => {
+  await fixture(page);
+  const sources: string[] = [];
+  await page.route('**/admin/notes?**', async (route) => {
+    sources.push(new URL(route.request().url()).searchParams.get('source') || 'shared');
+    await route.fulfill({ json: { items: [{ id: 'private-page', title: '私人笔记' }] } });
+  });
+  await page.goto('/admin?tab=tester');
+  if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航', exact: true }).click();
+  await page.locator('.chat-conversation-open:visible').first().click();
+  await page.getByRole('button', { name: '工作区笔记', exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: '工作区笔记', exact: true });
+  await expect(dialog.getByRole('combobox', { name: '笔记工作区' })).toBeEnabled();
+  await dialog.getByRole('combobox', { name: '笔记范围' }).click();
+  await page.getByRole('option', { name: '私人页面', exact: true }).click();
+  expect(sources).toHaveLength(0);
+  await dialog.getByRole('button', { name: '读取笔记', exact: true }).click();
+  await expect(dialog.getByRole('button', { name: '私人笔记', exact: true })).toBeVisible();
+  expect(sources).toEqual(['private']);
+});
+
+test('empty composer uses one line and grows with text', async ({ page }) => {
+  await fixture(page);
+  await page.goto('/admin?tab=tester');
+  const input = page.getByRole('textbox', { name: '消息', exact: true });
+  await expect(input).toBeVisible();
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThan(40);
+  await input.fill('第一行\n第二行\n第三行');
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeGreaterThan(65);
+  await input.fill('');
+  await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThan(40);
+});

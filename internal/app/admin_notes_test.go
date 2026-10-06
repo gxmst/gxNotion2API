@@ -93,3 +93,16 @@ func TestAdminNotesReadOnlyAndCache(t *testing.T) {
 		t.Fatal("Retry-After cooldown was not respected")
 	}
 }
+
+func TestPrivateNoteListScopesAndDeduplicates(t *testing.T) {
+	records := map[string]any{"space_view": map[string]any{
+		"own":        map[string]any{"value": map[string]any{"space_id": "space", "parent_id": "user", "private_pages": []any{"page", "page", "other"}}},
+		"foreign":    map[string]any{"value": map[string]any{"space_id": "foreign", "parent_id": "user", "private_pages": []any{"hidden"}}},
+		"no-owner":   map[string]any{"value": map[string]any{"space_id": "space", "private_pages": []any{"missing-owner"}}},
+		"other-user": map[string]any{"value": map[string]any{"space_id": "space", "parent_id": "someone", "private_pages": []any{"hidden-user"}}},
+	}}
+	notes := privateNoteList(records, "space", "user")
+	if len(notes) != 2 || notes[0].ID != "page" || notes[1].ID != "other" {
+		t.Fatal("private page scope or deduplication failed")
+	}
+}

@@ -249,7 +249,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     .map((workspace) => ({ id: targetID(account.email || '', workspace.id), email: account.email || '', workspace: workspace.id,
       name: workspace.name || workspace.id, tier: workspace.subscription_tier || workspace.plan_type || '套餐待确认',
       capability: workspace.model_capabilities,
-      eligible: !account.disabled && workspace.eligible })));
+      disabled: Boolean(account.disabled), eligible: !account.disabled && workspace.eligible })));
   const targets = allTargets.filter((workspace) => workspace.eligible);
   const selectedTarget = targets.find((item) => item.id === target);
   const boundTarget = allTargets.find((item) => item.id === target);
@@ -403,7 +403,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
 
   useEffect(() => {
     const element = inputRef.current;
-    if (element && visible) { element.style.height = '0px'; element.style.height = Math.min(Math.max(element.scrollHeight, 62), 180) + 'px'; }
+    if (element && visible) { element.style.height = '0px'; element.style.height = Math.min(Math.max(element.scrollHeight, 28), 180) + 'px'; }
   }, [prompt, visible]);
 
   useEffect(() => {
@@ -715,9 +715,9 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   </div>;
 
   return <div className="chat-shell" ref={shellRef}>
-    <NotebookDialog open={notesOpen && visible} onOpenChange={setNotesOpen} targets={targets}
-      current={effectiveWorkspace} locked={Boolean(conversationID)} onReference={(note, workspace) => {
-        if (!conversationID) setTarget(workspace.id);
+    <NotebookDialog open={notesOpen && visible} onOpenChange={setNotesOpen} targets={allTargets.filter((item) => !item.disabled)}
+      current={effectiveWorkspace} referenceDisabled={running || loading || loadFailed || remoteRunning} onReference={(note, workspace) => {
+        if (!conversationID && targets.some((item) => item.id === workspace.id)) setTarget(workspace.id);
         const citation = '\n\n参考笔记：' + note.title + '\n来源：https://www.notion.so/' + note.id.replaceAll('-', '') + '\n' + (note.partial ? '（部分文本快照）\n' : '') + note.text;
         setPrompt((current) => current + citation);
         inputRef.current?.focus();
@@ -739,7 +739,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         <div className="min-w-0"><div className="chat-breadcrumb"><span className="chat-workspace-name">{boundTarget?.name || 'Notion AI'}</span><span>/</span><h1>{title}</h1></div></div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
           {running ? <span className="chat-generating"><span />生成中</span> : null}
-          {targets.length ? <button type="button" className="chat-icon" aria-label="工作区笔记" title="浏览与引用笔记" disabled={running || loading || Boolean(conversationID) && !effectiveWorkspace} onClick={() => setNotesOpen(true)}><BookOpen size={17} /></button> : null}
+          {allTargets.some((item) => !item.disabled) ? <button type="button" className="chat-icon" aria-label="工作区笔记" title="浏览与引用笔记" onClick={() => setNotesOpen(true)}><BookOpen size={17} /></button> : null}
           {targets.length ? <button type="button" className="chat-icon" aria-label="工作区模型" title="工作区模型设置" disabled={running} onClick={() => { setPolicyTarget(effectiveWorkspace?.id || targets[0]?.id || ''); setPolicyOpen(true); }}><Settings2 size={17} /></button> : null}
           {targets.length ? <div className="chat-quota">
             <button type="button" className="chat-quota-chip" aria-expanded={quotaOpen} aria-haspopup="dialog" onClick={toggleQuota}
@@ -768,13 +768,20 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           <div className="chat-starters">{['梳理思路与行动计划', '分析文档中的关键信息', '一起打磨一段文字'].map((text) => <button key={text} onClick={() => { setPrompt(text); inputRef.current?.focus(); }}>{text}<ArrowUp size={14} /></button>)}</div>
         </div> : null}
         <div className="chat-transcript">{messages.map((message, index) => {
-          // A process step is Notion's own trail (search, tool call, thinking).
-          // It is rendered as a slim marker instead of a chat bubble so it
-          // reads as context for the answer rather than as a turn of its own.
-          if ((message.role || '').toLowerCase() === 'step') return <div className="chat-step" key={message.id || index}>
-            <span className="chat-step-label">{stepLabel(message.step_type)}</span>
-            {message.content ? <span className="chat-step-text">{message.content}</span> : null}
-          </div>;
+          if ((message.role || '').toLowerCase() === 'step') {
+            if ((messages[index - 1]?.role || '').toLowerCase() === 'step') return null;
+            const steps: ConversationMessage[] = [];
+            for (let i = index; i < messages.length && (messages[i].role || '').toLowerCase() === 'step'; i++) steps.push(messages[i]);
+            return <details className="chat-process" key={message.id || index}>
+              <summary>处理过程 · {steps.length} 条记录</summary>
+              <div className="chat-process-items">{steps.map((step, i) => <details className="chat-step" key={step.id || i}>
+                <summary className="chat-step-label" title={(step.step_type || '处理步骤') + '\n' + (step.content || '上游未提供更多详情')}>
+                  {stepLabel(step.step_type)}
+                </summary>
+                <div className="chat-step-text"><strong>{step.step_type || '处理步骤'}</strong><p>{step.content || '上游未提供更多详情'}</p></div>
+              </details>)}</div>
+            </details>;
+          }
           const isUser = message.role === 'user';
           const editing = Boolean(message.id) && editingID === message.id;
           return <article key={message.id || index} className={isUser ? 'chat-message chat-user' : 'chat-message chat-assistant'}>
@@ -832,7 +839,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
           {dragging ? <div className="chat-dropzone" aria-hidden="true"><Paperclip size={18} /><span>松开即可添加文件</span></div> : null}
           {files.length ? <div className="chat-attachments">{files.map((file, index) => <span key={index} title={`${file.name} · ${formatBytes(file.size)}`}>{attachmentIsImage({ content_type: file.type, name: file.name }) ? <ImageIcon size={14} /> : <FileText size={14} />}<span>{file.name}</span><em className="chat-attachment-size">{formatBytes(file.size)}</em><button type="button" aria-label={'移除 ' + file.name} disabled={running} onClick={() => setFiles((current) => current.filter((_, i) => i !== index))}><X size={13} /></button></span>)}</div> : null}
-          <textarea ref={inputRef} aria-label="消息" placeholder="发送消息，或拖入 / 粘贴文件一起讨论…" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={loading || loadFailed || remoteRunning} rows={2}
+          <textarea ref={inputRef} aria-label="消息" placeholder="发送消息…" value={prompt} onChange={(event) => setPrompt(event.target.value)} disabled={loading || loadFailed || remoteRunning} rows={1}
             onPaste={(event) => {
               // A pasted screenshot arrives as a file, not as text. Let text
               // paste through untouched so the composer still behaves normally.

@@ -231,7 +231,8 @@ test('new chats select an eligible workspace and existing chats keep their owner
 test('visiting management keeps the active generation and unsent draft', async ({ page }) => {
   const { requests, release } = await mockAdmin(page, { deferred: true });
   const failed: string[] = [];
-  page.on('requestfailed', (request) => { if (request.url().endsWith('/admin/test')) failed.push(request.failure()?.errorText || 'failed'); });
+  let responseReleased = false;
+  page.on('requestfailed', (request) => { if (!responseReleased && request.url().endsWith('/admin/test')) failed.push(request.failure()?.errorText || 'failed'); });
   await openChat(page);
   await send(page, 'A long-running question');
   await expect.poll(() => requests.length).toBe(1);
@@ -239,6 +240,9 @@ test('visiting management keeps the active generation and unsent draft', async (
   await openChatNavigation(page);
   await page.getByRole('button', { name: /管理控制台/ }).click();
   await expect(page.getByRole('dialog')).toHaveCount(0);
+  // Closing the reader after [DONE] can report ERR_ABORTED in Chromium.
+  // Only cancellation while the response is pending indicates lost generation.
+  responseReleased = true;
   release();
   if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航菜单', exact: true }).click();
   await page.getByRole('button', { name: '聊天', exact: true }).click();

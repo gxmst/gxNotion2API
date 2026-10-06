@@ -229,12 +229,17 @@ test('row actions stay hidden until the row is hovered', async ({ page }) => {
   await expect(actions).toHaveCSS('opacity', '1');
 });
 
-test('process steps render as slim markers and token estimates are shown', async ({ page }) => {
+test('process steps are collapsed with expandable details and token estimates', async ({ page }) => {
   await mockAdmin(page);
   await openChatWithHistory(page);
   const transcript = page.getByLabel('聊天记录');
   await expect(transcript.locator('.chat-step')).toHaveCount(1);
+  await expect(transcript.locator('.chat-step-label')).not.toBeVisible();
+  await transcript.locator('.chat-process > summary').click();
   await expect(transcript.locator('.chat-step-label')).toHaveText('调用工具');
+  await expect(transcript.locator('.chat-step-label')).toHaveAttribute('title', /.+/);
+  await transcript.locator('.chat-step-label').click();
+  await expect(transcript.locator('.chat-step-text')).toBeVisible();
   // The step is context, not a chat turn, so it must not add a bubble.
   await expect(transcript.locator('article')).toHaveCount(2);
   await expect(page.locator('.chat-token-total')).toContainText('估算');

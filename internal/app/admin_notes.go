@@ -65,6 +65,41 @@ func parseNoteList(body []byte, space string) ([]noteSummary, error) {
 	}
 	return notes, nil
 }
+
+// Private page pointers come from the current user's scoped space view.
+func privateNoteList(records map[string]any, space, user string) []noteSummary {
+	notes := []noteSummary{}
+	seen := map[string]bool{}
+	blocks := mapValue(records["block"])
+	for _, raw := range mapValue(records["space_view"]) {
+		view := unwrapRecordValue(raw)
+		if user == "" || stringValue(view["space_id"]) != space || view["alive"] == false || stringValue(mapValue(mapValue(raw)["value"])["role"]) == "none" {
+			continue
+		}
+		if stringValue(view["parent_id"]) != user {
+			continue
+		}
+		for _, rawID := range sliceValue(view["private_pages"]) {
+			id := stringValue(rawID)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			title := ""
+			if block, ok := noteBlock(blocks, id, space); ok {
+				title = noteTitle(mapValue(block["properties"])["title"])
+			} else if _, exists := blocks[id]; exists {
+				continue
+			}
+			notes = append(notes, noteSummary{ID: id, Title: firstNonEmpty(title, "私人页面 · "+id[:min(8, len(id))])})
+			if len(notes) >= 100 {
+				return notes
+			}
+		}
+	}
+	return notes
+}
+
 func parseNoteDocument(body []byte, id, space string) (noteDocument, error) {
 	var payload map[string]any
 	if json.Unmarshal(body, &payload) != nil {
@@ -155,6 +190,11 @@ func (a *App) handleAdminNotes(w http.ResponseWriter, r *http.Request) {
 	}
 	email, space := strings.TrimSpace(r.URL.Query().Get("email")), strings.TrimSpace(r.URL.Query().Get("workspace_id"))
 	id := strings.TrimSpace(r.URL.Query().Get("page_id"))
+	source := r.URL.Query().Get("source")
+	if source != "" && source != "shared" && source != "private" {
+		writeJSON(w, 400, map[string]any{"detail": "未知笔记范围"})
+		return
+	}
 	if email == "" || space == "" || len(id) > 128 {
 		writeJSON(w, 400, map[string]any{"detail": "必须指定账号和工作区"})
 		return
@@ -181,6 +221,9 @@ func (a *App) handleAdminNotes(w http.ResponseWriter, r *http.Request) {
 	}
 	defer a.State.notesMu.Unlock()
 	key := canonicalEmailKey(email) + "\x00" + space + "\x00" + id
+	if id == "" && source == "private" {
+		key += "\x00private"
+	}
 	cached, exists := a.State.notesCache[key]
 	age := time.Since(cached.At)
 	force := r.URL.Query().Get("refresh") == "1"
@@ -207,8 +250,17 @@ func (a *App) handleAdminNotes(w http.ResponseWriter, r *http.Request) {
 		endpoint = "loadCachedPageChunkV2"
 		args = map[string]any{"page": map[string]any{"id": id, "spaceId": space}, "cursor": map[string]any{"stack": []any{}}, "verticalColumns": false}
 	}
-	body, err := client.postJSON(ctx, client.Config.NotionUpstream().API(endpoint), args, "application/json")
-	if err == nil {
+	var body []byte
+	if id == "" && source == "private" {
+		var records map[string]any
+		records, err = client.readModelPolicyRecords(ctx)
+		if err == nil {
+			result = map[string]any{"items": privateNoteList(records, space, client.Session.UserID), "fetched_at": time.Now().UTC(), "scope": "private_pages"}
+		}
+	} else {
+		body, err = client.postJSON(ctx, client.Config.NotionUpstream().API(endpoint), args, "application/json")
+	}
+	if err == nil && result == nil {
 		if id == "" {
 			var notes []noteSummary
 			notes, err = parseNoteList(body, space)

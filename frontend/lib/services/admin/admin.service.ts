@@ -19,8 +19,9 @@ import type {
 } from './types';
 
 export const AdminService = {
-  getNotes(email: string, workspaceID: string, refresh = false) {
+  getNotes(email: string, workspaceID: string, refresh = false, source: 'shared' | 'private' = 'shared') {
     const query = new URLSearchParams({ email, workspace_id: workspaceID });
+    query.set('source', source);
     if (refresh) query.set('refresh', '1');
     return apiFetch<{ items: Array<{ id: string; title: string }> }>('/admin/notes?' + query);
   },
