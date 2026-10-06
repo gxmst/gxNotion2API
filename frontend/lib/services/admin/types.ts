@@ -9,6 +9,7 @@ export interface ModelItem {
   family?: string;
   group?: string;
   notion_model?: string;
+  aliases?: string[];
   beta?: boolean;
   enabled?: boolean;
 }

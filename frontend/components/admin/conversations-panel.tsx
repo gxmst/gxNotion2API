@@ -19,7 +19,7 @@ import {
   StatusPill,
   formatMaybeDate,
 } from '@/components/admin/shared';
-import type { ConversationDetail, ConversationSummary } from '@/lib/services/admin/types';
+import type { ConversationDetail, ConversationSummary, ModelItem } from '@/lib/services/admin/types';
 import { cn } from '@/lib/utils';
 
 const ACCOUNT_FILTER_ALL = '__all__';
@@ -38,6 +38,7 @@ function conversationOriginLabel(origin?: string) {
 }
 
 export function ConversationsPanel({
+  models = [],
   conversations,
   selectedConversationId,
   selectedConversation,
@@ -48,6 +49,7 @@ export function ConversationsPanel({
   onBatchDelete,
   onContinue,
 }: {
+  models?: ModelItem[];
   conversations: ConversationSummary[];
   selectedConversationId: string;
   selectedConversation: ConversationDetail | ConversationSummary | null;
@@ -362,7 +364,7 @@ export function ConversationsPanel({
                           <div className="rounded-lg border bg-background px-4 py-3 text-sm leading-7 whitespace-pre-wrap break-words">
                             {message.content || '[无文本内容]'}
                           </div>
-                          <ModelEvidence message={message} />
+                          <ModelEvidence message={message} models={models} />
                           {message.attachments?.length ? (
                             <div className="mt-3">
                               <FileChips items={message.attachments} />

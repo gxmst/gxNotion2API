@@ -175,3 +175,37 @@ test('empty composer uses one line and grows with text', async ({ page }) => {
   await input.fill('');
   await expect.poll(async () => (await input.boundingBox())!.height).toBeLessThan(40);
 });
+
+
+for (const scenario of [
+  { name: 'verified Opus name without a refreshed catalog', raw: 'albuquerque-quinn', models: [], expected: 'Opus 5.5' },
+  { name: 'future model from its catalog alias', raw: 'future-runtime', models: [{ id: 'gpt-8', name: 'GPT 8', aliases: ['future-runtime'] }], expected: 'GPT 8' },
+  { name: 'live mapping takes precedence over verified names', raw: 'albuquerque-quinn', models: [{ id: 'current-opus', name: 'Opus Current', notion_model: 'albuquerque-quinn' }], expected: 'Opus Current' },
+  { name: 'contradicting provider does not get a guessed name', raw: 'future-runtime', models: [{ id: 'gpt-8', name: 'GPT 8', family: 'openai', aliases: ['future-runtime'] }], expected: '未识别模型（future-runtime）' },
+  { name: 'ambiguous aliases stay unidentified', raw: 'shared-runtime', models: [{ id: 'a', name: 'Model A', aliases: ['shared-runtime'] }, { id: 'b', name: 'Model B', aliases: ['shared-runtime'] }], expected: '未识别模型（shared-runtime）' },
+]) {
+  test('model evidence uses ' + scenario.name, async ({ page }, testInfo) => {
+    await fixture(page);
+    await page.route('**/admin/config', (route) => route.fulfill({ json: { config: { default_model: 'auto', features: {} }, models: [{ id: 'auto', name: 'Auto' }, ...scenario.models] } }));
+    await page.route('**/admin/conversations/conversation-one*', (route) => route.fulfill({ json: { item: { id: 'conversation-one', title: '整理产品发布计划', messages: [
+      { id: 'user', role: 'user', content: '帮我整理产品发布计划。' },
+      { id: 'answer', role: 'assistant', content: '### 先确定发布范围\n\n把这次发布拆成三个阶段：\n\n1. **准备**：确认核心功能与验收标准。\n2. **验证**：检查关键流程并收集反馈。\n3. **发布**：保留回滚版本，观察运行状态。', model_selection_mode: 'auto', model_observations: [{ model: scenario.raw, provider: 'anthropic', source: 'stream' }] },
+    ] } } }));
+    await page.goto('/admin?tab=tester');
+    if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航', exact: true }).click();
+    await page.locator('.chat-conversation-open:visible').first().click();
+    const evidence = page.getByTestId('model-evidence');
+    await expect(evidence.locator('summary')).toContainText('实际模型：' + scenario.expected);
+    await expect(evidence.locator('.model-evidence-details')).not.toBeVisible();
+    if (scenario.expected === 'Opus 5.5') {
+      await expect(evidence.locator('summary')).not.toContainText(scenario.raw);
+      for (const theme of ['浅色', '深色']) {
+        await page.getByRole('combobox', { name: '主题模式' }).click();
+        await page.getByRole('option', { name: theme, exact: true }).click();
+        await page.screenshot({ path: testInfo.outputPath(theme === '深色' ? 'chat-dark.png' : 'chat-light.png'), fullPage: true });
+      }
+    }
+    await evidence.locator('summary').click();
+    await expect(evidence.locator('.model-evidence-details')).toContainText(scenario.raw);
+  });
+}

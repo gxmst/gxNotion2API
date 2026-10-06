@@ -814,7 +814,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
                 </a>;
               })}</div> : null}
             </div>}
-            <ModelEvidence message={message} models={modelCatalog} />
+            <ModelEvidence message={message} models={modelCatalog} preferredModels={[...(boundTarget?.capability?.models || []), ...(boundTarget?.capability?.catalog || [])]} />
             <div className="chat-message-actions">
               {message.edited_at ? <span className="chat-edited">已编辑</span> : null}
               {message.status === 'failed' ? <span>未完成</span> : null}

@@ -131,6 +131,7 @@ export function AdminConsole() {
       case 'conversations':
         return (
           <ConversationsPanel
+            models={models}
             conversations={conversations}
             selectedConversationId={selectedConversationId}
             selectedConversation={selectedConversation}

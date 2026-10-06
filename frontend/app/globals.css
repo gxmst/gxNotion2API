@@ -188,34 +188,35 @@
 
 
 :root {
-  --radius: .65rem;
+  --radius: .75rem;
   --topbar-height: 56px;
   --content-max-width: 1280px;
-  --background: #fafaf9; --foreground: #252725;
-  --card: #ffffff; --card-foreground: #252725;
-  --popover: #ffffff; --popover-foreground: #252725;
-  --primary: #28634f; --primary-foreground: #ffffff; --primary-rgb: 40 99 79;
-  --secondary: #f0f2ef; --secondary-foreground: #344038;
-  --muted: #f1f2ef; --muted-foreground: #70766f;
-  --accent: #eaf0eb; --accent-foreground: #284b3b;
-  --destructive: #bd4242; --border: #e2e5df; --input: #e2e5df; --ring: #28634f;
-  --sidebar: #f3f4f1; --sidebar-border: #e2e5df;
-  --code-bg: #f3f4f1; --code-fg: #344038;
-  --scrollbar-thumb: #c4c9c1; --scrollbar-thumb-strong: #9ea79a;
-  --shadow-soft: 0 1px 2px #172b1e04; --shadow-elevated: 0 12px 32px #172b1e12;
+  --background: #f5f4f0; --foreground: #282c30;
+  --card: #fffefa; --card-foreground: #282c30;
+  --popover: #fffefa; --popover-foreground: #282c30;
+  --primary: #755537; --primary-foreground: #ffffff; --primary-rgb: 117 85 55;
+  --secondary: #ecece7; --secondary-foreground: #41474d;
+  --muted: #efeee8; --muted-foreground: #686b6e;
+  --accent: #ebe2d5; --accent-foreground: #614727;
+  --destructive: #b64242; --border: #dedfd9; --input: #dedfd9; --ring: #96704a;
+  --sidebar: #ecece7; --sidebar-border: #dedfd9;
+  --code-bg: #eeede7; --code-fg: #38434c;
+  --scrollbar-thumb: #c5c6bf; --scrollbar-thumb-strong: #999f9f;
+  --shadow-soft: 0 1px 3px #24283008; --shadow-elevated: 0 16px 44px #24283014;
 }
 .dark {
-  --background: #1c1e1c; --foreground: #e8ebe5;
-  --card: #222522; --card-foreground: #e8ebe5;
-  --popover: #272b27; --popover-foreground: #e8ebe5;
-  --primary: #9cc9ad; --primary-foreground: #14291b; --primary-rgb: 156 201 173;
-  --secondary: #2d332d; --secondary-foreground: #dce6dc;
-  --muted: #2a2e2a; --muted-foreground: #a0a89e;
-  --accent: #303e34; --accent-foreground: #cee6d5;
-  --destructive: #ee8b8b; --border: #373d35; --input: #373d35; --ring: #9cc9ad;
-  --sidebar: #202320; --sidebar-border: #373d35;
-  --code-bg: #191d19; --code-fg: #d2dfd1;
-  --scrollbar-thumb: #485245; --scrollbar-thumb-strong: #65745f;
+  --background: #14171b; --foreground: #e7e9ec;
+  --card: #1b1f24; --card-foreground: #e7e9ec;
+  --popover: #23282f; --popover-foreground: #e7e9ec;
+  --primary: #d6b990; --primary-foreground: #211b13; --primary-rgb: 214 185 144;
+  --secondary: #272e36; --secondary-foreground: #d7dde5;
+  --muted: #252b32; --muted-foreground: #a2acb9;
+  --accent: #302a23; --accent-foreground: #e6cdaa;
+  --destructive: #ef9696; --border: #343c45; --input: #343c45; --ring: #d6b990;
+  --sidebar: #171b20; --sidebar-border: #343c45;
+  --code-bg: #171b20; --code-fg: #cad5e3;
+  --scrollbar-thumb: #414b58; --scrollbar-thumb-strong: #626f7e;
+  --shadow-soft: 0 1px 3px #00000018; --shadow-elevated: 0 16px 44px #00000040;
 }
 @layer base {
   * { border-color: var(--border); }
@@ -305,3 +306,15 @@
 .chat-step > summary { cursor: pointer; list-style: none; }
 .chat-step > summary::-webkit-details-marker { display: none; }
 .chat-step-text { white-space: pre-wrap; max-width: 560px; max-height: 220px; overflow: auto; padding: 10px; border: 1px solid var(--chat-line); border-radius: 8px; margin-top: 5px; }
+
+/* Shared semantic colors keep the chat and administration surfaces aligned. */
+.app-brand > span { color: var(--primary); }
+.app-navigation nav button[aria-current] { box-shadow: inset 2px 0 0 var(--primary); }
+.chat-composer { background: var(--popover); box-shadow: var(--shadow-soft); }
+.chat-composer:focus-within { border-color: var(--ring); }
+.chat-send { background: var(--primary); color: var(--primary-foreground); }
+.chat-tool.is-active { background: var(--accent); color: var(--accent-foreground); }
+.chat-user .chat-message-content { background: var(--muted); }
+.model-evidence { margin-top: 8px; color: var(--muted-foreground); font-size: 11px; line-height: 1.8; }
+.model-evidence > summary { width: fit-content; cursor: pointer; border-bottom: 1px dotted var(--border); }
+.model-evidence-details { margin-top: 6px; padding: 8px 12px; background: var(--muted); border-radius: 8px; overflow-wrap: anywhere; }
