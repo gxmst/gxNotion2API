@@ -452,6 +452,7 @@ type ndjsonPatchOperation struct {
 }
 
 type ndjsonStreamLine struct {
+	Data       map[string]any              `json:"data,omitempty"`
 	Model      string                      `json:"model,omitempty"`
 	Type       string                      `json:"type"`
 	V          []ndjsonPatchOperation      `json:"v,omitempty"`
@@ -2748,6 +2749,63 @@ func (s *ndjsonTranscriptState) applyPatchOperation(op ndjsonPatchOperation, sin
 	return nil
 }
 
+// Snapshot frames establish the absolute /s/N indices used by subsequent
+// patches. In v2 streams the inference step may first appear in patch-sync,
+// never in an append operation. Keep emitted cursors while replacing state so
+// repeated synchronization frames do not replay already delivered text.
+func (s *ndjsonTranscriptState) applySnapshot(data map[string]any, sink InferenceStreamSink) error {
+	raw, ok := data["s"].([]any)
+	if !ok {
+		return nil
+	}
+	priorSteps := make(map[string]ndjsonStepState, len(s.Steps))
+	for _, step := range s.Steps {
+		if step.ID != "" {
+			priorSteps[step.ID] = step
+		}
+	}
+	s.Steps = make([]ndjsonStepState, 0, len(raw))
+	s.patchValueTypes = nil
+	s.patchValueText = nil
+	s.patchValueCounts = nil
+	s.ActiveAgentIndex = -1
+	lastUser := -1
+	for index, value := range raw {
+		if stringValue(mapValue(value)["type"]) == "user" {
+			lastUser = index
+		}
+	}
+	for index, value := range raw {
+		item := mapValue(value)
+		step := ndjsonStepState{ID: stringValue(item["id"]), Type: stringValue(item["type"])}
+		if step.Type == "agent-inference" && index > lastUser {
+			step.Text = extractStepText(item["value"])
+			step.Reasoning = extractStepReasoning(item["value"])
+			step.Completed = item["finishedAt"] != nil
+			// Sync frames can omit model fields already observed in patches.
+			prior := priorSteps[step.ID]
+			step.ModelObservations = mergeModelObservations(prior.ModelObservations, observeStepModels(item, step.ID, "stream"))
+			step.ModelParts = prior.ModelParts
+			s.ActiveAgentIndex = index
+		}
+		s.Steps = append(s.Steps, step)
+		s.registerStepValueTypes(index, item["value"])
+	}
+	if s.ActiveAgentIndex < 0 {
+		return nil
+	}
+	step := s.Steps[s.ActiveAgentIndex]
+	if err := s.emitFullReasoning(s.composeReasoningText(), sink); err != nil {
+		return err
+	}
+	if err := s.emitFullText(step.Text, sink); err != nil {
+		return err
+	}
+	s.FinalAgent.Completed = step.Completed
+	s.FinalAgent.CompletedTime = mapValue(raw[s.ActiveAgentIndex])["finishedAt"]
+	return nil
+}
+
 func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink InferenceStreamSink) error {
 	line = bytes.TrimSpace(line)
 	if len(line) == 0 {
@@ -2759,6 +2817,8 @@ func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink In
 	}
 	s.LineCount++
 	switch streamLine.Type {
+	case "patch-start", "patch-sync":
+		return s.applySnapshot(streamLine.Data, sink)
 	case "patch":
 		for _, op := range streamLine.V {
 			if err := s.applyPatchOperation(op, sink); err != nil {
@@ -4118,6 +4178,7 @@ func (c *NotionAIClient) buildInferencePayload(req PromptRunRequest, threadID st
 		"transcript":                    transcript,
 		"threadType":                    threadType,
 		"asPatchResponse":               true,
+		"patchResponseVersion":          2,
 		"isPartialTranscript":           req.continuationDraft != nil,
 		"saveAllThreadOperations":       !req.SuppressUpstreamThreadPersistence,
 		"setUnreadState":                true,

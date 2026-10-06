@@ -28,6 +28,7 @@ type workspaceModelPolicy struct {
 }
 
 type policyCatalogModel struct {
+	FinalModel     string `json:"final_model,omitempty"`
 	ID             string `json:"id"`
 	Name           string `json:"name"`
 	Provider       string `json:"provider"`
@@ -236,16 +237,21 @@ func (c *NotionAIClient) readWorkspaceModelPolicy(ctx context.Context, scope str
 		if surface != nil {
 			disabled, reason = surface.Disabled, surface.Reason
 		}
+		finalModel := ""
+		if surface != nil {
+			finalModel = strings.TrimSpace(surface.FinalModel)
+		}
 		available := !model.Disabled && !disabled && provider != ""
-		out.Models = append(out.Models, policyCatalogModel{ID: id, Name: firstNonEmpty(model.Name, id), Provider: provider, Available: available, DisabledReason: firstNonEmpty(reason, model.Reason)})
+		out.Models = append(out.Models, policyCatalogModel{FinalModel: finalModel, ID: id, Name: firstNonEmpty(model.Name, id), Provider: provider, Available: available, DisabledReason: firstNonEmpty(reason, model.Reason)})
 	}
 	updatePolicyAllowedModels(&out)
 	return out, nil
 }
 
 type policySurfaceEntry struct {
-	Disabled bool   `json:"isDisabled"`
-	Reason   string `json:"disabledReason"`
+	FinalModel string `json:"finalModelName"`
+	Disabled   bool   `json:"isDisabled"`
+	Reason     string `json:"disabledReason"`
 }
 
 func policyContains(values []string, value string) bool {

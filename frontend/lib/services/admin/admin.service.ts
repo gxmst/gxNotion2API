@@ -19,6 +19,15 @@ import type {
 } from './types';
 
 export const AdminService = {
+  getNotes(email: string, workspaceID: string, refresh = false) {
+    const query = new URLSearchParams({ email, workspace_id: workspaceID });
+    if (refresh) query.set('refresh', '1');
+    return apiFetch<{ items: Array<{ id: string; title: string }> }>('/admin/notes?' + query);
+  },
+  getNote(email: string, workspaceID: string, pageID: string) {
+    const query = new URLSearchParams({ email, workspace_id: workspaceID, page_id: pageID });
+    return apiFetch<{ item: { id: string; title: string; text: string; partial: boolean } }>('/admin/notes?' + query);
+  },
   verify() {
     return apiFetch<AdminVerifyPayload>('/admin/verify');
   },

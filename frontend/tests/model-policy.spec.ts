@@ -115,8 +115,9 @@ async function mockModelPolicy(page: Page, options: MockOptions = {}) {
 
 async function openPolicy(page: Page) {
   await page.goto('/admin');
-  if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航', exact: true }).click();
-  await page.getByRole('button', { name: '账号与工作区', exact: true }).click();
+  if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航菜单', exact: true }).click();
+  await page.getByRole('button', { name: '账号', exact: true }).click();
+  await page.getByRole('button', { name: '模型与套餐', exact: true }).click();
   const panel = page.getByRole('region', { name: '工作区模型设置', exact: true });
   await panel.scrollIntoViewIfNeeded();
   await expect(panel.getByRole('button', { name: '读取模型设置' })).toBeEnabled();
@@ -300,4 +301,22 @@ test('a successful policy change refreshes model capabilities and the account li
   expect(capabilityRefreshes).toEqual([{ email: initial.email, workspace_id: initial.workspace_id }]);
   expect(accountReads()).toBeGreaterThan(readsBefore);
   await expect(page.getByText('模型选择：支持手动选择')).toBeVisible();
+});
+
+
+test('model mapping displays upstream IDs without guessing missing aliases', async ({ page }) => {
+  const fixture = await mockModelPolicy(page);
+  const next = structuredClone(fixture.initial);
+  next.models[0].final_model = 'runtime-alias-a';
+  fixture.setUpstreamSnapshot(next);
+  const panel = await openPolicy(page);
+  await panel.getByRole('button', { name: '读取模型设置', exact: true }).click();
+  await panel.getByRole('combobox', { name: '工作区目标模型' }).click();
+  await page.getByRole('option', { name: 'Model A', exact: true }).click();
+  await expect(panel.getByLabel('模型对应关系')).toContainText('设置 ID：model-a');
+  await expect(panel.getByLabel('模型对应关系')).toContainText('runtime-alias-a');
+  await panel.getByRole('combobox', { name: '工作区目标模型' }).click();
+  await page.getByRole('option', { name: 'Model B', exact: true }).click();
+  await expect(panel.getByLabel('模型对应关系')).toContainText('上游未返回，无法确认');
+  expect(fixture.writes).toHaveLength(0);
 });

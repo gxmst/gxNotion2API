@@ -139,6 +139,7 @@ export function ConversationsPanel({
   };
 
   const handleSingleDelete = async (id: string) => {
+    if (!window.confirm('删除这条会话？本地与 Notion 对话将一并删除，且不可恢复。')) return;
     setBusy(true);
     try {
       await onDelete(id);
@@ -153,6 +154,7 @@ export function ConversationsPanel({
 
   const handleBatchDelete = async () => {
     if (!selectedIDs.length) return;
+    if (!window.confirm('删除选中的 ' + selectedIDs.length + ' 条会话？本地与 Notion 对话将一并删除，且不可恢复。')) return;
     setBusy(true);
     try {
       await onBatchDelete(selectedIDs);

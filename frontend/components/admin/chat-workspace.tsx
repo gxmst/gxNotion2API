@@ -1,12 +1,15 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { ArrowDown, ArrowUp, Check, Copy, Download, FileText, Gauge, Globe2, ImageIcon, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, Trash2, X } from 'lucide-react';
+import { ArrowDown, ArrowUp, Check, Copy, Download, FileText, BookOpen, Gauge, Globe2, ImageIcon, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, Trash2, X } from 'lucide-react';
 import { useTheme } from 'next-themes';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
 import { AdminService } from '@/lib/services/admin/admin.service';
+import { NotebookDialog } from '@/components/admin/notebook-dialog';
+import { QuotaWindows } from '@/components/admin/quota-windows';
+import { WorkspaceModelPolicy } from '@/components/admin/workspace-model-policy';
 import { ModelEvidence } from '@/components/admin/model-evidence';
 import { safeMarkdownComponents } from '@/components/admin/safe-markdown';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -140,17 +143,6 @@ const targetID = (email: string, workspace: string) => JSON.stringify([email, wo
 
 // The window length is Notion's, so its own name is kept and only translated
 // into a readable form ("6h" -> "6 小时", "billing_period" -> "账单周期").
-function quotaWindowLabel(raw: string | undefined, fallback: string): string {
-  const value = (raw || '').trim();
-  if (!value) return fallback;
-  if (value === 'billing_period') return '账单周期';
-  const hours = /^(\d+)h$/.exec(value);
-  if (hours) return `${hours[1]} 小时`;
-  const days = /^(\d+)d$/.exec(value);
-  if (days) return `${days[1]} 天`;
-  return value;
-}
-
 // A remaining percentage is only derived from confirmed counters: an absent or
 // zero limit means upstream did not state one, not that nothing is left.
 function quotaRemainingPercent(window?: AIUsageRateLimitWindow): number | null {
@@ -165,24 +157,7 @@ function quotaTone(percent: number): 'ok' | 'warn' | 'low' {
   return 'ok';
 }
 
-function formatQuotaPeriodEnd(ms?: number): string {
-  if (!ms || !Number.isFinite(ms)) return '';
-  const date = new Date(ms);
-  if (Number.isNaN(date.getTime())) return '';
-  return `${date.getMonth() + 1} 月 ${date.getDate()} 日`;
-}
-
-// Counters are shown as upstream reported them. A missing limit is printed as
-// unknown rather than as zero, which would read as "nothing left".
-function formatQuotaAmount(window: AIUsageRateLimitWindow): string {
-  const round = (value: number) => (Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, ''));
-  const used = Number.isFinite(window.used) ? round(window.used) : '?';
-  const limit = Number.isFinite(window.limit) && window.limit > 0 ? round(window.limit) : '未知';
-  const periodEnd = formatQuotaPeriodEnd(window.period_end_ms);
-  return `已用 ${used} / ${limit}${periodEnd ? ` · 至 ${periodEnd}` : ''}`;
-}
-
-export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun, conversations, accounts, onNavigate, onDeleteConversation, onRefreshConversations, visible }: {
+export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialConversationID, onResumeHandled, onLoad, onRun, conversations, accounts, onNavigate, onDeleteConversation, onRefreshConversations, onRefreshWorkspaceModels, visible }: {
   models: ModelItem[];
   defaultModel?: string;
   defaultWebSearch: boolean;
@@ -197,8 +172,12 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   onDeleteConversation: (id: string) => Promise<unknown>;
   /** Re-reads the sidebar list after a rename or a delete. */
   onRefreshConversations: () => Promise<unknown>;
+  onRefreshWorkspaceModels: (email: string, workspaceID: string) => Promise<void>;
   visible: boolean;
 }) {
+  const [notesOpen, setNotesOpen] = useState(false);
+  const [policyOpen, setPolicyOpen] = useState(false);
+  const [policyTarget, setPolicyTarget] = useState('');
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState(defaultModel || models[0]?.id || 'auto');
   const [useWebSearch, setUseWebSearch] = useState(defaultWebSearch);
@@ -297,8 +276,8 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     setQuotaRowsLoading(true); setQuotaError('');
     try {
       const { accounts } = await AdminService.getAIUsage(refresh);
-      const eligible = new Set(targets.map((item) => item.workspace));
-      setQuotaRows(accounts.filter((row) => row.space_id && eligible.has(row.space_id)));
+      const eligible = new Set(targets.map((item) => item.email + ':' + item.workspace));
+      setQuotaRows(accounts.filter((row) => row.space_id && eligible.has(row.email + ':' + row.space_id)));
     } catch (cause) {
       setQuotaError(cause instanceof Error ? cause.message : '额度读取失败');
     } finally { setQuotaRowsLoading(false); }
@@ -416,7 +395,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   useEffect(() => {
     if (!visible) setMobileOpen(false);
     const viewport = window.visualViewport;
-    const resize = () => shellRef.current?.style.setProperty('--chat-height', `${viewport?.height || window.innerHeight}px`);
+    const resize = () => shellRef.current?.style.setProperty('--chat-height', `${Math.max(240, (viewport?.height || window.innerHeight) - 56)}px`);
     resize();
     viewport?.addEventListener('resize', resize);
     return () => viewport?.removeEventListener('resize', resize);
@@ -670,11 +649,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   const inputTokens = messages.filter((message) => message.role === 'user').reduce((sum, message) => sum + estimateTokens(message.content), 0);
   const outputTokens = messages.filter((message) => message.role === 'assistant').reduce((sum, message) => sum + estimateTokens(message.content), 0);
 
-  const quotaWindows = [
-    shortWindow ? { key: 'short', window: shortWindow, fallback: '短窗口' } : null,
-    longWindow ? { key: 'long', window: longWindow, fallback: '长周期' } : null,
-  ].filter((item): item is { key: string; window: AIUsageRateLimitWindow; fallback: string } => item !== null);
-
+  const policyWorkspace = targets.find((item) => item.id === policyTarget) || effectiveWorkspace || targets[0];
   const quotaPanel = !quotaOpen ? null : <>
     <div className="chat-quota-backdrop" onClick={() => setQuotaOpen(false)} />
     <div className="chat-quota-panel" role="dialog" aria-label="工作区额度">
@@ -688,36 +663,21 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       {!quotaError && !effectiveWorkspace ? (
         quotaRows === null ? <p className="chat-quota-empty">正在读取…</p>
           : !quotaRows.length ? <p className="chat-quota-empty">暂无可读取额度的商业工作区。</p>
-          : <div className="chat-quota-list">{quotaRows.map((row) => {
-            const percent = quotaRemainingPercent(row.usage?.rate_limit?.short ?? row.usage?.rate_limit?.long);
-            return <div className="chat-quota-row" key={(row.email || '') + (row.space_id || '')}>
-              <span className="chat-quota-row-name">{row.workspace_name || row.space_id}</span>
-              <span className={'chat-quota-row-value is-' + (percent === null ? 'ok' : quotaTone(percent))}>{percent === null ? '未知' : `剩余 ${percent}%`}</span>
-            </div>;
-          })}</div>
+          : <div className="space-y-5">{quotaRows.map((row) => <section className="border-b pb-4 last:border-0" key={(row.email || '') + row.space_id}>
+              <p className="text-xs font-medium mb-3">{row.workspace_name || row.space_id}</p>
+              <QuotaWindows report={row} />
+            </section>)}</div>
       ) : null}
       {!quotaError && effectiveWorkspace ? <>
         <p className="chat-quota-workspace">{effectiveWorkspace.name} · {effectiveWorkspace.email}</p>
         {quotaLoading && !activeQuota ? <p className="chat-quota-empty">正在读取…</p> : null}
-        {activeQuota && activeQuota.status !== 'ok' ? <p className="chat-quota-empty">{activeQuota.detail || '额度不可用'}</p> : null}
-        {quotaWindows.length ? quotaWindows.map((item) => {
-          const percent = quotaRemainingPercent(item.window);
-          return <div className="chat-quota-window" key={item.key}>
-            <div className="chat-quota-window-top">
-              <strong>{quotaWindowLabel(item.window.label, item.fallback)}</strong>
-              <span>{percent === null ? '未知' : `剩余 ${percent}%`}</span>
-            </div>
-            {percent === null ? null : <span className={'chat-quota-bar is-' + quotaTone(percent)}><b style={{ width: `${percent}%` }} /></span>}
-            <div className="chat-quota-window-meta">{formatQuotaAmount(item.window)}</div>
-          </div>;
-        }) : (quotaLoading || !activeQuota ? null : <p className="chat-quota-empty">上游未返回窗口额度。</p>)}
-        <p className="chat-quota-note">数值来自 Notion 上游，仅供估算，不代表实际扣费。</p>
+        {activeQuota ? <QuotaWindows report={activeQuota} /> : null}
       </> : null}
     </div>
   </>;
 
   const sidebar = <div className="chat-sidebar-content">
-    <div className="chat-brand"><span className="chat-mark"><Sparkles size={17} /></span><span>Notion AI</span><button className="chat-icon ml-auto hidden lg:flex" aria-label="收起侧栏" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button></div>
+    <div className="chat-brand"><span className="chat-mark"><Sparkles size={17} /></span><span>对话记录</span><button className="chat-icon ml-auto hidden lg:flex" aria-label="收起侧栏" onClick={() => setSidebarOpen(false)}><PanelLeftClose size={17} /></button></div>
     <button className="chat-new" disabled={running} onClick={startNew}><Plus size={17} />新对话<span aria-hidden="true" className="ml-auto text-xs text-muted-foreground">＋</span></button>
     <label className="chat-search"><Search size={15} /><input aria-label="搜索对话" placeholder="搜索对话" value={filter} onChange={(event) => setFilter(event.target.value)} /></label>
     <div className="chat-history-label">最近对话</div>
@@ -750,13 +710,26 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       {!history.length ? <p className="px-3 py-2 text-xs leading-6 text-muted-foreground">{filter ? '没有匹配的对话' : '对话会保存在这里，随时继续。'}</p> : null}
     </nav>
     <div className="chat-sidebar-footer">
-      <button onClick={() => onNavigate('accounts')}><KeyRound size={16} />账号与工作区</button>
-      <button onClick={() => onNavigate('settings')}><Settings2 size={16} />设置</button>
-      <button onClick={() => onNavigate('dashboard')}><span className="chat-status-dot" />管理控制台<span className="ml-auto text-xs opacity-60">↗</span></button>
+      <button onClick={() => onNavigate('dashboard')}><span className="chat-status-dot" />管理控制台</button>
     </div>
   </div>;
 
   return <div className="chat-shell" ref={shellRef}>
+    <NotebookDialog open={notesOpen && visible} onOpenChange={setNotesOpen} targets={targets}
+      current={effectiveWorkspace} locked={Boolean(conversationID)} onReference={(note, workspace) => {
+        if (!conversationID) setTarget(workspace.id);
+        const citation = '\n\n参考笔记：' + note.title + '\n来源：https://www.notion.so/' + note.id.replaceAll('-', '') + '\n' + (note.partial ? '（部分文本快照）\n' : '') + note.text;
+        setPrompt((current) => current + citation);
+        inputRef.current?.focus();
+      }} />
+    <Dialog open={policyOpen && visible} onOpenChange={setPolicyOpen}><DialogContent aria-describedby={undefined} className="!max-w-xl max-h-[85dvh] overflow-y-auto">
+      <DialogTitle>工作区模型</DialogTitle>
+      <p className="text-xs leading-6 text-muted-foreground">试用工作区聊天仍使用 Auto。这里可手动只保留一个模型；修改影响整个工作区，不会为每条消息自动切换。</p>
+      <Select value={policyWorkspace?.id || ''} onValueChange={setPolicyTarget}><SelectTrigger aria-label="模型设置工作区"><SelectValue /></SelectTrigger><SelectContent>{targets.map((item) => <SelectItem key={item.id} value={item.id}>{item.name} · {item.email}</SelectItem>)}</SelectContent></Select>
+      {policyWorkspace ? <WorkspaceModelPolicy key={policyWorkspace.id} email={policyWorkspace.email} workspaceID={policyWorkspace.workspace} workspaceName={policyWorkspace.name}
+        coolingDown={accounts.find((account) => account.email === policyWorkspace.email)?.credential_cooldown_active}
+        onPolicyChanged={() => onRefreshWorkspaceModels(policyWorkspace.email, policyWorkspace.workspace)} /> : null}
+    </DialogContent></Dialog>
     {sidebarOpen ? <aside className="chat-sidebar hidden lg:block">{sidebar}</aside> : null}
     <Dialog open={mobileOpen && visible} onOpenChange={setMobileOpen}><DialogContent aria-describedby={undefined} className="chat-mobile-sidebar !left-0 !top-0 !h-dvh !w-[280px] !max-w-[90vw] !translate-x-0 !translate-y-0 !bg-[var(--chat-side)] rounded-none border-0 p-0"><DialogTitle className="sr-only">历史会话与导航</DialogTitle>{sidebar}</DialogContent></Dialog>
     <section className="chat-main">
@@ -766,6 +739,8 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
         <div className="min-w-0"><div className="chat-breadcrumb"><span className="chat-workspace-name">{boundTarget?.name || 'Notion AI'}</span><span>/</span><h1>{title}</h1></div></div>
         <div className="ml-auto flex shrink-0 items-center gap-1">
           {running ? <span className="chat-generating"><span />生成中</span> : null}
+          {targets.length ? <button type="button" className="chat-icon" aria-label="工作区笔记" title="浏览与引用笔记" disabled={running || loading || Boolean(conversationID) && !effectiveWorkspace} onClick={() => setNotesOpen(true)}><BookOpen size={17} /></button> : null}
+          {targets.length ? <button type="button" className="chat-icon" aria-label="工作区模型" title="工作区模型设置" disabled={running} onClick={() => { setPolicyTarget(effectiveWorkspace?.id || targets[0]?.id || ''); setPolicyOpen(true); }}><Settings2 size={17} /></button> : null}
           {targets.length ? <div className="chat-quota">
             <button type="button" className="chat-quota-chip" aria-expanded={quotaOpen} aria-haspopup="dialog" onClick={toggleQuota}
               title={quotaError || (effectiveWorkspace ? `${effectiveWorkspace.name} 的工作区额度` : '各工作区剩余额度')}>

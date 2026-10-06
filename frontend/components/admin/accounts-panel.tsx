@@ -13,6 +13,7 @@ import {
   WandSparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -28,7 +29,6 @@ import {
   KeyValueGrid,
   MetaTile,
   PanelHeader,
-  StatCard,
   StatusPill,
   Subsection,
   formatMaybeDate,
@@ -199,7 +199,7 @@ function AccountListItem({
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 space-y-2">
-          <div className="break-all text-sm font-semibold leading-6">{item.email}</div>
+          <div className="truncate text-sm font-semibold leading-6" title={item.email}>{item.email}</div>
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <StatusPill status={item.status} />
             <span>{item.active ? 'active' : 'standby'}</span>
@@ -219,6 +219,7 @@ function AccountListItem({
 }
 
 export function AccountsPanel({
+  onDirtyChange,
   accountsPayload,
   models,
   defaultModel,
@@ -233,6 +234,7 @@ export function AccountsPanel({
   onDelete,
   onSaveAccountSettings,
 }: {
+  onDirtyChange?: (dirty: boolean) => void;
   accountsPayload: AccountsPayload | null;
   models: ModelItem[];
   defaultModel?: string;
@@ -253,6 +255,13 @@ export function AccountsPanel({
   const loginHelper = accountsPayload?.login_helper;
   const runtimeSession = accountsPayload?.session;
   const refreshRuntime = accountsPayload?.session_refresh_runtime;
+
+  const [addOpen, setAddOpen] = useState(false);
+  const [detailTab, setDetailTab] = useState('scheduling');
+  const [usageOpen, setUsageOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const editBaseline = useRef<Record<string, AccountEditState>>({});
+  const disabledBaseline = useRef<Record<string, boolean>>({});
 
   const [startEmail, setStartEmail] = useState('');
   const [startMessage, setStartMessage] = useState('');
@@ -290,8 +299,17 @@ export function AccountsPanel({
   );
 
   useEffect(() => {
-    setAccountEdits(buildAccountEditMap(items));
-    setDisabledEdits(buildDisabledEditMap(items));
+    const previous = editBaseline.current;
+    const previousDisabled = disabledBaseline.current;
+    const next = buildAccountEditMap(items);
+    const nextDisabled = buildDisabledEditMap(items);
+    // Refresh clean fields, preserving each workspace's unsaved draft.
+    setAccountEdits((current) => Object.fromEntries(Object.entries(next).map(([key, value]) =>
+      [key, current[key] && JSON.stringify(current[key]) !== JSON.stringify(previous[key]) ? current[key] : value])));
+    setDisabledEdits((current) => Object.fromEntries(Object.entries(nextDisabled).map(([key, value]) =>
+      [key, key in current && current[key] !== previousDisabled[key] ? current[key] : value])));
+    editBaseline.current = next;
+    disabledBaseline.current = nextDisabled;
     const preferredEmail = activeAccount || items[0]?.email || '';
     setQuickTestEmail((current) => (current && items.some((item) => item.email === current) ? current : preferredEmail));
     setStartEmail((current) => current || preferredEmail);
@@ -350,6 +368,17 @@ export function AccountsPanel({
     }
   }, [manual.probeJsonText]);
 
+  const dirty = Object.entries(accountEdits).some(([key, value]) => JSON.stringify(value) !== JSON.stringify(editBaseline.current[key]))
+    || Object.entries(disabledEdits).some(([key, value]) => value !== disabledBaseline.current[key]);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ''; };
+    window.addEventListener('beforeunload', warn);
+    return () => window.removeEventListener('beforeunload', warn);
+  }, [dirty]);
+
   const selectedAccount = useMemo(
     () => accountOptions.find((item) => item.email === selectedEmail) || null,
     [accountOptions, selectedEmail],
@@ -375,29 +404,6 @@ export function AccountsPanel({
   const selectedDisabled = selectedAccount?.email
     ? disabledEdits[selectedAccount.email] ?? Boolean(selectedAccount.disabled)
     : false;
-
-  const summaryCards = [
-    {
-      label: '账号池',
-      value: `${items.length}`,
-      hint: activeAccount ? `active · ${activeAccount}` : '尚未激活默认账号',
-    },
-    {
-      label: '会话状态',
-      value: accountsPayload?.session_ready ? 'READY' : 'NOT READY',
-      hint: runtimeSession?.space_name || runtimeSession?.space_id || '尚未绑定空间',
-    },
-    {
-      label: '登录 Helper',
-      value: `timeout ${loginHelper?.timeout_sec || 120}s`,
-      hint: loginHelper?.sessions_dir || '使用默认 sessions_dir',
-    },
-    {
-      label: '刷新状态',
-      value: refreshRuntime?.last_error ? 'ERROR' : 'IDLE',
-      hint: refreshRuntime?.last_refresh_at || refreshRuntime?.last_error || '暂无刷新记录',
-    },
-  ];
 
   const runtimeCards = [
     { label: '活跃账号', value: activeAccount || '-' },
@@ -435,6 +441,7 @@ export function AccountsPanel({
   async function runQuickTest(email: string, workspaceId = quickTestWorkspaceId) {
     if (quickTestInFlight.current) return;
     quickTestInFlight.current = true;
+    setToolsOpen(true);
     const account = accountOptions.find((item) => item.email === email);
     const workspace = account ? workspaceItems(account).find((item) => item.id === workspaceId) : undefined;
     const supported = manualModelOptions(account, workspaceId, models).some((item) => item.id === quickTestModel);
@@ -484,7 +491,10 @@ export function AccountsPanel({
         max_concurrency: edit.maxConcurrency,
         disabled,
       });
-      toast.success(`已保存 ${email}`);
+      const key = workspaceEditKey(email, workspaceId);
+      setAccountEdits((current) => ({ ...current, [key]: editBaseline.current[key] || edit }));
+      setDisabledEdits((current) => ({ ...current, [email]: disabledBaseline.current[email] ?? disabled }));
+      toast.success('工作区设置已保存');
     } catch (error) {
       toast.error(error instanceof Error ? error.message : '保存账号设置失败');
     } finally {
@@ -566,26 +576,309 @@ export function AccountsPanel({
     <div className="space-y-6">
       <PanelHeader
         eyebrow="Accounts"
-        title="账号、验证码登录与手动导入"
-        description="集中处理登录、导入、调度与校验。"
+        title="账号与工作区"
+        description="选择账号，管理工作区、模型能力与请求调度。"
         actions={
-          <Button variant="outline" onClick={() => void onRefresh()}>
+          <>
+          <Button onClick={() => setAddOpen(true)}><MailPlus className="size-4" />添加账号</Button>
+          <Button variant="outline" onClick={() => void onRefresh().catch((error) => toast.error(error instanceof Error ? error.message : '刷新失败'))}>
             <RefreshCcw className="size-4" />
             刷新账号
           </Button>
+          </>
         }
       />
 
-      <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-4">
-        {summaryCards.map((item) => (
-          <StatCard key={item.label} label={item.label} value={item.value} hint={item.hint} />
-        ))}
-      </div>
-
-      <AIUsagePanel />
-
-      <div className="grid gap-6 2xl:grid-cols-[minmax(0,1.04fr)_360px]">
+      {dirty ? <div className="draft-notice" role="status"><span>有未保存的账号设置，刷新时会保留。</span><Button variant="ghost" size="sm" onClick={() => {
+        setAccountEdits({ ...editBaseline.current }); setDisabledEdits({ ...disabledBaseline.current });
+      }}>放弃修改</Button></div> : null}
+      <div className="space-y-6">
         <div className="min-w-0 space-y-6">
+          <div className="grid gap-6 xl:grid-cols-[260px_minmax(0,1fr)]">
+            <InfoCard className="self-start" title="账号池" description={`共 ${accountOptions.length} 个账号，点击查看详情。`}>
+              {accountOptions.length ? (
+                <ScrollArea className="console-list-scroll pretty-scroll pr-3">
+                  <div className="space-y-3 pb-1">
+                    {accountOptions.map((item) => (
+                      <AccountListItem
+                        key={item.email}
+                        item={item}
+                        selected={item.email === selectedEmail}
+                        onSelect={() => {
+                          setSelectedEmail(item.email);
+                          setQuickTestEmail(item.email);
+                        }}
+                      />
+                    ))}
+                  </div>
+                </ScrollArea>
+              ) : (
+                <EmptyHint title="当前还没有账号" description="可先请求验证码，或直接导入 Probe JSON。" />
+              )}
+            </InfoCard>
+
+            <InfoCard title="账号详情与操作" description="当前账号的运行信息与操作入口。">
+              {selectedAccount ? (
+                <div className="space-y-5">
+                  {(() => {
+                    const workspaces = workspaceItems(selectedAccount);
+                    return workspaces.length ? (
+                      <DetailField label="工作区" hint="额度、并发和会话目标都按这里选择的工作区计算。">
+                        <Select value={selectedWorkspace?.id || ''} onValueChange={setSelectedWorkspaceId} disabled={workspaces.length < 2}>
+                          <SelectTrigger className={FIELD_CLASS}>
+                            <SelectValue placeholder="选择工作区" />
+                          </SelectTrigger>
+                          <SelectContent>
+                            {workspaces.map((workspace) => (
+                              <SelectItem key={workspace.id} value={workspace.id}>
+                                {workspaceTitle(workspace)}{workspace.default ? ' · 默认' : ''}{workspace.active ? ' · 当前' : ''}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                      </DetailField>
+                    ) : null;
+                  })()}
+                  <nav className="settings-navigation" aria-label="工作区详情分类">
+                    {[['scheduling', '调度设置'], ['models', '模型与套餐'], ['details', '账号信息']].map(([id, label]) => <button type="button" key={id} aria-current={detailTab === id ? 'page' : undefined} onClick={() => setDetailTab(id)}>{label}</button>)}
+                  </nav>
+                  <fieldset disabled={savingAccount} hidden={detailTab !== 'scheduling'} className="min-w-0">
+                    <Subsection eyebrow="Scheduling" title="调度与限额" description="保存后直接写回账号池。">
+                      <div className="space-y-4">
+                        <div className="grid gap-4 md:grid-cols-3">
+                          <DetailField label="优先级">
+                            <Input
+                              type="number"
+                              value={selectedEdit.priority}
+                              onChange={(event) =>
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
+                                  priority: Number(event.target.value || 0),
+                                })
+                              }
+                              className={FIELD_CLASS}
+                            />
+                          </DetailField>
+                          <DetailField label="本地每小时请求上限" hint="0 表示不限制。">
+                            <Input
+                              type="number"
+                              min="0"
+                              value={selectedEdit.hourlyQuota}
+                              onChange={(event) =>
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
+                                  hourlyQuota: Math.max(0, Number(event.target.value || 0)),
+                                })
+                              }
+                              className={FIELD_CLASS}
+                            />
+                          </DetailField>
+                          <DetailField label="工作区并发上限" hint="当前工作区的并发请求数，最小值 1。">
+                            <Input
+                              type="number"
+                              min="1"
+                              value={selectedEdit.maxConcurrency}
+                              onChange={(event) =>
+                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
+                                  maxConcurrency: Math.max(1, Number(event.target.value || 1)),
+                                })
+                              }
+                              className={FIELD_CLASS}
+                            />
+                          </DetailField>
+                        </div>
+                        <div className="flex items-center justify-between gap-3 rounded-xl border bg-muted/40 px-3 py-3">
+                          <div>
+                            <div className="text-sm font-semibold tracking-tight">禁用账号</div>
+                            <p className="text-xs leading-5 text-muted-foreground">作用于整个账号（所有工作区）；禁用后仍保留账号数据，但不参与调度。</p>
+                          </div>
+                          <Switch
+                            aria-label="禁用账号"
+                            checked={selectedDisabled}
+                            onCheckedChange={(checked) => setDisabledEdits((current) => ({ ...current, [selectedAccount.email]: checked }))}
+                          />
+                        </div>
+                      </div>
+                    </Subsection>
+
+                  </fieldset>
+                  <div hidden={detailTab !== 'details'} className="space-y-4">
+                  <KeyValueGrid
+                    items={[
+                      { label: 'Email', value: selectedAccount.email },
+                      { label: 'Status', value: selectedAccount.status || '-' },
+                      { label: 'User', value: selectedAccount.user_name || selectedAccount.user_id || '-' },
+                      { label: 'Workspace', value: selectedWorkspace ? `${workspaceTitle(selectedWorkspace)} (${selectedWorkspace.id})` : selectedAccount.space_name || selectedAccount.space_id || '-' },
+                      { label: 'Plan', value: selectedWorkspace?.plan_type || selectedAccount.plan_type || '-' },
+                      { label: 'Last Login', value: formatMaybeDate(selectedAccount.last_login_at) },
+                      { label: 'Client Version', value: selectedAccount.client_version || '-' },
+                    ]}
+                  />
+
+                    <Subsection eyebrow="Runtime" title="运行态摘要" description="最近登录、使用与失败记录。">
+                      <div className="grid gap-3 sm:grid-cols-2">
+                        <MetaTile label="本地请求限速" value={quotaText(selectedWorkspace || selectedAccount)} />
+                        <MetaTile label="账号总并发上限" value={selectedAccount.account_max_concurrency || 1} />
+                        {selectedAccount.credential_cooldown_active ? <MetaTile label="账号暂停至" value={formatMaybeDate(selectedAccount.credential_cooldown_until)} /> : null}
+                          <MetaTile
+                            label="Cooldown"
+                            value={selectedWorkspace?.cooldown_active ? `${selectedWorkspace.cooldown_remaining_sec || 0}s` : 'ready'}
+                          />
+                          <MetaTile
+                            label="Success / Fail"
+                            value={`${selectedWorkspace?.total_successes || 0} / ${selectedWorkspace?.total_failures || 0}`}
+                          />
+                          <MetaTile label="Last Used" value={formatMaybeDate(selectedWorkspace?.last_used_at || selectedAccount.last_used_at)} />
+                      </div>
+                    </Subsection>
+                  <div className="grid gap-3 lg:grid-cols-2">
+                    <MetaTile
+                      label="Login Message"
+                      scrollable
+                      value={selectedAccount.login_status?.message || selectedAccount.login_status?.error || '-'}
+                    />
+                    <MetaTile label="Last Error" scrollable value={selectedAccount.last_error || '-'} />
+                  </div>
+
+                  <div className="grid gap-3 lg:grid-cols-3">
+                    <MetaTile label="Probe JSON" scrollable value={selectedAccount.probe_json || '-'} />
+                    <MetaTile label="Profile Dir" scrollable value={selectedAccount.profile_dir || '-'} />
+                    <MetaTile label="Storage State" scrollable value={selectedAccount.storage_state_path || '-'} />
+                  </div>
+
+                  </div>
+                  <div hidden={detailTab !== 'models'} className="space-y-4">
+                    {selectedWorkspace ? <WorkspaceModelPolicy key={workspaceEditKey(selectedAccount.email || '', selectedWorkspace.id)} email={selectedAccount.email || ''} workspaceID={selectedWorkspace.id} workspaceName={workspaceTitle(selectedWorkspace)} coolingDown={selectedAccount.credential_cooldown_active} onPolicyChanged={() => onRefreshModels(selectedAccount.email || '', selectedWorkspace.id)} /> : null}
+                    <Button variant="outline" disabled={refreshingModels || !selectedWorkspace || selectedAccount.credential_cooldown_active} onClick={async () => {
+                      if (!selectedWorkspace) return;
+                      setRefreshingModels(true);
+                      try { await onRefreshModels(selectedAccount.email || '', selectedWorkspace.id); toast.success('已刷新模型能力'); }
+                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
+                      finally { setRefreshingModels(false); }
+                    }}>{refreshingModels ? '正在刷新…' : '刷新模型能力'}</Button>
+                    <p className="col-span-full text-xs text-muted-foreground">模型选择：{selectedWorkspace?.model_capabilities?.mode === 'auto_only' ? '仅 Auto，由 Notion 分配' : selectedWorkspace?.model_capabilities?.mode === 'manual' ? '支持手动选择' : '未知，请刷新模型能力；当前可使用 Auto'}。{selectedWorkspace?.model_capabilities?.checked_at ? ` 上次确认：${formatMaybeDate(selectedWorkspace.model_capabilities.checked_at)}` : ''}</p>
+                    {selectedWorkspace?.model_capabilities ? <details className="col-span-full text-xs text-muted-foreground"><summary>模型目录与默认思考强度</summary><p className="my-2">目录仅提供说明，不代表当前工作区可手动选择。默认强度不代表本轮实际强度。</p><ul>{(selectedWorkspace.model_capabilities.catalog || selectedWorkspace.model_capabilities.models || []).map((item) => <li key={item.id}>{item.name || item.id} · 默认 {item.default_reasoning_effort || '未知'}{item.disabled_reason ? ` · 不可用：${item.disabled_reason}` : ''}</li>)}</ul></details> : null}
+                    <Button variant="outline" disabled={refreshingWorkspaces || selectedAccount.credential_cooldown_active} onClick={async () => {
+                      setRefreshingWorkspaces(true);
+                      try { await onRefreshWorkspaces(selectedAccount.email || ''); toast.success('已刷新工作区套餐'); }
+                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
+                      finally { setRefreshingWorkspaces(false); }
+                    }}>{refreshingWorkspaces ? '正在刷新…' : '刷新工作区套餐'}</Button>
+                    <p className="col-span-full text-xs text-muted-foreground">{selectedWorkspace?.eligible ? '商业工作区 · 已通过套餐准入' : selectedWorkspace?.ai_disabled ? '此工作区已关闭 AI 功能。' : selectedWorkspace?.eligibility_reason?.startsWith('workspace_plan_excluded') ? '此套餐不支持聊天，请选择商业试用、Business 或 Enterprise 工作区。' : '套餐尚未确认，请刷新工作区套餐。'} · 套餐准入不代表所有模型均有额度。</p>
+                  </div>
+                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3 border-t pt-4">
+                    <Button className="w-full" disabled={savingAccount} onClick={() => void saveAccount(selectedAccount.email, selectedWorkspace?.id, selectedEdit, selectedDisabled)}>
+                      {savingAccount ? '保存中...' : '保存工作区设置'}
+                    </Button>
+                    <Button
+                      className="w-full"
+                      variant="outline"
+                      disabled={!selectedWorkspace || selectedWorkspace.default}
+                      onClick={() => selectedWorkspace && void setDefaultWorkspace(selectedAccount.email, selectedWorkspace.id)}
+                    >
+                      设为默认工作区
+                    </Button>
+                    <Button className="w-full" variant="outline" onClick={() => { populateEmail(selectedAccount.email); setAddOpen(true); }}>
+                      填充到表单
+                    </Button>
+                    <Button className="w-full" variant="outline" onClick={() => void activateAccount(selectedAccount.email, selectedWorkspace?.id)}>
+                      激活工作区
+                    </Button>
+                    <Button className="w-full" variant="outline" disabled={quickTesting} onClick={() => void runQuickTest(selectedAccount.email, selectedWorkspace?.id)}>
+                      {quickTesting ? '测试中...' : '测试工作区'}
+                    </Button>
+                    <Button
+                      variant="outline"
+                      className="w-full text-destructive hover:text-destructive"
+                      onClick={() => void deleteAccount(selectedAccount.email)}
+                    >
+                      <Trash2 className="size-4" />
+                      删除账号
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <EmptyHint title="请选择一个账号" description="选择后查看详情与操作。" />
+              )}
+            </InfoCard>
+          </div>
+        </div>
+
+        <details className="account-tools" open={toolsOpen} onToggle={(event) => setToolsOpen(event.currentTarget.open)}>
+          <summary>连接测试与运行详情</summary>
+          <InfoCard title="Runtime 概览" description="账号池与会话摘要。">
+            <div className="grid gap-3">
+              {runtimeCards.map((item) => (
+                <MetaTile key={item.label} label={item.label} scrollable value={item.value} />
+              ))}
+            </div>
+          </InfoCard>
+
+          <InfoCard title="快速测试指定账号" description="验证账号与模型是否可用。">
+            <div className="space-y-4">
+              <DetailField label="Account">
+                <Select value={quickTestEmail} onValueChange={setQuickTestEmail} disabled={!accountOptions.length}>
+                  <SelectTrigger className={FIELD_CLASS}>
+                    <SelectValue placeholder="选择账号" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {accountOptions.map((item) => (
+                      <SelectItem key={item.email} value={item.email}>
+                        {item.email}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </DetailField>
+              {(() => {
+                const item = accountOptions.find((candidate) => candidate.email === quickTestEmail);
+                const workspaces = item ? workspaceItems(item) : [];
+                return workspaces.length > 1 ? (
+                  <DetailField label="工作区">
+                    <Select value={quickTestWorkspaceId} onValueChange={setQuickTestWorkspaceId}>
+                      <SelectTrigger className={FIELD_CLASS}>
+                        <SelectValue placeholder="选择工作区" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {workspaces.map((workspace) => (
+                          <SelectItem key={workspace.id} value={workspace.id}>{workspaceTitle(workspace)}</SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </DetailField>
+                ) : null;
+              })()}
+              <DetailField label="Model">
+                <Select value={quickTestModel} onValueChange={setQuickTestModel}>
+                  <SelectTrigger className={FIELD_CLASS}>
+                    <SelectValue placeholder="选择模型" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {modelOptions.map((item) => (
+                      <SelectItem key={item.id} value={item.id}>
+                        {item.name || item.id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </DetailField>
+              <DetailField label="Prompt" hint="建议先用短 prompt 探测 READY，再换长内容回归。">
+                <Textarea value={quickTestPrompt} onChange={(event) => setQuickTestPrompt(event.target.value)} className={[TEXTAREA_CLASS, 'min-h-[130px]'].join(' ')} />
+              </DetailField>
+              <Button className="w-full justify-center" disabled={quickTesting || !quickTestEmail} onClick={() => void runQuickTest(quickTestEmail)}>
+                <Rocket className="size-4" />
+                {quickTesting ? '测试中...' : '测试账号'}
+              </Button>
+              <p className="text-xs leading-5 text-muted-foreground">{quickTestMessage || '建议先用短 prompt 验证账号是否 READY。'}</p>
+            </div>
+          </InfoCard>
+
+          <JsonPreview title="账号测试输出" value={quickTestOutput} minHeight={320} />
+        </details>
+      </div>
+      <details className="account-tools" onToggle={(event) => setUsageOpen(event.currentTarget.open)}><summary>所有账号的 Notion 额度</summary>{usageOpen ? <AIUsagePanel /> : null}</details>
+      <Dialog open={addOpen} onOpenChange={setAddOpen}>
+        <DialogContent aria-describedby={undefined} className="!max-w-3xl max-h-[88dvh] overflow-y-auto">
+          <DialogTitle>添加账号</DialogTitle>
+          <div className="space-y-5">
           <InfoCard
             title="验证码登录管线"
             description="发起验证码请求、提交验证码，同步动作会自动填充到其他区域。"
@@ -791,279 +1084,9 @@ export function AccountsPanel({
             </div>
           </InfoCard>
 
-          <div className="grid gap-6 xl:grid-cols-[minmax(320px,360px)_minmax(0,1fr)] 2xl:grid-cols-[minmax(340px,0.8fr)_minmax(0,1.2fr)]">
-            <InfoCard title="账号池" description={`共 ${accountOptions.length} 个账号，点击查看详情。`}>
-              {accountOptions.length ? (
-                <ScrollArea className="console-list-scroll pretty-scroll pr-3">
-                  <div className="space-y-3 pb-1">
-                    {accountOptions.map((item) => (
-                      <AccountListItem
-                        key={item.email}
-                        item={item}
-                        selected={item.email === selectedEmail}
-                        onSelect={() => {
-                          setSelectedEmail(item.email);
-                          setQuickTestEmail(item.email);
-                        }}
-                      />
-                    ))}
-                  </div>
-                </ScrollArea>
-              ) : (
-                <EmptyHint title="当前还没有账号" description="可先请求验证码，或直接导入 Probe JSON。" />
-              )}
-            </InfoCard>
-
-            <InfoCard title="账号详情与操作" description="当前账号的运行信息与操作入口。">
-              {selectedAccount ? (
-                <div className="space-y-5">
-                  {(() => {
-                    const workspaces = workspaceItems(selectedAccount);
-                    return workspaces.length ? (
-                      <DetailField label="Workspace" hint="额度、并发和会话目标都按这里选择的工作区计算。">
-                        <Select value={selectedWorkspace?.id || ''} onValueChange={setSelectedWorkspaceId} disabled={workspaces.length < 2}>
-                          <SelectTrigger className={FIELD_CLASS}>
-                            <SelectValue placeholder="选择工作区" />
-                          </SelectTrigger>
-                          <SelectContent>
-                            {workspaces.map((workspace) => (
-                              <SelectItem key={workspace.id} value={workspace.id}>
-                                {workspaceTitle(workspace)}{workspace.default ? ' · 默认' : ''}{workspace.active ? ' · 当前' : ''}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
-                      </DetailField>
-                    ) : null;
-                  })()}
-                  <KeyValueGrid
-                    items={[
-                      { label: 'Email', value: selectedAccount.email },
-                      { label: 'Status', value: selectedAccount.status || '-' },
-                      { label: 'User', value: selectedAccount.user_name || selectedAccount.user_id || '-' },
-                      { label: 'Workspace', value: selectedWorkspace ? `${workspaceTitle(selectedWorkspace)} (${selectedWorkspace.id})` : selectedAccount.space_name || selectedAccount.space_id || '-' },
-                      { label: 'Plan', value: selectedWorkspace?.plan_type || selectedAccount.plan_type || '-' },
-                      { label: 'Last Login', value: formatMaybeDate(selectedAccount.last_login_at) },
-                      { label: 'Client Version', value: selectedAccount.client_version || '-' },
-                    ]}
-                  />
-
-                  <div className="grid gap-4 lg:grid-cols-2">
-                    <Subsection eyebrow="Scheduling" title="调度与限额" description="保存后直接写回账号池。">
-                      <div className="space-y-4">
-                        <div className="grid gap-4 md:grid-cols-3">
-                          <DetailField label="Priority">
-                            <Input
-                              type="number"
-                              value={selectedEdit.priority}
-                              onChange={(event) =>
-                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
-                                  priority: Number(event.target.value || 0),
-                                })
-                              }
-                              className={FIELD_CLASS}
-                            />
-                          </DetailField>
-                          <DetailField label="本地每小时请求上限" hint="0 表示不限制。">
-                            <Input
-                              type="number"
-                              min="0"
-                              value={selectedEdit.hourlyQuota}
-                              onChange={(event) =>
-                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
-                                  hourlyQuota: Math.max(0, Number(event.target.value || 0)),
-                                })
-                              }
-                              className={FIELD_CLASS}
-                            />
-                          </DetailField>
-                          <DetailField label="Max Concurrency" hint="每账号并发槽位，最小值 1。">
-                            <Input
-                              type="number"
-                              min="1"
-                              value={selectedEdit.maxConcurrency}
-                              onChange={(event) =>
-                                updateWorkspaceEdit(selectedAccount.email, selectedWorkspace?.id, {
-                                  maxConcurrency: Math.max(1, Number(event.target.value || 1)),
-                                })
-                              }
-                              className={FIELD_CLASS}
-                            />
-                          </DetailField>
-                        </div>
-                        <div className="flex items-center justify-between gap-3 rounded-xl border bg-muted/40 px-3 py-3">
-                          <div>
-                            <div className="text-sm font-semibold tracking-tight">Disabled</div>
-                            <p className="text-xs leading-5 text-muted-foreground">作用于整个账号（所有工作区）；禁用后仍保留账号数据，但不参与调度。</p>
-                          </div>
-                          <Switch
-                            aria-label="禁用账号"
-                            checked={selectedDisabled}
-                            onCheckedChange={(checked) => setDisabledEdits((current) => ({ ...current, [selectedAccount.email]: checked }))}
-                          />
-                        </div>
-                      </div>
-                    </Subsection>
-
-                    <Subsection eyebrow="Runtime" title="运行态摘要" description="最近登录、使用与失败记录。">
-                      <div className="grid gap-3 sm:grid-cols-2">
-                        <MetaTile label="本地请求限速" value={quotaText(selectedWorkspace || selectedAccount)} />
-                        <MetaTile label="账号总并发上限" value={selectedAccount.account_max_concurrency || 1} />
-                        {selectedAccount.credential_cooldown_active ? <MetaTile label="账号暂停至" value={formatMaybeDate(selectedAccount.credential_cooldown_until)} /> : null}
-                          <MetaTile
-                            label="Cooldown"
-                            value={selectedWorkspace?.cooldown_active ? `${selectedWorkspace.cooldown_remaining_sec || 0}s` : 'ready'}
-                          />
-                          <MetaTile
-                            label="Success / Fail"
-                            value={`${selectedWorkspace?.total_successes || 0} / ${selectedWorkspace?.total_failures || 0}`}
-                          />
-                          <MetaTile label="Last Used" value={formatMaybeDate(selectedWorkspace?.last_used_at || selectedAccount.last_used_at)} />
-                      </div>
-                    </Subsection>
-                  </div>
-
-                  <div className="grid gap-3 lg:grid-cols-2">
-                    <MetaTile
-                      label="Login Message"
-                      scrollable
-                      value={selectedAccount.login_status?.message || selectedAccount.login_status?.error || '-'}
-                    />
-                    <MetaTile label="Last Error" scrollable value={selectedAccount.last_error || '-'} />
-                  </div>
-
-                  <div className="grid gap-3 lg:grid-cols-3">
-                    <MetaTile label="Probe JSON" scrollable value={selectedAccount.probe_json || '-'} />
-                    <MetaTile label="Profile Dir" scrollable value={selectedAccount.profile_dir || '-'} />
-                    <MetaTile label="Storage State" scrollable value={selectedAccount.storage_state_path || '-'} />
-                  </div>
-
-                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-                    {selectedWorkspace ? <WorkspaceModelPolicy key={workspaceEditKey(selectedAccount.email || '', selectedWorkspace.id)} email={selectedAccount.email || ''} workspaceID={selectedWorkspace.id} workspaceName={workspaceTitle(selectedWorkspace)} coolingDown={selectedAccount.credential_cooldown_active} onPolicyChanged={() => onRefreshModels(selectedAccount.email || '', selectedWorkspace.id)} /> : null}
-                    <Button variant="outline" disabled={refreshingModels || !selectedWorkspace || selectedAccount.credential_cooldown_active} onClick={async () => {
-                      if (!selectedWorkspace) return;
-                      setRefreshingModels(true);
-                      try { await onRefreshModels(selectedAccount.email || '', selectedWorkspace.id); toast.success('已刷新模型能力'); }
-                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
-                      finally { setRefreshingModels(false); }
-                    }}>{refreshingModels ? '正在刷新…' : '刷新模型能力'}</Button>
-                    <p className="col-span-full text-xs text-muted-foreground">模型选择：{selectedWorkspace?.model_capabilities?.mode === 'auto_only' ? '仅 Auto，由 Notion 分配' : selectedWorkspace?.model_capabilities?.mode === 'manual' ? '支持手动选择' : '未知，请刷新模型能力；当前可使用 Auto'}。{selectedWorkspace?.model_capabilities?.checked_at ? ` 上次确认：${formatMaybeDate(selectedWorkspace.model_capabilities.checked_at)}` : ''}</p>
-                    {selectedWorkspace?.model_capabilities ? <details className="col-span-full text-xs text-muted-foreground"><summary>模型目录与默认思考强度</summary><p className="my-2">目录仅提供说明，不代表当前工作区可手动选择。默认强度不代表本轮实际强度。</p><ul>{(selectedWorkspace.model_capabilities.catalog || selectedWorkspace.model_capabilities.models || []).map((item) => <li key={item.id}>{item.name || item.id} · 默认 {item.default_reasoning_effort || '未知'}{item.disabled_reason ? ` · 不可用：${item.disabled_reason}` : ''}</li>)}</ul></details> : null}
-                    <Button variant="outline" disabled={refreshingWorkspaces || selectedAccount.credential_cooldown_active} onClick={async () => {
-                      setRefreshingWorkspaces(true);
-                      try { await onRefreshWorkspaces(selectedAccount.email || ''); toast.success('已刷新工作区套餐'); }
-                      catch (error) { toast.error(error instanceof Error ? error.message : '刷新失败'); }
-                      finally { setRefreshingWorkspaces(false); }
-                    }}>{refreshingWorkspaces ? '正在刷新…' : '刷新工作区套餐'}</Button>
-                    <p className="col-span-full text-xs text-muted-foreground">{selectedWorkspace?.eligible ? '商业工作区 · 已通过套餐准入' : selectedWorkspace?.ai_disabled ? '此工作区已关闭 AI 功能。' : selectedWorkspace?.eligibility_reason?.startsWith('workspace_plan_excluded') ? '此套餐不支持聊天，请选择商业试用、Business 或 Enterprise 工作区。' : '套餐尚未确认，请刷新工作区套餐。'} · 套餐准入不代表所有模型均有额度。</p>
-                    <Button className="w-full" disabled={savingAccount} onClick={() => void saveAccount(selectedAccount.email, selectedWorkspace?.id, selectedEdit, selectedDisabled)}>
-                      {savingAccount ? '保存中...' : '保存工作区设置'}
-                    </Button>
-                    <Button
-                      className="w-full"
-                      variant="outline"
-                      disabled={!selectedWorkspace || selectedWorkspace.default}
-                      onClick={() => selectedWorkspace && void setDefaultWorkspace(selectedAccount.email, selectedWorkspace.id)}
-                    >
-                      设为默认工作区
-                    </Button>
-                    <Button className="w-full" variant="outline" onClick={() => populateEmail(selectedAccount.email)}>
-                      填充到表单
-                    </Button>
-                    <Button className="w-full" variant="outline" onClick={() => void activateAccount(selectedAccount.email, selectedWorkspace?.id)}>
-                      激活工作区
-                    </Button>
-                    <Button className="w-full" variant="outline" disabled={quickTesting} onClick={() => void runQuickTest(selectedAccount.email, selectedWorkspace?.id)}>
-                      {quickTesting ? '测试中...' : '测试工作区'}
-                    </Button>
-                    <Button
-                      variant="outline"
-                      className="w-full text-destructive hover:text-destructive"
-                      onClick={() => void deleteAccount(selectedAccount.email)}
-                    >
-                      <Trash2 className="size-4" />
-                      删除账号
-                    </Button>
-                  </div>
-                </div>
-              ) : (
-                <EmptyHint title="请选择一个账号" description="选择后查看详情与操作。" />
-              )}
-            </InfoCard>
           </div>
-        </div>
-
-        <aside className="pretty-scroll min-w-0 space-y-5 self-start xl:sticky xl:top-6 xl:max-h-[calc(100vh-3rem)] xl:overflow-y-auto xl:pr-1">
-          <InfoCard title="Runtime 概览" description="账号池与会话摘要。">
-            <div className="grid gap-3">
-              {runtimeCards.map((item) => (
-                <MetaTile key={item.label} label={item.label} scrollable value={item.value} />
-              ))}
-            </div>
-          </InfoCard>
-
-          <InfoCard title="快速测试指定账号" description="验证账号与模型是否可用。">
-            <div className="space-y-4">
-              <DetailField label="Account">
-                <Select value={quickTestEmail} onValueChange={setQuickTestEmail} disabled={!accountOptions.length}>
-                  <SelectTrigger className={FIELD_CLASS}>
-                    <SelectValue placeholder="选择账号" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {accountOptions.map((item) => (
-                      <SelectItem key={item.email} value={item.email}>
-                        {item.email}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </DetailField>
-              {(() => {
-                const item = accountOptions.find((candidate) => candidate.email === quickTestEmail);
-                const workspaces = item ? workspaceItems(item) : [];
-                return workspaces.length > 1 ? (
-                  <DetailField label="Workspace">
-                    <Select value={quickTestWorkspaceId} onValueChange={setQuickTestWorkspaceId}>
-                      <SelectTrigger className={FIELD_CLASS}>
-                        <SelectValue placeholder="选择工作区" />
-                      </SelectTrigger>
-                      <SelectContent>
-                        {workspaces.map((workspace) => (
-                          <SelectItem key={workspace.id} value={workspace.id}>{workspaceTitle(workspace)}</SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </DetailField>
-                ) : null;
-              })()}
-              <DetailField label="Model">
-                <Select value={quickTestModel} onValueChange={setQuickTestModel}>
-                  <SelectTrigger className={FIELD_CLASS}>
-                    <SelectValue placeholder="选择模型" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {modelOptions.map((item) => (
-                      <SelectItem key={item.id} value={item.id}>
-                        {item.name || item.id}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </DetailField>
-              <DetailField label="Prompt" hint="建议先用短 prompt 探测 READY，再换长内容回归。">
-                <Textarea value={quickTestPrompt} onChange={(event) => setQuickTestPrompt(event.target.value)} className={[TEXTAREA_CLASS, 'min-h-[130px]'].join(' ')} />
-              </DetailField>
-              <Button className="w-full justify-center" disabled={quickTesting || !quickTestEmail} onClick={() => void runQuickTest(quickTestEmail)}>
-                <Rocket className="size-4" />
-                {quickTesting ? '测试中...' : '测试账号'}
-              </Button>
-              <p className="text-xs leading-5 text-muted-foreground">{quickTestMessage || '建议先用短 prompt 验证账号是否 READY。'}</p>
-            </div>
-          </InfoCard>
-
-          <JsonPreview title="账号测试输出" value={quickTestOutput} minHeight={320} />
-        </aside>
-      </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { QuotaWindows } from '@/components/admin/quota-windows';
 import { RefreshCcw } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { AdminService } from '@/lib/services/admin/admin.service';
@@ -31,24 +32,12 @@ export function AIUsagePanel() {
       </div>
       {error ? <p role="status" className="text-sm text-destructive">{error}</p> : null}
       {!payload && loading ? <p className="text-sm text-muted-foreground">查询中...</p> : null}
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[680px] text-left text-sm">
-          <thead><tr className="border-b text-xs text-muted-foreground"><th className="py-2 pr-4">账号 / 工作区</th><th className="px-2 py-2">基础额度</th><th className="px-2 py-2">工作区用量</th><th className="px-2 py-2">成员用量</th><th className="px-2 py-2">当前周期</th><th className="px-2 py-2">Credits 余额</th><th className="px-2 py-2">查询时间</th></tr></thead>
-          <tbody>{payload?.accounts.map((report) => {
-            const usage = report.usage;
-            const enforced = usage?.quota_enforced;
-            const status = report.status !== 'ok' ? '未知' : !usage?.is_eligible_known ? '资格未知' : !usage.is_eligible ? '不可用' : enforced ? '有限额' : usage.type === 'unlimited' ? '基础限额未启用' : '限额未知';
-            return <tr key={`${report.email}-${report.space_id}`} className="border-b last:border-0">
-              <td className="max-w-64 py-3 pr-4"><div className="break-all">{report.email}</div><div className="mt-1 break-all text-xs text-muted-foreground">{report.workspace_name || report.space_id || '工作区未知'}</div><div className="break-all text-[11px] text-muted-foreground">{report.space_id || '-'}</div>{report.detail ? <p className="mt-1 break-words text-xs text-destructive">{report.detail}</p> : null}</td>
-              <td className="px-2 py-3">{status}</td>
-              <td className="px-2 py-3 tabular-nums">{usage?.basic_usage_known ? `${usage.space_usage}${enforced && usage.basic_limits_known ? ` / ${usage.space_limit}` : ''}` : '未知'}</td>
-              <td className="px-2 py-3 tabular-nums">{usage?.basic_usage_known ? `${usage.user_usage}${enforced && usage.basic_limits_known ? ` / ${usage.user_limit}` : ''}` : '未知'}</td>
-              <td className="px-2 py-3 text-xs tabular-nums">{usage?.current_period_usage_known ? <><div>工作区 {usage.current_period_space_usage ?? 0}</div><div>成员 {usage.current_period_user_usage ?? 0}</div></> : '未知'}</td>
-              <td className="px-2 py-3 tabular-nums">{usage?.premium_credit_known ? <><div>{usage.premium_credit_balance ?? 0}</div>{usage.credits_in_overage ? <div className="text-xs text-muted-foreground">超额 {usage.credits_in_overage}</div> : null}</> : '未知'}</td>
-              <td className="px-2 py-3 text-xs text-muted-foreground">{report.fetched_at ? new Date(report.fetched_at).toLocaleString() : '-'}{report.cached ? ' (缓存)' : ''}</td>
-            </tr>;
-          })}</tbody>
-        </table>
+      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+        {(payload?.accounts || []).map((report) => <div className="rounded-lg border p-4 space-y-4" key={(report.email || '') + report.space_id}>
+          <div><h3 className="text-sm font-medium">{report.workspace_name || '工作区'}</h3><p className="text-xs text-muted-foreground break-all mt-1">{report.email}</p></div>
+          <QuotaWindows report={report} />
+          <details className="text-xs text-muted-foreground"><summary>其他用量</summary><p className="mt-2">累计基础用量：{report.usage?.basic_usage_known ? report.usage.user_usage : '未知'} · 额外积分余额：{report.usage?.premium_credit_known ? report.usage.premium_credit_balance : '未知'}</p></details>
+        </div>)}
       </div>
     </section>
   );

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // workspaceAIUsage is the normalized view of Notion's per-workspace AI
@@ -57,6 +58,7 @@ type workspaceAIUsage struct {
 // for the window ("5h", "6h", ...) and is shown verbatim -- the length belongs
 // to Notion, not to us.
 type workspaceRateLimitWindow struct {
+	ResetsAtMs  int64   `json:"resets_at_ms,omitempty"`
 	Label       string  `json:"label,omitempty"`
 	CreditType  string  `json:"credit_type,omitempty"`
 	Scope       string  `json:"scope,omitempty"`
@@ -92,8 +94,9 @@ func (c *NotionAIClient) getCreditRateLimitStatus(ctx context.Context, spaceID s
 
 func parseCreditRateLimitStatus(body []byte) (*workspaceRateLimit, error) {
 	var payload struct {
-		Status string `json:"status"`
-		Window *struct {
+		ResetsInSeconds *int64 `json:"resetsInSeconds"`
+		Status          string `json:"status"`
+		Window          *struct {
 			CreditType string  `json:"creditType"`
 			Scope      string  `json:"scope"`
 			Window     string  `json:"window"`
@@ -124,6 +127,10 @@ func parseCreditRateLimitStatus(body []byte) (*workspaceRateLimit, error) {
 			Used:       window.Used,
 			Limit:      window.Limit,
 		}
+	}
+	if out.Short != nil && payload.ResetsInSeconds != nil && *payload.ResetsInSeconds >= 0 {
+		// Store a fixed deadline: returning a cached report must not restart it.
+		out.Short.ResetsAtMs = time.Now().Add(time.Duration(*payload.ResetsInSeconds) * time.Second).UnixMilli()
 	}
 	if window := payload.BillingPeriodWindow; window != nil {
 		out.Long = &workspaceRateLimitWindow{

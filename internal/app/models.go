@@ -113,7 +113,10 @@ func buildModelRegistry(cfg AppConfig) ModelRegistry {
 			canonicalTarget = resolved
 		}
 		if _, ok := byID[canonicalTarget]; ok {
-			registerModelAlias(aliasToID, alias, canonicalTarget)
+			// Explicit operator mappings may disambiguate catalog aliases.
+			if key := normalizeLookupKey(alias); key != "" {
+				aliasToID[key] = canonicalTarget
+			}
 		}
 	}
 	entries = sortedModelEntries(entries)
@@ -150,7 +153,14 @@ func (r ModelRegistry) Resolve(value string, fallback string) (ModelDefinition, 
 		candidate = "auto"
 	}
 	key := normalizeLookupKey(candidate)
+	// Stable public IDs take precedence over descriptive aliases.
+	if entry, ok := r.ByID[key]; ok {
+		return entry, nil
+	}
 	if id, ok := r.AliasToID[key]; ok {
+		if id == "" {
+			return ModelDefinition{}, fmt.Errorf("ambiguous model alias: %s; use a model ID", candidate)
+		}
 		if entry, ok := r.ByID[id]; ok {
 			return entry, nil
 		}
@@ -419,7 +429,13 @@ func registerModelAlias(target map[string]string, alias string, id string) {
 	if key == "" || strings.TrimSpace(id) == "" {
 		return
 	}
-	target[key] = strings.TrimSpace(id)
+	id = strings.TrimSpace(id)
+	if previous, exists := target[key]; exists && previous != id {
+		// Keep an ambiguity marker: a third registration cannot undo it.
+		target[key] = ""
+		return
+	}
+	target[key] = id
 }
 
 func sortedModelEntries(entries []ModelDefinition) []ModelDefinition {

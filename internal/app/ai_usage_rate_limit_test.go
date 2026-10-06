@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // The payload is copied verbatim from a captured getCreditRateLimitStatus
@@ -104,5 +106,22 @@ func TestAdminWorkspaceAIUsageScopesToOneWorkspace(t *testing.T) {
 	app.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/admin/accounts/ai-usage/workspace?email=primary@example.com", nil))
 	if rec.Code == http.StatusOK {
 		t.Fatalf("unauthenticated request was served: %s", rec.Body.String())
+	}
+}
+
+func TestCreditRateLimitResetDeadline(t *testing.T) {
+	before := time.Now().Add(6 * time.Hour).UnixMilli()
+	raw := strings.Replace(creditRateLimitSample, "\"status\":", "\"resetsInSeconds\":21600,\"status\":", 1)
+	got, err := parseCreditRateLimitStatus([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now().Add(6 * time.Hour).UnixMilli()
+	if got.Short.ResetsAtMs < before || got.Short.ResetsAtMs > after {
+		t.Fatal("rolling reset deadline missing or incorrect")
+	}
+	original, _ := parseCreditRateLimitStatus([]byte(creditRateLimitSample))
+	if original.Short.ResetsAtMs != 0 {
+		t.Fatal("fabricated reset deadline without upstream value")
 	}
 }

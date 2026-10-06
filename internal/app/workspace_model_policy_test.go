@@ -519,3 +519,34 @@ func TestModelPolicyAuditRecordsSentButUnparsableWrite(t *testing.T) {
 		t.Fatal("precondition failed: upstream never received the write")
 	}
 }
+
+func TestCapturedOpus55PolicyCatalog(t *testing.T) {
+	fixture := newPolicyTestUpstream(t)
+	// Public model names and policy fields from the Oct 6 capture; no account data.
+	fixture.catalog = `{"models":[
+ {"model":"albuquerque-quinn","modelMessage":"Opus 5.5","modelProvider":"anthropic","isDisabled":false,"restrictedForPersonalAgent":false,"workflow":{"finalModelName":"albuquerque-quinn"},"customAgent":{"finalModelName":"albuquerque-quinn"}},
+ {"model":"achira-donut","modelMessage":"Sonnet 5.5","modelProvider":"anthropic","workflow":{},"customAgent":{}},
+ {"model":"omniberry-sundae","modelMessage":"GPT-6.1 Sol","modelProvider":"openai","restrictedForPersonalAgent":true,"workflow":{},"customAgent":{}}
+ ]}`
+	for _, scope := range []string{"personal", "custom"} {
+		snapshot := fixture.read(t, scope)
+		policy, err := lockWorkspaceModel(snapshot, "albuquerque-quinn")
+		if err != nil {
+			t.Fatal(err)
+		}
+		snapshot.Policy = policy
+		updatePolicyAllowedModels(&snapshot)
+		allowed := []string{}
+		for _, model := range snapshot.Models {
+			if model.Allowed {
+				allowed = append(allowed, model.ID)
+			}
+		}
+		if len(allowed) != 1 || allowed[0] != "albuquerque-quinn" {
+			t.Fatal("Opus 5.5 was not the sole allowed model")
+		}
+		if !policyContains(policy.DisabledProviders, "openai") || !policyContains(policy.DisabledModels, "achira-donut") {
+			t.Fatal("other candidates not excluded")
+		}
+	}
+}

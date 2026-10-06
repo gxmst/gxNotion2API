@@ -58,23 +58,21 @@ async function mockPanels(page: Page, options: { holdQuickTest?: boolean } = {})
 }
 
 async function openTab(page: Page, name: string) {
-  await page.goto('/admin');
-  await page.getByRole('button', { name: '管理控制台' }).click();
-  await page.getByRole('button', { name, exact: true }).click();
+  const tabs: Record<string, string> = { '账号': 'accounts', '设置': 'settings', '状态': 'dashboard' };
+  await page.goto('/admin?tab=' + tabs[name]);
 }
-
-test.beforeEach(({ page }) => {
-  test.skip(page.viewportSize()!.width < 1024, 'desktop layout only');
-});
-
+async function navigate(page: Page, name: string) {
+  if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航菜单' }).click();
+  await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name, exact: true }).click();
+}
 test('workspace scheduling edits are kept per workspace and reach the save payload', async ({ page }) => {
   const { accountSaves } = await mockPanels(page);
   await openTab(page, '账号');
-  const priority = page.locator('label:text-is("Priority")').locator('xpath=../..').locator('input');
+  const priority = page.locator('label:text-is("优先级")').locator('xpath=../..').locator('input');
   await expect(priority).toHaveValue('1');
   await priority.fill('7');
   await expect(priority).toHaveValue('7');
-  const concurrency = page.locator('label:text-is("Max Concurrency")').locator('xpath=../..').locator('input');
+  const concurrency = page.locator('label:text-is("工作区并发上限")').locator('xpath=../..').locator('input');
   await concurrency.fill('4');
   await page.getByRole('switch', { name: '禁用账号' }).click();
   await expect(page.getByRole('switch', { name: '禁用账号' })).toBeChecked();
@@ -112,7 +110,7 @@ test('unsaved settings survive a resync, guard tab changes, and save without acc
   await expect(page.getByText('后台配置已更新')).toBeVisible();
   await expect(host).toHaveValue('127.0.0.1');
   page.once('dialog', (dialog) => void dialog.dismiss());
-  await page.getByRole('button', { name: '账号', exact: true }).click();
+  await navigate(page, '账号');
   await expect(host).toHaveValue('127.0.0.1');
   await page.getByRole('button', { name: '保存设置' }).click();
   await expect.poll(() => settingsSaves.length).toBe(1);
@@ -123,6 +121,57 @@ test('unsaved settings survive a resync, guard tab changes, and save without acc
   expect(saved.features).not.toHaveProperty('is_custom_agent_builder');
   expect(saved.features).not.toHaveProperty('use_custom_agent_draft');
   await expect(page.getByText('有未保存的修改')).toHaveCount(0);
-  await page.getByRole('button', { name: '账号', exact: true }).click();
+  await navigate(page, '账号');
+  await expect(page.getByRole('button', { name: '保存工作区设置' })).toBeVisible();
+});
+
+test('account drafts survive refresh and guard navigation until discarded', async ({ page }) => {
+  await mockPanels(page);
+  await openTab(page, '账号');
+  const priority = page.locator('label:text-is("优先级")').locator('xpath=../..').locator('input');
+  await priority.fill('17');
+  await page.getByRole('switch', { name: '禁用账号' }).click();
+  await page.getByRole('button', { name: '刷新账号', exact: true }).click();
+  await expect(priority).toHaveValue('17');
+  await expect(page.getByRole('switch', { name: '禁用账号' })).toBeChecked();
+  await page.getByRole('button', { name: '重新同步' }).click();
+  await expect(priority).toHaveValue('17');
+  page.once('dialog', (dialog) => void dialog.dismiss());
+  await navigate(page, '状态');
+  await expect(priority).toHaveValue('17');
+  await page.getByRole('button', { name: '放弃修改' }).click();
+  await expect(priority).toHaveValue('1');
+  await expect(page.getByRole('switch', { name: '禁用账号' })).not.toBeChecked();
+  await navigate(page, '状态');
+  await expect(page.getByRole('heading', { name: '运行状态', exact: true })).toBeVisible();
+});
+
+test('navigation survives reload and follows browser history', async ({ page }) => {
+  await mockPanels(page);
+  await openTab(page, '账号');
+  await expect(page).toHaveURL(/tab=accounts/);
+  await page.reload();
+  await expect(page.getByRole('heading', { name: '账号与工作区', exact: true })).toBeVisible();
+  await navigate(page, '设置');
+  await expect(page).toHaveURL(/tab=settings/);
+  await page.goBack();
+  await expect(page.getByRole('heading', { name: '账号与工作区', exact: true })).toBeVisible();
+});
+
+test('settings categories preserve drafts and account creation is a separate dialog', async ({ page }) => {
+  await mockPanels(page);
+  await openTab(page, '设置');
+  const host = page.locator('label:text-is("监听 Host")').locator('xpath=ancestor::div[2]').locator('input').first();
+  await host.fill('127.0.0.1');
+  await page.getByRole('button', { name: '上游连接（高级）', exact: true }).click();
+  await expect(host).not.toBeVisible();
+  await page.getByRole('button', { name: '常用设置', exact: true }).click();
+  await expect(host).toHaveValue('127.0.0.1');
+  page.once('dialog', (dialog) => void dialog.accept());
+  await navigate(page, '账号');
+  await expect(page.getByText('验证码登录管线', { exact: true })).not.toBeVisible();
+  await page.getByRole('button', { name: '添加账号', exact: true }).click();
+  await expect(page.getByRole('dialog')).toContainText('验证码登录管线');
+  await page.getByRole('dialog').getByRole('button', { name: 'Close' }).click();
   await expect(page.getByRole('button', { name: '保存工作区设置' })).toBeVisible();
 });

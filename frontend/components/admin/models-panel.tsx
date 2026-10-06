@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { DatabaseZap, Layers3, Sparkles } from 'lucide-react';
 import { EmptyHint, InfoCard, KeyValueGrid, MetaTile, PanelHeader, StatCard } from '@/components/admin/shared';
+import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import type { ModelItem } from '@/lib/services/admin/types';
@@ -13,9 +14,11 @@ function uniqueValues(items: Array<string | undefined>) {
 }
 
 export function ModelsPanel({
+  onOpenAccounts,
   models,
   defaultModel,
 }: {
+  onOpenAccounts: () => void;
   models: ModelItem[];
   defaultModel?: string;
 }) {
@@ -39,8 +42,9 @@ export function ModelsPanel({
     <div className="space-y-6">
       <PanelHeader
         eyebrow="Models"
-        title="模型注册表"
-        description="查看模型映射、状态和内部目标。"
+        title="模型目录"
+        description="查看服务注册的模型及映射。实际可用模型取决于工作区权限与额度。"
+        actions={<Button variant="outline" onClick={onOpenAccounts}>管理工作区模型</Button>}
       />
 
       <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-4">

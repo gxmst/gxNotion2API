@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
+import { createContext, useContext, useEffect, useMemo, useRef, useState, type ComponentType, type ReactNode } from 'react';
 import { toast } from 'sonner';
 import {
   Bug,
@@ -146,45 +146,46 @@ const SECTIONS: SectionMeta[] = [
   {
     id: 'service-runtime',
     eyebrow: 'Runtime',
-    title: '服务监听与响应节奏',
+    title: '常用设置',
     description: '监听入口、默认模型与轮询节奏。',
     icon: Server,
   },
   {
     id: 'upstream-connection',
     eyebrow: 'Upstream',
-    title: '上游连接与路由透传',
+    title: '上游连接（高级）',
     description: '上游地址、TLS、Origin、代理。',
     icon: Globe,
   },
   {
     id: 'behavior-capabilities',
     eyebrow: 'Behavior',
-    title: '协议行为与能力开关',
+    title: '聊天与协议',
     description: '行为守护、默认能力位、AI Surface。',
     icon: Settings2,
   },
   {
     id: 'prompt-strategy',
     eyebrow: 'Prompt',
-    title: '满血策略与反拒绝 Prompt',
+    title: '提示词策略',
     description: '路由 profile、重试链路、即时测试。',
     icon: WandSparkles,
   },
   {
     id: 'security-admin',
     eyebrow: 'Security',
-    title: '安全 / Admin / 登录态 / 存储',
+    title: '安全与存储',
     description: '管理面密码、登录目录、SQLite 持久化。',
     icon: Shield,
   },
   {
     id: 'advanced-json',
     eyebrow: 'Advanced',
-    title: '高级 JSON 与调试输出',
+    title: '调试与模型映射',
     description: '调试开关、列表型与结构化高级配置。',
     icon: Bug,
   },
+  { id: 'configuration-files', eyebrow: 'Config', title: '配置文件', description: '导入、导出与快照。', icon: Download },
 ];
 
 function resolveStoragePersistenceFlag(flag: boolean | undefined, fallback: boolean | undefined) {
@@ -331,6 +332,8 @@ function ToggleTile({ label, description, value, onChange, disabled, hint }: Tog
   );
 }
 
+const ActiveSection = createContext('service-runtime');
+
 function SectionShell({
   id,
   eyebrow,
@@ -349,7 +352,7 @@ function SectionShell({
   children: ReactNode;
 }) {
   return (
-    <section id={id} className="scroll-mt-28">
+    <section id={id} hidden={useContext(ActiveSection) !== id} className="scroll-mt-28">
       <InfoCard
         title={
           <span className="flex flex-col gap-1">
@@ -374,61 +377,11 @@ function SectionShell({
 }
 
 function SectionNav({ activeId, onJump }: { activeId?: string; onJump?: (id: string) => void }) {
-  return (
-    <InfoCard
-      title="快速跳转"
-      description={
-        <span className="flex items-center gap-1.5 text-[12px]">
-          <Sparkles className="size-3.5 text-primary" />
-          点击任意章节直接定位
-        </span>
-      }
-    >
-      <nav className="grid gap-1.5">
-        {SECTIONS.map((section) => {
-          const Icon = section.icon;
-          const active = activeId === section.id;
-          return (
-            <a
-              key={section.id}
-              href={'#' + section.id}
-              onClick={(event) => {
-                if (onJump) {
-                  event.preventDefault();
-                  const node = document.getElementById(section.id);
-                  if (node) {
-                    node.scrollIntoView({ behavior: 'smooth', block: 'start' });
-                  }
-                  onJump(section.id);
-                }
-              }}
-              className={[
-                'flex items-start gap-3 rounded-lg border px-3 py-2.5 text-left transition-all',
-                active
-                  ? 'border-primary/40 bg-[color-mix(in_oklab,var(--primary)_12%,var(--card))] shadow-soft'
-                  : 'border-transparent hover:border-primary/20 hover:bg-muted/40',
-              ].join(' ')}
-            >
-              <div
-                className={[
-                  'flex size-7 shrink-0 items-center justify-center rounded-lg border',
-                  active
-                    ? 'border-primary/30 bg-primary/10 text-primary'
-                    : 'border-border/60 bg-card text-muted-foreground',
-                ].join(' ')}
-              >
-                <Icon className="size-[14px]" />
-              </div>
-              <div className="min-w-0">
-                <div className="section-eyebrow">{section.eyebrow}</div>
-                <div className="mt-0.5 text-[13px] font-medium leading-5">{section.title}</div>
-              </div>
-            </a>
-          );
-        })}
-      </nav>
-    </InfoCard>
-  );
+  return <nav className="settings-navigation" aria-label="设置分类">
+    {SECTIONS.map(({ id, title, icon: Icon }) => <button key={id} type="button" aria-current={activeId === id ? 'page' : undefined} onClick={() => onJump?.(id)}>
+      <Icon size={16} />{title}
+    </button>)}
+  </nav>;
 }
 
 export function SettingsPanel({
@@ -463,7 +416,7 @@ export function SettingsPanel({
   const [output, setOutput] = useState('等待操作...');
   const [message, setMessage] = useState('');
   const [saving, setSaving] = useState(false);
-  const [activeSection, setActiveSection] = useState<string>(SECTIONS[0]?.id ?? '');
+  const [activeSection, setActiveSection] = useState<string>('service-runtime');
   const [strategyTestPrompt, setStrategyTestPrompt] = useState(PROMPT_TEST_PRESETS.creative);
   const [strategyTestModel, setStrategyTestModel] = useState(config.default_model || config.model_id || models[0]?.id || 'auto');
   const [strategyTestUseWebSearch, setStrategyTestUseWebSearch] = useState(Boolean(config.features?.use_web_search));
@@ -522,27 +475,6 @@ export function SettingsPanel({
       }));
     }
   }, [form.forceDisableUpstreamEdits]);
-
-  // Track active section using IntersectionObserver for the SectionNav highlight.
-  useEffect(() => {
-    if (typeof window === 'undefined' || typeof IntersectionObserver === 'undefined') return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((entry) => entry.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
-        if (visible?.target?.id) {
-          setActiveSection(visible.target.id);
-        }
-      },
-      { rootMargin: '-20% 0px -60% 0px', threshold: [0, 0.25, 0.5, 0.75, 1] },
-    );
-    SECTIONS.forEach((section) => {
-      const node = document.getElementById(section.id);
-      if (node) observer.observe(node);
-    });
-    return () => observer.disconnect();
-  }, []);
 
   const currentModel = useMemo(() => form.defaultModel || models[0]?.id || 'auto', [form.defaultModel, models]);
   const persistenceEnabledCount = useMemo(
@@ -619,69 +551,6 @@ export function SettingsPanel({
       value: form.enableCsv,
       onChange: (checked) => setForm({ ...form, enableCsv: checked }),
     },
-  ];
-
-  const summaryCards = useMemo(
-    () => [
-      {
-        label: '监听入口',
-        value: (form.host.trim() || '0.0.0.0') + ':' + (form.port || '8787'),
-        hint: 'WebUI、OpenAI 兼容接口与管理面共用此入口。',
-      },
-      {
-        label: '上游目标',
-        value: parseHostLabel(form.upstreamBaseURL),
-        hint: form.upstreamTLSServerName.trim() || '未额外指定 TLS SNI',
-      },
-      {
-        label: '默认模型',
-        value: currentModel,
-        hint: (form.aiSurface || 'ai_module') + ' / ' + (form.threadType || 'workflow'),
-      },
-      {
-        label: '写入策略',
-        value: form.forceDisableUpstreamEdits ? '强制只读' : form.readOnly ? 'Read Only' : '允许写入',
-        hint: form.forceFreshThreadPerRequest ? '每次请求都会新建上游 thread' : form.useWebSearch ? '默认联网已开启' : '默认联网已关闭',
-      },
-      {
-        label: '会话落盘',
-        value: persistenceEnabled ? `${persistenceEnabledCount} / 4 项已启用` : '仅内存',
-        hint: form.sqlitePath.trim() || '未配置 SQLite 路径',
-      },
-      {
-        label: 'Prompt 策略',
-        value: form.promptProfile || 'cognitive_reframing',
-        hint: `${form.maxRefusalRetries || 0} 次拒绝重试`,
-      },
-    ],
-    [
-      currentModel,
-      form.aiSurface,
-      form.forceDisableUpstreamEdits,
-      form.forceFreshThreadPerRequest,
-      form.host,
-      form.maxRefusalRetries,
-      form.port,
-      form.promptProfile,
-      form.readOnly,
-      form.sqlitePath,
-      form.threadType,
-      form.upstreamBaseURL,
-      form.upstreamTLSServerName,
-      form.useWebSearch,
-      persistenceEnabled,
-      persistenceEnabledCount,
-    ],
-  );
-
-  const sidebarHighlights = [
-    { label: 'Admin 密码', value: adminPasswordSet ? '已配置，留空不改' : '尚未设置' },
-    { label: '会话目录', value: form.loginSessionsDir.trim() || '使用默认目录' },
-    { label: 'SQLite 会话', value: persistenceEnabled ? `${persistenceEnabledCount} / 4 项已启用` : '全部关闭' },
-    { label: 'Upstream 调试', value: form.debugUpstream ? '开启' : '关闭' },
-    { label: 'Chat Profile', value: form.promptProfile || 'cognitive_reframing' },
-    { label: '拒绝重试', value: `${form.maxRefusalRetries || 0} 次` },
-    { label: '升级步数', value: `${form.maxEscalationSteps || 0} 步` },
   ];
 
   const promptStrategyPayload = useMemo(() => buildPromptStrategyPayload(form), [form]);
@@ -886,8 +755,8 @@ export function SettingsPanel({
 
       <PanelHeader
         eyebrow="Settings"
-        title="配置与热更新"
-        description="集中管理监听、上游、会话策略与高级 JSON。"
+        title="设置"
+        description="按分类调整配置，所有修改统一保存。"
         actions={
           <>
             <div className="status-chip max-w-[360px]">
@@ -910,18 +779,14 @@ export function SettingsPanel({
         }
       />
 
-      <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-3">
-        {summaryCards.map((item) => (
-          <StatCard key={item.label} label={item.label} value={item.value} hint={item.hint} />
-        ))}
-      </div>
-
-      <div className="grid gap-6 2xl:grid-cols-[minmax(0,1fr)_320px]">
+      <SectionNav activeId={activeSection} onJump={setActiveSection} />
+      <ActiveSection.Provider value={activeSection}>
+      <div className="settings-layout">
         <div className="min-w-0 space-y-6">
           <SectionShell
             id="service-runtime"
             eyebrow="Runtime"
-            title="服务监听与响应节奏"
+            title="常用设置"
             description="配置监听地址、默认模型和运行参数。"
             icon={Server}
           >
@@ -954,6 +819,7 @@ export function SettingsPanel({
                 </div>
               </Subsection>
 
+              <details className="account-tools"><summary>高级响应参数</summary>
               <Subsection eyebrow="Runtime Rhythm" title="超时与轮询节奏" description="配置超时、轮询间隔、缓存保留和流式分块参数。">
                 <div className="grid gap-4 md:grid-cols-2">
                   <FieldBlock label="Timeout (sec)" description="单次上游请求的总超时。">
@@ -972,14 +838,14 @@ export function SettingsPanel({
                     <Input type="number" value={form.chunkRunes} onChange={(event) => setForm({ ...form, chunkRunes: event.target.value })} className={FIELD_CLASSNAME} />
                   </FieldBlock>
                 </div>
-              </Subsection>
+              </Subsection></details>
             </div>
           </SectionShell>
 
           <SectionShell
             id="upstream-connection"
             eyebrow="Upstream"
-            title="上游连接与路由透传"
+            title="上游连接（高级）"
             description="配置上游地址、请求头透传、TLS 和环境代理。"
             icon={Globe}
           >
@@ -1020,7 +886,7 @@ export function SettingsPanel({
           <SectionShell
             id="behavior-capabilities"
             eyebrow="Behavior"
-            title="协议行为与能力开关"
+            title="聊天与协议"
             description="配置协议行为守护和默认能力开关。"
             icon={Settings2}
           >
@@ -1060,7 +926,7 @@ export function SettingsPanel({
           <SectionShell
             id="prompt-strategy"
             eyebrow="Prompt"
-            title="满血策略与反拒绝 Prompt"
+            title="提示词策略"
             description="在线编辑 profile、重试链路与测试样本。"
             icon={WandSparkles}
             actions={
@@ -1258,7 +1124,7 @@ export function SettingsPanel({
           <SectionShell
             id="security-admin"
             eyebrow="Security"
-            title="安全 / Admin / 登录态 / 存储"
+            title="安全与存储"
             description="集中核对管理密码、会话目录与登录超时。"
             icon={Shield}
           >
@@ -1345,7 +1211,7 @@ export function SettingsPanel({
           <SectionShell
             id="advanced-json"
             eyebrow="Advanced"
-            title="高级 JSON 与调试输出"
+            title="调试与模型映射"
             description="维护调试开关、列表项和结构化 JSON。"
             icon={Bug}
           >
@@ -1377,16 +1243,8 @@ export function SettingsPanel({
         </div>
 
         {/* Sticky right rail with section nav, ops checklist, file/snapshot actions, and JSON output. */}
-        <aside className="pretty-scroll min-w-0 space-y-5 self-start xl:sticky xl:top-6 xl:max-h-[calc(100vh-3rem)] xl:overflow-y-auto xl:pr-1">
-          <SectionNav activeId={activeSection} onJump={setActiveSection} />
+        <aside hidden={activeSection !== 'configuration-files'} className="settings-utilities">
 
-          <InfoCard title="部署核对" description="关键运行项。">
-            <div className="grid gap-3">
-              {sidebarHighlights.map((item) => (
-                <MetaTile key={item.label} label={item.label} value={item.value} />
-              ))}
-            </div>
-          </InfoCard>
 
           <InfoCard
             title="配置文件 / 快照"
@@ -1467,6 +1325,7 @@ export function SettingsPanel({
           <JsonPreview title="配置输出" value={output} onCopy={() => void copyText(output)} minHeight={420} />
         </aside>
       </div>
+      </ActiveSection.Provider>
     </div>
   );
 }

@@ -114,6 +114,13 @@ export function WorkspaceModelPolicy({ email, workspaceID, workspaceName, coolin
           {model.name}{!model.available ? `（不可用${model.disabled_reason ? `：${model.disabled_reason}` : ''}）` : ''}
         </SelectItem>)}</SelectContent>
       </Select>
+      {selected ? <div className="rounded-md bg-muted p-3 text-xs leading-6 break-all" aria-label="模型对应关系">
+        <div>官方名称：{selected.name}</div>
+        <div>供应商：{selected.provider}</div>
+        <div>设置 ID：{selected.id}</div>
+        <div>此代理推理别名：{selected.final_model || '上游未返回，无法确认'}</div>
+        <p className="text-muted-foreground">以上对应关系来自本次 Notion 目录响应；不代表已经验证实际调用模型。</p>
+      </div> : null}
       <p className="text-xs leading-5 text-muted-foreground">应用后将允许目标模型，并排除当前目录内的其他模型与供应商。目录新增模型后需重新确认；此设置不会解除试用或套餐限制。</p>
       {selected ? <p className="text-xs">将应用到「{workspaceName}」的{scopeLabel}：{selected.name}</p> : null}
       <div className="flex flex-wrap gap-2">

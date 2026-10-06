@@ -64,6 +64,8 @@ type ServerState struct {
 	cachedHealthzStaticJSON    atomic.Pointer[[]byte]
 	cachedModelsListJSON       atomic.Pointer[[]byte]
 	cachedModelByIDJSON        atomic.Pointer[map[string][]byte]
+	notesMu                    sync.Mutex
+	notesCache                 map[string]noteCacheEntry
 	aiUsageMu                  sync.Mutex
 	aiUsageCache               map[string]workspaceAIUsageReport
 	aiUsageLastForced          time.Time

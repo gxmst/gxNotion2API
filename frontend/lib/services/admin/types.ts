@@ -33,7 +33,7 @@ export interface ModelPolicySnapshot {
   policy: WorkspaceModelPolicy;
   policy_present: boolean;
   revision: string;
-  models: { id: string; name: string; provider: string; available: boolean; disabled_reason?: string; allowed: boolean }[];
+  models: { id: string; name: string; final_model?: string; provider: string; available: boolean; disabled_reason?: string; allowed: boolean }[];
   // Server-persisted pre-change policy captured at the first successful lock;
   // cleared after a successful restore or clear.
   restore_point?: ModelPolicyRestorePoint | null;
@@ -324,6 +324,7 @@ export interface AIUsageReport {
  * when `limit > 0`.
  */
 export interface AIUsageRateLimitWindow {
+  resets_at_ms?: number;
   label?: string;
   credit_type?: string;
   scope?: string;
