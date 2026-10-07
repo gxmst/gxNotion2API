@@ -23,7 +23,9 @@ func (s *ConversationStore) ImportRemote(entry ConversationEntry) ConversationEn
 }
 
 // DeleteMessage edits only the local transcript, like SetMessageContent.
-func (s *ConversationStore) DeleteMessage(conversationID, messageID string) (ConversationEntry, error) {
+func (s *ConversationStore) DeleteMessage(conversationID, messageID string, savers ...func(ConversationEntry) error) (ConversationEntry, error) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	s.mu.Lock()
 	entry := s.items[strings.TrimSpace(conversationID)]
 	if entry == nil {
@@ -79,6 +81,10 @@ func (s *ConversationStore) DeleteMessage(conversationID, messageID string) (Con
 	next.RequestFingerprint = ""
 	next.UpdatedAt = time.Now().UTC()
 	refreshConversationDerivedFields(&next)
+	if err := persistConversationMutation(next, savers); err != nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, err
+	}
 	s.items[next.ID] = &next
 	summary := buildConversationSummary(&next)
 	s.mu.Unlock()

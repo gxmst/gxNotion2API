@@ -1176,9 +1176,11 @@ func (s *ConversationStore) SetExecutionTarget(conversationID string, threadID s
 
 // SetTitle replaces a conversation title. Titles are otherwise derived from the
 // first prompt at creation time, so this is the only way for an operator to
-// name a conversation themselves. It returns the updated entry for the caller
-// to persist; the in-memory store is updated either way.
-func (s *ConversationStore) SetTitle(conversationID string, title string) (ConversationEntry, error) {
+// name a conversation themselves. An optional saver must succeed before the
+// in-memory entry is replaced and subscribers are notified.
+func (s *ConversationStore) SetTitle(conversationID string, title string, savers ...func(ConversationEntry) error) (ConversationEntry, error) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	conversationID = strings.TrimSpace(conversationID)
 	if conversationID == "" {
 		return ConversationEntry{}, fmt.Errorf("conversation id is required")
@@ -1206,6 +1208,10 @@ func (s *ConversationStore) SetTitle(conversationID string, title string) (Conve
 	next.Title = title
 	next.TitleEditedAt = timePointer(now)
 	next.UpdatedAt = now
+	if err := persistConversationMutation(next, savers); err != nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, err
+	}
 	s.items[conversationID] = &next
 	summary := buildConversationSummary(&next)
 	s.mu.Unlock()
@@ -1224,7 +1230,9 @@ func (s *ConversationStore) SetTitle(conversationID string, title string) (Conve
 // deltas to the assistant message, so an edit there would be overwritten or
 // interleaved. The edit is recorded with EditedAt so the transcript can say the
 // text is no longer verbatim model output.
-func (s *ConversationStore) SetMessageContent(conversationID string, messageID string, content string) (ConversationEntry, error) {
+func (s *ConversationStore) SetMessageContent(conversationID string, messageID string, content string, savers ...func(ConversationEntry) error) (ConversationEntry, error) {
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 	conversationID = strings.TrimSpace(conversationID)
 	messageID = strings.TrimSpace(messageID)
 	if conversationID == "" {
@@ -1265,6 +1273,11 @@ func (s *ConversationStore) SetMessageContent(conversationID string, messageID s
 	next.Messages[index].UpdatedAt = now
 	next.Messages[index].EditedAt = &editedAt
 	next.UpdatedAt = now
+	refreshConversationDerivedFields(&next)
+	if err := persistConversationMutation(next, savers); err != nil {
+		s.mu.Unlock()
+		return ConversationEntry{}, err
+	}
 	s.items[conversationID] = &next
 	summary := buildConversationSummary(&next)
 	s.mu.Unlock()

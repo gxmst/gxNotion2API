@@ -625,6 +625,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
     const controller = new AbortController(); abortRef.current = controller;
     setRunning(true); setError(''); followBottom.current = true;
     const sentPrompt = prompt;
+    const sentFiles = files;
     const id = conversationID || 'conv_' + newID();
     const answerID = 'answer_' + newID();
     try {
@@ -660,6 +661,27 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       setError(controller.signal.aborted ? '已停止生成' : cause instanceof Error ? cause.message : '生成失败');
       setMessages((current) => current.map((item) => item.id === answerID ? { ...item, status: 'failed' } : item));
       if (!controller.signal.aborted) setPrompt((current) => current || sentPrompt);
+      if (!controller.signal.aborted) setFiles(sentFiles);
+      // Failed/stopped turns also have server-assigned message IDs. Keeping
+      // optimistic IDs here made the next edit/delete address a missing row.
+      try {
+        const { item } = await propsRef.current.onLoad(id);
+        if (mounted.current) {
+          const persisted = item.messages || [];
+          // A dropped connection can leave the server snapshot behind the
+          // visible stream. Keep the partial answer until that snapshot catches up.
+          setMessages((current) => persisted.map((message, index) => {
+            const optimistic = current[current.length - 1];
+            return index === persisted.length - 1 && message.role === 'assistant' && optimistic?.id === answerID &&
+              (optimistic.content || '').length > (message.content || '').length
+              ? { ...message, content: optimistic.content, status: 'failed' } : message;
+          }));
+          setRemoteOnly(Boolean(item.remote_only));
+          setOwner(item.account_email || '');
+          if (item.account_email && item.space_id) setTarget(targetID(item.account_email, item.space_id));
+          setRemoteRunning(item.status === 'running' || item.status === 'queued');
+        }
+      } catch { /* Keep the failed turn visible if the server cannot be reached. */ }
     } finally { abortRef.current = null; if (mounted.current) setRunning(false); }
   }
 

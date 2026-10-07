@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -186,6 +187,10 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 	out.CreatedAt = mergeConversationTimes(out.CreatedAt, remote.CreatedAt, false)
 	out.UpdatedAt = mergeConversationTimes(out.UpdatedAt, remote.UpdatedAt, true)
 	out.CreatedByDisplay = firstNonEmpty(strings.TrimSpace(remote.CreatedByDisplay), strings.TrimSpace(out.CreatedByDisplay))
+	// A stale upstream transcript must not erase a locally failed/active turn.
+	if conversationStatusBusy(local.Status) || local.Status == "failed" {
+		return out
+	}
 	if len(remote.Messages) > 0 {
 		deletedIDs := make(map[string]bool, len(local.DeletedMessageIDs))
 		for _, id := range local.DeletedMessageIDs {
@@ -311,6 +316,13 @@ func (a *App) handleAdminConversations(w http.ResponseWriter, r *http.Request) {
 
 func (a *App) deleteAdminConversationByID(r *http.Request, conversationID string) error {
 	conversationID = strings.TrimSpace(conversationID)
+	// Imported transcripts keep their notion_thread: ID after becoming local.
+	// Use the owning account, deletion claim and durable cleanup for those rows.
+	if _, found, err := a.State.loadConversation(conversationID); err != nil {
+		return err
+	} else if found {
+		return a.deleteConversation(conversationID)
+	}
 	if threadID, ok := parseNotionThreadConversationID(conversationID); ok {
 		cfg, _, _ := a.State.Snapshot()
 		timedRequest, cancel := cloneRequestWithTimeout(r, adminSyncRequestTimeout(cfg))
@@ -458,18 +470,20 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 // handleAdminConversationRename renames a stored conversation. The title is
 // persisted with the snapshot, so it survives a restart.
 func (a *App) handleAdminConversationRename(w http.ResponseWriter, r *http.Request, conversationID string) {
+	if !a.loadAdminConversationForMutation(w, conversationID) {
+		return
+	}
 	defer r.Body.Close()
 	var req adminConversationRenameRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid json body"})
 		return
 	}
-	entry, err := a.State.conversations().SetTitle(conversationID, req.Title)
+	entry, err := a.State.conversations().SetTitle(conversationID, req.Title, a.State.conversationMutationSaver())
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		writeAdminConversationMutationError(w, err, http.StatusBadRequest)
 		return
 	}
-	a.State.persistConversationSnapshot(entry.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
 }
 
@@ -477,29 +491,24 @@ func (a *App) handleAdminConversationRename(w http.ResponseWriter, r *http.Reque
 // role. Editing is local to this bridge: nothing is pushed back to Notion, so
 // the upstream thread keeps the original text.
 func (a *App) handleAdminConversationMessageEdit(w http.ResponseWriter, r *http.Request, conversationID string, messageID string) {
+	if r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
+		return
+	}
 	if messageID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "message id is required"})
 		return
 	}
-	if r.Method == http.MethodDelete {
-		if _, found, err := a.State.loadConversation(conversationID); err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
-			return
-		} else if !found {
-			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found"})
-			return
-		}
-		entry, err := a.State.conversations().DeleteMessage(conversationID, messageID)
-		if err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
-			return
-		}
-		a.State.persistConversationSnapshot(entry.ID)
-		writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
+	if !a.loadAdminConversationForMutation(w, conversationID) {
 		return
 	}
-	if r.Method != http.MethodPatch {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
+	if r.Method == http.MethodDelete {
+		entry, err := a.State.conversations().DeleteMessage(conversationID, messageID, a.State.conversationMutationSaver())
+		if err != nil {
+			writeAdminConversationMutationError(w, err, http.StatusConflict)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
 		return
 	}
 	defer r.Body.Close()
@@ -508,13 +517,31 @@ func (a *App) handleAdminConversationMessageEdit(w http.ResponseWriter, r *http.
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "invalid json body"})
 		return
 	}
-	entry, err := a.State.conversations().SetMessageContent(conversationID, messageID, req.Content)
+	entry, err := a.State.conversations().SetMessageContent(conversationID, messageID, req.Content, a.State.conversationMutationSaver())
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		writeAdminConversationMutationError(w, err, http.StatusBadRequest)
 		return
 	}
-	a.State.persistConversationSnapshot(entry.ID)
 	writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
+}
+
+func (a *App) loadAdminConversationForMutation(w http.ResponseWriter, id string) bool {
+	if _, found, err := a.State.loadConversation(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
+		return false
+	} else if !found {
+		writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found"})
+		return false
+	}
+	return true
+}
+
+func writeAdminConversationMutationError(w http.ResponseWriter, err error, status int) {
+	detail := err.Error()
+	if errors.Is(err, errConversationMutationPersistence) {
+		status, detail = http.StatusInternalServerError, "保存失败，修改未生效，请检查存储后重试"
+	}
+	writeJSON(w, status, map[string]any{"detail": detail})
 }
 
 func (a *App) handleAdminEvents(w http.ResponseWriter, r *http.Request) {

@@ -1934,19 +1934,23 @@ func intFromAny(value any) int {
 func extractConversationMessageFromThreadRecord(messageID string, rawItem any) (ConversationMessage, bool) {
 	item := mapValue(rawItem)
 	valueWrapper := mapValue(item["value"])
-	value := mapValue(valueWrapper["value"])
+	value := unwrapRecordValue(rawItem)
 	step := mapValue(value["step"])
 	if step == nil {
 		return ConversationMessage{}, false
 	}
 	data := mapValue(value["data"])
 	createdAt := firstNonZeroTime(
+		timeFromTranscriptValue(value["created_time"]),
+		timeFromTranscriptValue(value["created_at"]),
 		timeFromTranscriptValue(valueWrapper["created_time"]),
 		timeFromTranscriptValue(valueWrapper["created_at"]),
 		timeFromTranscriptValue(step["createdAt"]),
 		timeFromTranscriptValue(data["completed_time"]),
 	)
 	updatedAt := firstNonZeroTime(
+		timeFromTranscriptValue(value["last_edited_time"]),
+		timeFromTranscriptValue(value["updated_at"]),
 		timeFromTranscriptValue(valueWrapper["last_edited_time"]),
 		timeFromTranscriptValue(valueWrapper["updated_at"]),
 		timeFromTranscriptValue(data["completed_time"]),
@@ -3139,9 +3143,7 @@ func messageIDsFromThreadRecord(threadData map[string]any, threadID string) []st
 func threadFileIDsFromThreadRecord(threadData map[string]any, threadID string) []string {
 	recordMap := mapValue(threadData["recordMap"])
 	threadMap := mapValue(recordMap["thread"])
-	threadRecord := mapValue(threadMap[threadID])
-	valueWrapper := mapValue(threadRecord["value"])
-	value := mapValue(valueWrapper["value"])
+	value := unwrapRecordValue(threadMap[threadID])
 	rawFileIDs := sliceValue(value["file_ids"])
 	out := make([]string, 0, len(rawFileIDs))
 	for _, item := range rawFileIDs {
@@ -3157,9 +3159,7 @@ func extractAgentMessages(recordMap map[string]any) map[string]agentMessage {
 	out := map[string]agentMessage{}
 	threadMessages := mapValue(recordMap["thread_message"])
 	for messageID, rawItem := range threadMessages {
-		item := mapValue(rawItem)
-		valueWrapper := mapValue(item["value"])
-		value := mapValue(valueWrapper["value"])
+		value := unwrapRecordValue(rawItem)
 		step := mapValue(value["step"])
 		if stringValue(step["type"]) != "agent-inference" {
 			continue
@@ -3182,9 +3182,7 @@ func extractThreadErrors(recordMap map[string]any, threadID string) map[string]i
 	out := map[string]inferenceStepError{}
 	threadMessages := mapValue(recordMap["thread_message"])
 	for messageID, rawItem := range threadMessages {
-		item := mapValue(rawItem)
-		valueWrapper := mapValue(item["value"])
-		value := mapValue(valueWrapper["value"])
+		value := unwrapRecordValue(rawItem)
 		step := mapValue(value["step"])
 		if stringValue(step["type"]) != "error" {
 			continue
@@ -3215,6 +3213,13 @@ func (c *NotionAIClient) loadTranscriptConversation(ctx context.Context, summary
 	}
 	messageIDs := messageIDsFromThreadRecord(threadData, threadID)
 	recordMap := mapValue(threadData["recordMap"])
+	thread := unwrapRecordValue(mapValue(recordMap["thread"])[threadID])
+	if _, ok := thread["messages"]; !ok {
+		return ConversationEntry{}, fmt.Errorf("conversation transcript is unavailable")
+	}
+	if spaceID := stringValue(thread["space_id"]); spaceID != "" && spaceID != c.Session.SpaceID {
+		return ConversationEntry{}, errConversationWorkspaceMismatch
+	}
 	if len(messageIDs) > 0 {
 		messageData, err := c.syncThreadMessages(ctx, threadID, messageIDs)
 		if err != nil {
@@ -4265,7 +4270,7 @@ func (c *NotionAIClient) preparePromptRequest(ctx context.Context, req PromptRun
 				return "", nil, "", nil, inferencePayloadMeta{}, fmt.Errorf("verify conversation workspace: %w", err)
 			}
 			record := mapValue(mapValue(mapValue(data["recordMap"])["thread"])[req.UpstreamThreadID])
-			value := mapValue(mapValue(record["value"])["value"])
+			value := unwrapRecordValue(record)
 			spaceID = firstNonEmpty(stringValue(value["space_id"]), stringValue(record["spaceId"]))
 		}
 		if spaceID == "" || spaceID != c.Session.SpaceID {

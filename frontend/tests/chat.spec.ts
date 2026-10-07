@@ -87,7 +87,7 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; lengthStop?
     }
     return route.continue();
   });
-  return { requests, release };
+  return { requests, release, conversations };
 }
 
 async function openChat(page: Page) {
@@ -162,6 +162,29 @@ test('a truncated stream preserves partial text and allows recovery', async ({ p
   await expect(history.getByText('未完成', { exact: true })).toBeVisible();
   await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
   await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveValue('Interrupted question');
+});
+
+test('a failed image turn keeps its attachment and deletes using the saved message ID', async ({ page }) => {
+  const { conversations } = await mockAdmin(page, { truncated: true });
+  let deletedID = '';
+  await page.route('**/admin/conversations/*/messages/*', async route => {
+    const segments = new URL(route.request().url()).pathname.split('/');
+    const item = conversations.get(decodeURIComponent(segments[3]));
+    deletedID = decodeURIComponent(segments[5]);
+    if (deletedID !== 'answer-1' || !item) return route.fulfill({ status: 404, json: { detail: 'message not found' } });
+    item.messages = item.messages!.filter(message => message.id !== deletedID);
+    return route.fulfill({ json: { item } });
+  });
+  await openChat(page);
+  await page.locator('input[type=file]').setInputFiles({ name: 'retry.png', mimeType: 'image/png', buffer: Buffer.from('image') });
+  await send(page, 'Image question');
+  await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+  await expect(page.locator('.chat-composer')).toContainText('retry.png');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '删除消息', exact: true }).last().click();
+  await expect(page.getByLabel('聊天记录').locator('article')).toHaveCount(1);
+  expect(deletedID).toBe('answer-1');
+  await expect(page.getByLabel('聊天记录')).toContainText('Image question');
 });
 
 test('a length finish reason marks the answer as truncated', async ({ page }) => {
