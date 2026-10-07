@@ -120,6 +120,9 @@ export const AdminService = {
       { method: 'PATCH', body: JSON.stringify({ content }) },
     );
   },
+  deleteConversationMessage(id: string, messageId: string) {
+    return apiFetch<ConversationMutationPayload>(`/admin/conversations/${encodeURIComponent(id)}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' });
+  },
   testPrompt(payload: {
     prompt: string;
     model: string;

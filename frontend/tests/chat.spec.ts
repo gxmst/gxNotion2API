@@ -100,6 +100,19 @@ async function send(page: Page, prompt: string) {
   await page.getByRole('button', { name: '发送', exact: true }).click();
 }
 
+test('HTML gateway errors do not claim Notion rejected the conversation', async ({ page }) => {
+  await mockAdmin(page);
+  await page.route('**/admin/test', route => route.fulfill({
+    status: 502, contentType: 'text/html',
+    body: '<html><title>gxmst.cc.cd | 502: Bad gateway</title><h1>Bad gateway</h1></html>',
+  }));
+  await openChat(page);
+  await send(page, 'continue image conversation');
+  await expect(page.getByText(/错误详情可能被网关替换/).first()).toBeVisible();
+  await expect(page.getByText(/上游返回 HTML/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '发送', exact: true })).toBeVisible();
+});
+
 async function openChatNavigation(page: Page) {
   if (page.viewportSize()!.width < 1024) await page.getByRole('button', { name: '打开导航', exact: true }).click();
 }

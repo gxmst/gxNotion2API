@@ -146,7 +146,7 @@ func conversationMergeMessages(local, remote ConversationEntry) map[string]Conve
 			}
 		}
 	}
-	if local.Status == "completed" && local.MessageID != "" && len(local.Messages) > 0 {
+	if local.Status == "completed" && local.MessageID != "" && !containsTrimmedString(local.DeletedMessageIDs, local.MessageID) && len(local.Messages) > 0 {
 		i := len(local.Messages) - 1
 		if last := local.Messages[i]; last.Role == "assistant" {
 			messages[local.MessageID] = last
@@ -187,9 +187,29 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 	out.UpdatedAt = mergeConversationTimes(out.UpdatedAt, remote.UpdatedAt, true)
 	out.CreatedByDisplay = firstNonEmpty(strings.TrimSpace(remote.CreatedByDisplay), strings.TrimSpace(out.CreatedByDisplay))
 	if len(remote.Messages) > 0 {
-		localMessages := conversationMergeMessages(local, remote)
-		out.Messages = make([]ConversationMessage, len(remote.Messages))
+		deletedIDs := make(map[string]bool, len(local.DeletedMessageIDs))
+		for _, id := range local.DeletedMessageIDs {
+			deletedIDs[id] = true
+		}
+		deletedUserTurns := map[string]bool{}
+		for userID, answerID := range local.LegacyUserTurnIDs {
+			if deletedIDs[userID] {
+				deletedUserTurns[answerID] = true
+			}
+		}
 		for i, message := range remote.Messages {
+			if message.Role == "assistant" && deletedUserTurns[message.ID] {
+				if user, ok := precedingTurnUser(remote.Messages, i); ok {
+					deletedIDs[user.ID] = true
+				}
+			}
+		}
+		localMessages := conversationMergeMessages(local, remote)
+		out.Messages = make([]ConversationMessage, 0, len(remote.Messages))
+		for _, message := range remote.Messages {
+			if deletedIDs[message.ID] {
+				continue
+			}
 			message = cloneConversationMessage(message)
 			if prior, ok := localMessages[message.ID]; ok && prior.Role == message.Role {
 				message.UpstreamMessageID = message.ID
@@ -208,7 +228,10 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 					message.Truncated = true
 				}
 			}
-			out.Messages[i] = message
+			if deletedIDs[message.ID] {
+				continue
+			}
+			out.Messages = append(out.Messages, message)
 		}
 	}
 	return out
@@ -246,10 +269,12 @@ func (a *App) loadAdminRemoteConversation(ctx context.Context, threadID string, 
 	if err != nil {
 		return ConversationEntry{}, err
 	}
-	if summary != nil {
-		return client.loadTranscriptConversation(ctx, *summary)
+	if summary == nil {
+		summary = &InferenceTranscriptSummary{ThreadID: threadID}
 	}
-	return client.loadTranscriptConversation(ctx, InferenceTranscriptSummary{ThreadID: threadID})
+	item, err := client.loadTranscriptConversation(ctx, *summary)
+	item.AccountEmail, item.SpaceID, item.SpaceViewID = client.Session.UserEmail, client.Session.SpaceID, client.Session.SpaceViewID
+	return item, err
 }
 
 func (a *App) handleAdminConversations(w http.ResponseWriter, r *http.Request) {
@@ -452,12 +477,29 @@ func (a *App) handleAdminConversationRename(w http.ResponseWriter, r *http.Reque
 // role. Editing is local to this bridge: nothing is pushed back to Notion, so
 // the upstream thread keeps the original text.
 func (a *App) handleAdminConversationMessageEdit(w http.ResponseWriter, r *http.Request, conversationID string, messageID string) {
-	if r.Method != http.MethodPatch {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
-		return
-	}
 	if messageID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "message id is required"})
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if _, found, err := a.State.loadConversation(conversationID); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
+			return
+		} else if !found {
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found"})
+			return
+		}
+		entry, err := a.State.conversations().DeleteMessage(conversationID, messageID)
+		if err != nil {
+			writeJSON(w, http.StatusConflict, map[string]any{"detail": err.Error()})
+			return
+		}
+		a.State.persistConversationSnapshot(entry.ID)
+		writeJSON(w, http.StatusOK, map[string]any{"success": true, "item": entry})
+		return
+	}
+	if r.Method != http.MethodPatch {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"detail": "method not allowed"})
 		return
 	}
 	defer r.Body.Close()

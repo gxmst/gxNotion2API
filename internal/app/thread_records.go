@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // The captured browser still uses SpaceInitial successfully, while some
@@ -22,7 +23,7 @@ func (c *NotionAIClient) syncThreadRecords(ctx context.Context, threadID, table 
 		}
 		var response map[string]any
 		if err := json.Unmarshal(body, &response); err != nil {
-			return nil, err
+			return nil, fmt.Errorf("decode %s (%s records, %d bytes): %w", endpoint, table, len(body), err)
 		}
 		for name, raw := range mapValue(response["recordMap"]) {
 			incoming := mapValue(raw)

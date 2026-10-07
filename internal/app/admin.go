@@ -922,14 +922,16 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	}
 	preferredConversationID := requestedConversationID(r, payload)
 	request := PromptRunRequest{
-		Prompt:                            prompt,
-		HistorySegments:                   []conversationPromptSegment{{Role: "user", Text: prompt}},
-		LatestUserPrompt:                  prompt,
-		PublicModel:                       entry.ID,
-		NotionModel:                       entry.NotionModel,
-		UseWebSearch:                      requestedWebSearch(payload, cfg.Features.UseWebSearch),
-		Attachments:                       attachments,
-		SuppressUpstreamThreadPersistence: strings.TrimSpace(preferredConversationID) == "",
+		Prompt:           prompt,
+		HistorySegments:  []conversationPromptSegment{{Role: "user", Text: prompt}},
+		LatestUserPrompt: prompt,
+		PublicModel:      entry.ID,
+		NotionModel:      entry.NotionModel,
+		UseWebSearch:     requestedWebSearch(payload, cfg.Features.UseWebSearch),
+		Attachments:      attachments,
+		// Web chats are resumable. In particular, uploads create the thread
+		// before inference, so suppressing saves loses its initial config/context.
+		SuppressUpstreamThreadPersistence: false,
 		WorkspaceID:                       requestedWorkspaceID(r, strings.TrimSpace(stringValue(payload["workspace_id"])), strings.TrimSpace(stringValue(payload["space_id"])), payload["metadata"]),
 	}
 	freshThreadMode := forceFreshThreadPerRequest(cfg)
@@ -941,7 +943,22 @@ func (a *App) handleAdminTest(w http.ResponseWriter, r *http.Request) {
 	}
 	conversation := ConversationEntry{}
 	if preferredConversationID != "" {
-		if matched, ok := a.resolveContinuationConversation(r, payload, "", "", nil); ok {
+		matched, ok := a.resolveContinuationConversation(r, payload, "", "", nil)
+		if !ok {
+			if threadID, remote := parseNotionThreadConversationID(preferredConversationID); remote {
+				timed, cancel := cloneRequestWithTimeout(r, adminSyncRequestTimeout(cfg))
+				item, loadErr := a.loadAdminRemoteConversation(timed.Context(), threadID, request.PinnedAccountEmail, request.WorkspaceID, nil)
+				cancel()
+				if loadErr != nil {
+					writeAdminUpstreamError(w, loadErr, nil)
+					return
+				}
+				item = a.State.conversations().ImportRemote(item)
+				a.State.persistConversationSnapshot(item.ID)
+				matched, ok = continuationTarget{Conversation: item}, true
+			}
+		}
+		if ok {
 			if matched.Err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": "failed to load conversation"})
 				return

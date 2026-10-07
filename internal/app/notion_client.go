@@ -544,6 +544,8 @@ func (s *ndjsonTranscriptState) hasVisibleAnswer() bool {
 }
 
 type continuationTurnDraft struct {
+	MissingConfig          bool
+	MissingContext         bool
 	SessionID              string
 	ConfigID               string
 	ConfigValue            map[string]any
@@ -2062,9 +2064,7 @@ func extractContinuationDraftFromThreadMessages(threadMessages map[string]any, m
 	}
 	draft := &continuationTurnDraft{}
 	for _, messageID := range messageIDs {
-		item := mapValue(threadMessages[messageID])
-		valueWrapper := mapValue(item["value"])
-		value := mapValue(valueWrapper["value"])
+		value := unwrapRecordValue(threadMessages[messageID])
 		step := mapValue(value["step"])
 		stepType := strings.TrimSpace(stringValue(step["type"]))
 		switch stepType {
@@ -2813,7 +2813,7 @@ func (s *ndjsonTranscriptState) handleLine(line []byte, threadID string, sink In
 	}
 	var streamLine ndjsonStreamLine
 	if err := json.Unmarshal(line, &streamLine); err != nil {
-		return err
+		return fmt.Errorf("decode inference stream line %d (%d bytes): %w", s.LineCount+1, len(line), err)
 	}
 	s.LineCount++
 	switch streamLine.Type {
@@ -3124,9 +3124,7 @@ func booleanValue(v any) bool {
 func messageIDsFromThreadRecord(threadData map[string]any, threadID string) []string {
 	recordMap := mapValue(threadData["recordMap"])
 	threadMap := mapValue(recordMap["thread"])
-	threadRecord := mapValue(threadMap[threadID])
-	valueWrapper := mapValue(threadRecord["value"])
-	value := mapValue(valueWrapper["value"])
+	value := unwrapRecordValue(threadMap[threadID])
 	rawMessages := sliceValue(value["messages"])
 	out := make([]string, 0, len(rawMessages))
 	for _, item := range rawMessages {
@@ -3862,18 +3860,31 @@ func (c *NotionAIClient) prepareContinuationDraftFromThread(ctx context.Context,
 		return nil, err
 	}
 	messageIDs := messageIDsFromThreadRecord(threadData, threadID)
+	thread := unwrapRecordValue(mapValue(mapValue(threadData["recordMap"])["thread"])[threadID])
+	if _, ok := thread["messages"]; !ok {
+		return nil, fmt.Errorf("continuation thread message list unavailable")
+	}
 	if len(messageIDs) == 0 {
-		return &continuationTurnDraft{}, nil
+		return &continuationTurnDraft{MissingConfig: true, MissingContext: true}, nil
 	}
 	messageData, err := c.syncThreadMessages(ctx, threadID, messageIDs)
 	if err != nil {
 		return nil, err
 	}
 	recordMap := mapValue(messageData["recordMap"])
+	for _, id := range messageIDs {
+		value := unwrapRecordValue(mapValue(recordMap["thread_message"])[id])
+		if strings.TrimSpace(stringValue(mapValue(value["step"])["type"])) == "" {
+			return nil, fmt.Errorf("continuation thread message records incomplete")
+		}
+	}
 	draft := extractContinuationDraftFromThreadMessages(mapValue(recordMap["thread_message"]), messageIDs)
 	if draft == nil {
 		draft = &continuationTurnDraft{}
 	}
+	// Only a successful live read can authorize repairing missing metadata.
+	draft.MissingConfig = draft.ConfigID == ""
+	draft.MissingContext = draft.ContextID == ""
 	return draft, nil
 }
 
@@ -3987,6 +3998,38 @@ func (c *NotionAIClient) saveContinuationScaffold(ctx context.Context, threadID 
 				},
 			},
 		},
+	}
+	if draft != nil && (draft.MissingConfig || draft.MissingContext) {
+		// Early web uploads could leave a thread with answers but no initial
+		// config/context. Persist only the missing records before the new turn.
+		base, _ := c.buildInferencePayload(PromptRunRequest{NotionModel: notionModel, continuationDraft: draft}, threadID, nil)
+		transactions := payload["transactions"].([]map[string]any)
+		operations := transactions[0]["operations"].([]map[string]any)
+		var repairs []map[string]any
+		var repairIDs []string
+		for _, step := range base["transcript"].([]map[string]any) {
+			kind := stringValue(step["type"])
+			if !(kind == "config" && draft.MissingConfig || kind == "context" && draft.MissingContext) {
+				continue
+			}
+			id := stringValue(step["id"])
+			if kind == "config" {
+				draft.ConfigID = id
+				draft.ConfigValue = cloneMapAny(mapValue(step["value"]))
+			}
+			if kind == "context" {
+				draft.ContextID = id
+				draft.ContextValue = cloneMapAny(mapValue(step["value"]))
+			}
+			repairs = append(repairs, map[string]any{
+				"pointer": map[string]any{"table": "thread_message", "id": id, "spaceId": spaceID},
+				"path":    []string{}, "command": "set",
+				"args": map[string]any{"id": id, "version": 1, "step": step, "parent_id": threadID, "parent_table": "thread", "space_id": spaceID, "created_time": createdTime, "created_by_id": userID, "created_by_table": "notion_user"},
+			})
+			repairIDs = append(repairIDs, id)
+		}
+		operations[2]["args"] = map[string]any{"ids": append(repairIDs, updatedConfigID, userStepID)}
+		transactions[0]["operations"] = append(repairs, operations...)
 	}
 	if _, err := c.postJSON(ctx, c.Config.NotionUpstream().API("saveTransactionsFanout"), payload, "application/json"); err != nil {
 		return nil, err

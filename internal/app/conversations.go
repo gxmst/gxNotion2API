@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -100,6 +101,8 @@ type ConversationEntry struct {
 	InputAttachments   []ConversationAttachment `json:"input_attachments,omitempty"`
 	OutputAttachments  []UploadedAttachment     `json:"output_attachments,omitempty"`
 	Messages           []ConversationMessage    `json:"messages,omitempty"`
+	DeletedMessageIDs  []string                 `json:"deleted_message_ids,omitempty"`
+	LegacyUserTurnIDs  map[string]string        `json:"legacy_user_turn_ids,omitempty"`
 	cachedPreview      string                   `json:"-"`
 }
 
@@ -403,6 +406,8 @@ func cloneConversationEntry(entry *ConversationEntry) ConversationEntry {
 		return ConversationEntry{}
 	}
 	out := *entry
+	out.DeletedMessageIDs = cloneStringSlice(entry.DeletedMessageIDs)
+	out.LegacyUserTurnIDs = maps.Clone(entry.LegacyUserTurnIDs)
 	out.AutoDeleteAt = cloneTimePointer(entry.AutoDeleteAt)
 	out.InputAttachments = cloneConversationAttachments(entry.InputAttachments)
 	out.OutputAttachments = cloneUploadedAttachments(entry.OutputAttachments)

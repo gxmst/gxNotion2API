@@ -22,10 +22,16 @@ function summarizeHTMLText(raw: string): string {
   const strip = (value: string) => value.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
   const title = strip(titleMatch?.[1] || '');
   const h1 = strip(h1Match?.[1] || '');
-  if (title && h1 && title !== h1) return `上游返回 HTML 错误页: ${title} | ${h1}`;
-  if (title) return `上游返回 HTML 错误页: ${title}`;
-  if (h1) return `上游返回 HTML 错误页: ${h1}`;
-  return '上游返回了 HTML 错误页';
+  if (title && h1 && title !== h1) return `${title} | ${h1}`;
+  return title || h1 || 'HTML 错误页';
+}
+
+function describeHTMLResponse(response: Response, raw: string): string {
+  const summary = summarizeHTMLText(raw);
+  if (!summary) return '';
+  // A CDN may replace the application's JSON error and strip its headers.
+  // Missing our marker does not prove the request never reached the backend.
+  return `收到 HTML 错误页（HTTP ${response.status}），错误详情可能被网关替换，请查看会话记录中的失败原因：${summary}`;
 }
 
 export class ApiError extends Error {
@@ -46,14 +52,10 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
     credentials: 'include',
   });
   const contentType = response.headers.get('content-type') || '';
-  const hitNation2API = response.headers.get('x-notion2api') === '1';
   const payload = contentType.includes('application/json') ? await response.json() : await response.text();
 
   if (!response.ok) {
-    const htmlSummary = typeof payload === 'string' ? summarizeHTMLText(payload) : '';
-    if (htmlSummary && !hitNation2API) {
-      throw new ApiError(`当前响应未命中 nation2api（status ${response.status} ${response.statusText}，url ${response.url}），而是前置代理/反代返回的 HTML 错误页: ${htmlSummary.replace(/^上游返回 HTML 错误页:\s*/, '')}`, response.status);
-    }
+    const htmlSummary = typeof payload === 'string' ? describeHTMLResponse(response, payload) : '';
     if (typeof payload === 'object' && payload !== null) {
       const detail = (payload as { detail?: string; error?: { message?: string } }).detail;
       const message = (payload as { detail?: string; error?: { message?: string } }).error?.message;
@@ -72,12 +74,12 @@ export async function apiEventStream(path: string, payload: unknown, onEvent: (d
   });
   if (!response.ok || !response.body || !response.headers.get('content-type')?.includes('text/event-stream')) {
     const text = await response.text();
-    let message = summarizeHTMLText(text) || `${response.status} ${response.statusText}`;
+    let message = describeHTMLResponse(response, text) || `${response.status} ${response.statusText}`;
     try {
       const error = JSON.parse(text);
       message = error.detail || error.error?.message || message;
     } catch { /* Non-JSON responses use the HTTP status or HTML title. */ }
-    throw new Error(message);
+    throw new ApiError(message, response.status);
   }
   const reader = response.body.pipeThrough(new TextDecoderStream()).pipeThrough(new EventSourceParserStream()).getReader();
   let done = false;

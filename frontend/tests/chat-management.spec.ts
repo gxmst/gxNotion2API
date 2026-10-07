@@ -51,6 +51,10 @@ async function mockAdmin(page: Page) {
       return route.fulfill({ json: { items } });
     }
     const messageRoute = /^\/admin\/conversations\/([^/]+)\/messages\/([^/]+)$/.exec(path);
+    if (messageRoute && method === 'DELETE') {
+      conversation.messages = conversation.messages!.filter(message => message.id !== decodeURIComponent(messageRoute[2]));
+      return route.fulfill({ json: { success: true, item: conversation } });
+    }
     if (messageRoute && method === 'PATCH') {
       const body = request.postDataJSON() as { content: string };
       calls.edited.push({ id: decodeURIComponent(messageRoute[1]), messageId: decodeURIComponent(messageRoute[2]), content: body.content });
@@ -121,6 +125,18 @@ test('a conversation can be renamed from the sidebar', async ({ page }) => {
   await list.getByRole('button', { name: '保存标题' }).click();
   await expect(row.locator('.chat-conversation-open span')).toHaveText('季度复盘');
   expect(calls.renamed).toEqual([{ id: CONVERSATION_ID, title: '季度复盘' }]);
+});
+
+test('delete one local message preserves the other messages after reload', async ({ page }) => {
+  await mockAdmin(page);
+  await openChatWithHistory(page);
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '删除消息', exact: true }).last().click();
+  await expect(page.getByLabel('聊天记录')).not.toContainText('这是总结结果。');
+  await expect(page.getByLabel('聊天记录')).toContainText('请总结这份文档');
+  await page.reload();
+  await expect(page.getByLabel('聊天记录')).not.toContainText('这是总结结果。');
+  await expect(page.getByLabel('聊天记录')).toContainText('请总结这份文档');
 });
 
 test('renaming can be abandoned without a request', async ({ page }) => {

@@ -568,6 +568,24 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
 
   function cancelEdit() { setEditingID(''); setEditValue(''); }
 
+  async function removeMessage(message: ConversationMessage) {
+    if (running || savingEdit || remoteOnly || !conversationID || !message.id) return;
+    if (!window.confirm('删除这条本地消息？Notion 上游已经读取的内容仍保留在对话上下文中。')) return;
+    const targetID = conversationID;
+    setSavingEdit(true);
+    try {
+      const { item } = await AdminService.deleteConversationMessage(targetID, message.id);
+      if (!mounted.current) return;
+      if (activeConversationRef.current === targetID) {
+        setMessages(item.messages || []);
+        cancelEdit();
+      }
+      await propsRef.current.onRefreshConversations();
+      toast.success('已删除本地消息');
+    } catch (cause) { toast.error(cause instanceof Error ? cause.message : '删除失败'); }
+    finally { setSavingEdit(false); }
+  }
+
   async function commitEdit(message: ConversationMessage) {
     const next = editValue.trim();
     if (!conversationID || !message.id) return;
@@ -599,7 +617,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   }
 
   async function performRun() {
-    if (abortRef.current || loading || loadFailed || remoteRunning || (!prompt.trim() && !files.length)) return;
+    if (abortRef.current || savingEdit || loading || loadFailed || remoteRunning || (!prompt.trim() && !files.length)) return;
     if (!conversationID && target !== 'auto' && !selectedTarget) {
       setError('所选工作区已不可用，请重新选择商业工作区。');
       return;
@@ -626,6 +644,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       }, controller.signal);
       if (!mounted.current) return;
       setConversationID(result.conversation_id || id);
+      setRemoteOnly(false);
       setMessages((current) => current.map((message) => message.id === answerID ? { ...message, content: result.text, status: 'completed', truncated: result.truncated } : message));
       // The turn just spent allowance; re-read so the indicator is not stale.
       refreshQuota();
@@ -820,7 +839,8 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
               {message.status === 'failed' ? <span>未完成</span> : null}
               {message.truncated ? <span className="chat-truncated" title="上游在回答写完之前结束了流，这段回答可能不完整">已截断</span> : null}
               {message.content ? <span className="chat-token-hint" title="按字符数估算，非上游计数">≈ {formatTokens(estimateTokens(message.content))} tokens</span> : null}
-              <button className="chat-icon" aria-label="编辑消息" disabled={running || !message.id || remoteOnly} onClick={() => startEdit(message)}><Pencil size={14} /></button>
+              <button className="chat-icon" aria-label="编辑消息" disabled={running || savingEdit || !message.id || remoteOnly} onClick={() => startEdit(message)}><Pencil size={14} /></button>
+              <button className="chat-icon" aria-label="删除消息" title="删除本地消息，上游对话上下文仍保留" disabled={running || savingEdit || !message.id || remoteOnly} onClick={() => void removeMessage(message)}><Trash2 size={14} /></button>
               <button className="chat-icon" aria-label="复制消息" disabled={!message.content} onClick={() => void copyText(message.content || '').then(() => { setCopied(String(index)); setTimeout(() => setCopied(''), 1600); }).catch(() => toast.error('复制失败'))}>{copied === String(index) ? <Check size={14} /> : <Copy size={14} />}</button>
             </div>
           </article>;

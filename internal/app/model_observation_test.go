@@ -182,7 +182,16 @@ func TestContinuationUpdatedConfigUsesCurrentModel(t *testing.T) {
 				t.Fatal("continuation was not saved")
 			}
 			operations := sliceValue(mapValue(transactions[0])["operations"])
-			updated := mapValue(mapValue(mapValue(mapValue(operations[0])["args"])["step"])["value"])
+			var updated map[string]any
+			for _, raw := range operations {
+				step := mapValue(mapValue(mapValue(raw)["args"])["step"])
+				if stringValue(step["type"]) == "updated-config" {
+					updated = mapValue(step["value"])
+				}
+			}
+			if updated == nil {
+				t.Fatal("updated-config step missing")
+			}
 			for _, value := range []map[string]any{updated, transcriptStepValue(t, payload, "config")} {
 				if stringValue(value["model"]) != model || booleanValue(value["modelFromUser"]) != (model != "") {
 					t.Fatalf("stale selection retained: %+v", value)

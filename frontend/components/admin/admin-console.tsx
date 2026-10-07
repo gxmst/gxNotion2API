@@ -276,7 +276,10 @@ export function AdminConsole() {
           onRefreshWorkspaceModels={async (email, workspaceID) => { await services.refreshModels(email, workspaceID); await refreshAccounts(); await refreshConfigBundle(); }}
           onRun={async (payload, onDelta, signal) => {
             try { return await services.streamTestPrompt(payload, onDelta, signal); }
-            finally { void loadConversations().catch(() => undefined); }
+            finally {
+              void loadConversations().catch(() => undefined);
+              void refreshAccounts().catch(() => undefined);
+            }
           }} />
         </div> : null}
         {authenticated && !configPayload ? <div className="app-loading"><p>{bootError || '正在加载配置…'}</p><Button onClick={() => void refreshAll()}>重新加载</Button></div> : null}

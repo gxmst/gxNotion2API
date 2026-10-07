@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"expvar"
 	"fmt"
@@ -251,6 +252,12 @@ func resolveDispatchWorkspaceCandidates(cfg AppConfig, poolCandidates []NotionAc
 		if reason == "cooldown" {
 			if quotaErr := accountQuotaCooldownError(account, now); quotaErr != nil {
 				return nil, quotaErr
+			}
+			until := parseOptionalRFC3339(account.CooldownUntil)
+			return nil, &notionAPIError{
+				StatusCode: http.StatusTooManyRequests,
+				RetryAfter: until,
+				Message:    fmt.Sprintf("工作区因前一次请求失败暂时冷却，请在 %s 后重试；本次未向 Notion 发送请求", until.UTC().Format(time.RFC3339)),
 			}
 		}
 		return nil, fmt.Errorf("account %s is not dispatchable: %s", account.Email, reason)
@@ -659,6 +666,13 @@ func promptAttemptRequest(base PromptRunRequest) PromptRunRequest {
 // account health: the caller went away, the request itself is invalid, or it
 // is pinned to a different workspace.
 func abortsDispatch(ctx context.Context, emit *dispatchEmitState, err error) bool {
+	// Malformed JSON is a response/protocol failure, not evidence that the
+	// credential or workspace is unhealthy. Stop this request without retrying
+	// inference on another account or imposing an account-wide cooldown.
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return true
+	}
 	return isDispatchContextAbort(ctx, err) ||
 		emit.clientGone.Load() || isClientGoneError(err) ||
 		isClientInputError(err) ||
