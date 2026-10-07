@@ -298,7 +298,7 @@ func TestLegacyMergeDoesNotGuessAcrossAmbiguousUserTurns(t *testing.T) {
 	local := ConversationEntry{Messages: []ConversationMessage{{ID: "local-user", Role: "user", Content: "edited", EditedAt: &now}, {ID: "assistant", Role: "assistant"}}}
 	remote := ConversationEntry{Messages: []ConversationMessage{{ID: "user-1", Role: "user", Content: "first"}, {ID: "user-2", Role: "user", Content: "second"}, {ID: "assistant", Role: "assistant"}}}
 	merged := mergeConversationEntry(local, remote)
-	if merged.Messages[0].Content != "first" || merged.Messages[1].Content != "second" {
+	if len(merged.Messages) != 4 || merged.Messages[0].ID != "local-user" || merged.Messages[1].Content != "first" || merged.Messages[2].Content != "second" {
 		t.Fatal("applied user edit to an ambiguous turn")
 	}
 }

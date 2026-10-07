@@ -28,13 +28,19 @@ func TestRemoteHistoryPreservesPerTurnModelSelection(t *testing.T) {
 		{ID: "unrelated", Role: "assistant", Content: "external answer"},
 	}}
 	merged := mergeConversationEntry(entry, remote)
+	var assistants []ConversationMessage
+	for _, message := range merged.Messages {
+		if message.Role == "assistant" {
+			assistants = append(assistants, message)
+		}
+	}
 	for i, id := range []string{"first", "second"} {
-		message := merged.Messages[i]
+		message := assistants[i]
 		if message.RequestedModel != "requested" || message.ModelSelectionMode != "auto_fallback" || len(message.ModelObservations) != 1 || message.ModelObservations[0].Model != id+"-model" {
 			t.Fatalf("turn metadata lost or mixed: %+v", message)
 		}
 	}
-	if merged.Messages[0].ModelObservations[0].Provider != "provider" || merged.Messages[2].RequestedModel != "" {
+	if assistants[0].ModelObservations[0].Provider != "provider" || assistants[2].RequestedModel != "" {
 		t.Fatal("remote evidence was lost or attached to an unrelated turn")
 	}
 	if !reflect.DeepEqual(entry, before) || remote.Messages[0].RequestedModel != "" {
@@ -123,7 +129,7 @@ func TestConversationReadAndDeleteUseBoundWorkspace(t *testing.T) {
 	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if recorder.Code != http.StatusOK || reads != 2 || len(response.Item.Messages) != 1 || response.Item.Messages[0].Content != "remote answer" || response.Item.Messages[0].ModelSelectionMode != "auto" {
+	if recorder.Code != http.StatusOK || reads != 2 || len(response.Item.Messages) != 2 || response.Item.Messages[0].Content != "question" || response.Item.Messages[1].Content != "remote answer" || response.Item.Messages[1].ModelSelectionMode != "auto" {
 		t.Fatalf("bound conversation was not read correctly: %d %s", recorder.Code, recorder.Body.String())
 	}
 	if _, err := app.notionClientForWorkspace(t.Context(), "primary@example.com", "missing"); err == nil {

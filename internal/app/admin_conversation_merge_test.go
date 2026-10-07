@@ -1,9 +1,65 @@
 package app
 
 import (
+	"reflect"
 	"testing"
 	"time"
 )
+
+func TestRemoteMergeRetainsOmittedCompletedMessages(t *testing.T) {
+	editedAt := conversationMergeBase()
+	attachment := ConversationAttachment{Name: "red.png", ContentType: "image/png", URL: "/image/red.png"}
+	local := ConversationEntry{Status: "completed", DeletedMessageIDs: []string{"deleted-answer", "deleted-user"}, Messages: []ConversationMessage{
+		{ID: "local-first", UpstreamMessageID: "remote-first", Role: "user", Content: "edited question", EditedAt: &editedAt, Attachments: []ConversationAttachment{attachment}},
+		{ID: "answer-1", Role: "assistant", Content: "old answer"},
+		{ID: "local-middle", UpstreamMessageID: "remote-middle", Role: "user", Content: "omitted middle question"},
+		{ID: "answer-2", Role: "assistant", Content: "second answer"},
+		{ID: "local-third", UpstreamMessageID: "remote-third", Role: "user", Content: "third question", Attachments: []ConversationAttachment{attachment}},
+		{ID: "local-tail", Role: "assistant", Content: "omitted tail"},
+		// Even an inconsistent old snapshot must not restore a tombstoned ID.
+		{ID: "local-deleted", UpstreamMessageID: "deleted-user", Role: "user"},
+	}}
+	remote := ConversationEntry{Messages: []ConversationMessage{
+		{ID: "step-1", Role: "step", StepType: "agent-tool-result"},
+		{ID: "answer-1", Role: "assistant", Content: "fresh answer"},
+		{ID: "step-2", Role: "step", StepType: "agent-tool-result"},
+		{ID: "answer-2", Role: "assistant", Content: "second answer"},
+		{ID: "remote-third", Role: "user", Content: "third question"},
+		{ID: "deleted-answer", Role: "assistant", Content: "deleted"},
+		{ID: "deleted-user", Role: "user"},
+	}}
+	before := cloneConversationEntry(&local)
+	merged := mergeConversationEntry(local, remote)
+	wantIDs := []string{"local-first", "step-1", "answer-1", "local-middle", "step-2", "answer-2", "local-third", "local-tail"}
+	var gotIDs []string
+	for _, message := range merged.Messages {
+		gotIDs = append(gotIDs, message.ID)
+	}
+	if !reflect.DeepEqual(gotIDs, wantIDs) {
+		t.Fatalf("incomplete transcript lost/reordered messages: got %v want %v", gotIDs, wantIDs)
+	}
+	if !reflect.DeepEqual(merged.Messages[0], local.Messages[0]) || merged.Messages[2].Content != "fresh answer" || !reflect.DeepEqual(merged.Messages[6].Attachments, []ConversationAttachment{attachment}) {
+		t.Fatal("local edit/attachment or fresh upstream content lost")
+	}
+	if repeated := mergeConversationEntry(merged, remote); !reflect.DeepEqual(repeated.Messages, merged.Messages) {
+		t.Fatal("repeated sync changed or duplicated messages")
+	}
+	merged.Messages[0].Attachments[0].Name = "changed"
+	merged.Messages[6].Attachments[0].Name = "changed"
+	if !reflect.DeepEqual(local, before) || len(remote.Messages[4].Attachments) != 0 {
+		t.Fatal("merge mutated its inputs")
+	}
+}
+
+func TestRemoteMergeWithoutSharedMessagesRetainsBothTranscripts(t *testing.T) {
+	local := ConversationEntry{Status: "completed", Messages: []ConversationMessage{{ID: "local", Role: "user", Content: "missing upstream"}}}
+	for _, messages := range [][]ConversationMessage{nil, {{ID: "remote", Role: "step", StepType: "agent-tool-result"}}} {
+		merged := mergeConversationEntry(local, ConversationEntry{Messages: messages})
+		if len(merged.Messages) != 1+len(messages) || merged.Messages[0].ID != "local" {
+			t.Fatalf("lost unanchored local transcript: %+v", merged.Messages)
+		}
+	}
+}
 
 // conversationMergeBase is a fixed instant so the merge tests never depend on
 // the clock.

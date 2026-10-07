@@ -156,12 +156,21 @@ func conversationMergeMessages(local, remote ConversationEntry) map[string]Conve
 	}
 	// Older snapshots lack user step IDs. A shared assistant ID anchors the
 	// same turn on both sides, including when the preceding user text was edited.
+	legacyUsers := map[string]ConversationMessage{}
+	for userID, answerID := range local.LegacyUserTurnIDs {
+		if user, ok := messages[userID]; ok && user.Role == "user" {
+			legacyUsers[answerID] = user
+		}
+	}
 	for i, message := range remote.Messages {
-		localIndex, ok := assistantIndexes[message.ID]
-		if !ok || message.Role != "assistant" {
+		if message.Role != "assistant" {
 			continue
 		}
-		localUser, localOK := precedingTurnUser(local.Messages, localIndex)
+		// The recorded turn anchor also survives deleting the assistant first.
+		localUser, localOK := legacyUsers[message.ID]
+		if localIndex, ok := assistantIndexes[message.ID]; ok {
+			localUser, localOK = precedingTurnUser(local.Messages, localIndex)
+		}
 		remoteUser, remoteOK := precedingTurnUser(remote.Messages, i)
 		if !localOK || !remoteOK || localUser.UpstreamMessageID != "" {
 			continue
@@ -216,12 +225,16 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 				continue
 			}
 			message = cloneConversationMessage(message)
+			message.UpstreamMessageID = firstNonEmpty(message.UpstreamMessageID, message.ID)
 			if prior, ok := localMessages[message.ID]; ok && prior.Role == message.Role {
 				message.UpstreamMessageID = message.ID
 				message.ID = prior.ID
 				message.RequestedModel = firstNonEmpty(prior.RequestedModel, message.RequestedModel)
 				message.ModelSelectionMode = firstNonEmpty(prior.ModelSelectionMode, message.ModelSelectionMode)
 				message.ModelObservations = mergeModelObservations(prior.ModelObservations, message.ModelObservations)
+				if len(message.Attachments) == 0 {
+					message.Attachments = append([]ConversationAttachment(nil), prior.Attachments...)
+				}
 				// Notion still holds the pre-edit text, so a hand-edited body has
 				// to survive the merge or the edit is lost on the next refresh.
 				if prior.EditedAt != nil {
@@ -238,8 +251,43 @@ func mergeConversationEntry(local ConversationEntry, remote ConversationEntry) C
 			}
 			out.Messages = append(out.Messages, message)
 		}
+		out.Messages = retainLocalConversationMessages(local.Messages, out.Messages, deletedIDs)
 	}
 	return out
+}
+
+// Notion may omit even completed user turns from its transcript. Keep local
+// messages absent from the snapshot immediately after their last shared anchor
+// (or before the remote prefix), preserving the order of both transcripts.
+func retainLocalConversationMessages(local, remote []ConversationMessage, deletedIDs map[string]bool) []ConversationMessage {
+	remoteIDs := make(map[string]bool, len(remote))
+	for _, message := range remote {
+		remoteIDs[message.ID] = true
+	}
+	after := make(map[string][]ConversationMessage)
+	anchor := ""
+	for _, message := range local {
+		if deletedIDs[message.ID] || deletedIDs[message.UpstreamMessageID] {
+			continue
+		}
+		if remoteIDs[message.ID] {
+			anchor = message.ID
+			continue
+		}
+		after[anchor] = append(after[anchor], cloneConversationMessage(message))
+	}
+	merged := make([]ConversationMessage, 0, len(local)+len(remote))
+	merged = append(merged, after[""]...)
+	seen := make(map[string]bool, len(remote))
+	for _, message := range remote {
+		if seen[message.ID] {
+			continue
+		}
+		seen[message.ID] = true
+		merged = append(merged, message)
+		merged = append(merged, after[message.ID]...)
+	}
+	return merged
 }
 
 func mergeAdminConversationSummaries(localItems []ConversationSummary, remoteItems []InferenceTranscriptSummary) []ConversationSummary {

@@ -48,17 +48,17 @@ with tempfile.TemporaryDirectory(prefix='notion2api-release-smoke-') as tmp:
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
     cfg = json.loads((package/'config.example.json').read_text())
-    cfg.update(host='127.0.0.1', port=port, accounts=[], active_account='', probe_json=str(root/'missing-probe.json'))
+    cfg.update(host='127.0.0.1', port=port, api_key=secrets.token_hex(24), accounts=[], active_account='', probe_json=str(root/'missing-probe.json'))
     cfg['admin'].update(password=secrets.token_hex(24), static_dir=str(package/'static/admin'))
     cfg['session_refresh'].update(enabled=False, startup_check=False)
     cfg['storage']['sqlite_path'] = str(root/'smoke.sqlite')
     path = root/'config.json'; path.write_text(json.dumps(cfg))
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    proc = subprocess.Popen([str(package/'notion2api'), '--config', str(path)], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen([str(package/'notion2api'), '--config', str(path)], cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         url = f'http://127.0.0.1:{port}'
         for _ in range(40):
-            if proc.poll() is not None: raise RuntimeError('packaged executable exited during smoke test')
+            if proc.poll() is not None: raise RuntimeError('packaged executable exited during smoke test: '+proc.stderr.read().decode()[:2000])
             try:
                 if json.load(opener.open(url+'/healthz', timeout=1)).get('ok'): break
             except (OSError, ValueError): pass
