@@ -3,7 +3,7 @@
 3:I[9766,[],""]
 4:I[8924,[],""]
 5:I[240,["818","static/chunks/818-46f53aa145a919de.js","177","static/chunks/app/layout-c15b96086242f161.js"],"Toaster"]
-6:I[2639,["818","static/chunks/818-46f53aa145a919de.js","115","static/chunks/115-875e5acffcbaaaba.js","974","static/chunks/app/page-26eaf65fd5040057.js"],"AdminConsole"]
+6:I[2639,["818","static/chunks/818-46f53aa145a919de.js","115","static/chunks/115-875e5acffcbaaaba.js","974","static/chunks/app/page-bf5bc08e746ca2c3.js"],"AdminConsole"]
 7:I[4431,[],"OutletBoundary"]
 9:I[5278,[],"AsyncMetadataOutlet"]
 b:I[4431,[],"ViewportBoundary"]

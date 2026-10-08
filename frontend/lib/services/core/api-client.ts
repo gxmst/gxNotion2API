@@ -35,7 +35,7 @@ function describeHTMLResponse(response: Response, raw: string): string {
 }
 
 export class ApiError extends Error {
-  constructor(message: string, public readonly status: number) {
+  constructor(message: string, public readonly status: number, public readonly code?: string) {
     super(message);
     this.name = 'ApiError';
   }
@@ -57,9 +57,8 @@ export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> 
   if (!response.ok) {
     const htmlSummary = typeof payload === 'string' ? describeHTMLResponse(response, payload) : '';
     if (typeof payload === 'object' && payload !== null) {
-      const detail = (payload as { detail?: string; error?: { message?: string } }).detail;
-      const message = (payload as { detail?: string; error?: { message?: string } }).error?.message;
-      throw new ApiError(detail || message || `${response.status} ${response.statusText}`, response.status);
+      const error = payload as { detail?: string; code?: string; error?: { message?: string; code?: string } };
+      throw new ApiError(error.detail || error.error?.message || `${response.status} ${response.statusText}`, response.status, error.code || error.error?.code);
     }
     throw new ApiError(htmlSummary || String(payload || `${response.status} ${response.statusText}`), response.status);
   }

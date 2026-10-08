@@ -487,7 +487,7 @@ func (a *App) handleAdminConversationByID(w http.ResponseWriter, r *http.Request
 		}
 		threadID, ok := parseNotionThreadConversationID(conversationID)
 		if !ok {
-			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found"})
+			writeJSON(w, http.StatusNotFound, map[string]any{"detail": "conversation not found", "code": "conversation_not_found"})
 			return
 		}
 		item, err := a.loadAdminRemoteConversation(timedRequest.Context(), threadID, "", "", &InferenceTranscriptSummary{ThreadID: threadID})

@@ -48,7 +48,7 @@ async function mockAdmin(page: Page, options: { truncated?: boolean; lengthStop?
     if (path === '/admin/conversations') return route.fulfill({ json: { items: [...conversations.values()] } });
     if (path.startsWith('/admin/conversations/')) {
       const item = conversations.get(decodeURIComponent(path.split('/').pop()!));
-      return route.fulfill({ status: item ? 200 : 404, json: item ? { item } : { detail: 'conversation not found' } });
+      return route.fulfill({ status: item ? 200 : 404, json: item ? { item } : { detail: 'conversation not found', code: 'conversation_not_found' } });
     }
     if (path === '/admin/test') {
       const input = route.request().postDataJSON();
@@ -99,6 +99,97 @@ async function send(page: Page, prompt: string) {
   await page.getByRole('textbox', { name: '消息', exact: true }).fill(prompt);
   await page.getByRole('button', { name: '发送', exact: true }).click();
 }
+
+const savedSessionKey = 'notion2api-chat-session';
+const restoredDraft = '还没发送的草稿\n第二行内容';
+
+async function seedSavedConversation(page: Page, storage: 'localStorage' | 'sessionStorage') {
+  await page.addInitScript(({ key, storage, draft }) => {
+    // Seed once so a real reload checks what the app persisted after recovery.
+    if (sessionStorage.getItem('restore-test-seeded')) return;
+    sessionStorage.setItem('restore-test-seeded', '1');
+    window[storage].setItem(key, JSON.stringify({ conversationID: 'conv_saved', prompt: draft, model: 'test-model' }));
+  }, { key: savedSessionKey, storage, draft: restoredDraft });
+}
+
+for (const storage of ['localStorage', 'sessionStorage'] as const) {
+  test(`a missing conversation restored from ${storage} opens a usable draft and stays repaired`, async ({ page }) => {
+    await seedSavedConversation(page, storage);
+    const { requests } = await mockAdmin(page);
+    let missingReads = 0;
+    await page.route('**/admin/conversations/conv_saved?local=1', route => {
+      missingReads++;
+      return route.fulfill({ status: 404, json: { detail: 'conversation not found', code: 'conversation_not_found' } });
+    });
+    await openChat(page);
+    await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveValue(restoredDraft);
+    await expect(page.locator('.chat-breadcrumb h1')).toHaveText('新对话');
+    await expect(page.locator('.chat-error')).toHaveCount(0);
+    await expect(page.getByText(/该会话已不存在，已切换到新对话/)).toBeVisible();
+    await expect.poll(() => page.evaluate(key => [sessionStorage, localStorage].map(store => JSON.parse(store.getItem(key) || '{}').conversationID), savedSessionKey)).toEqual(['', '']);
+    await page.reload();
+    await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeEnabled();
+    await expect(page.getByRole('textbox', { name: '消息', exact: true })).toHaveValue(restoredDraft);
+    expect(missingReads).toBe(1);
+    await page.getByRole('button', { name: '发送', exact: true }).click();
+    await expect(page.getByRole('button', { name: '停止', exact: true })).toHaveCount(0);
+    await expect(page.getByLabel('聊天记录').locator('strong')).toHaveText('Reply 1');
+    expect(requests[0].conversation_id).not.toBe('conv_saved');
+    expect(requests[0].prompt).toBe(restoredDraft);
+  });
+}
+
+for (const failure of ['network', 'server', 'gateway404', 'authentication'] as const) {
+  test(`${failure} restore failure keeps the saved conversation and draft for retry`, async ({ page }) => {
+    await seedSavedConversation(page, 'localStorage');
+    await mockAdmin(page);
+    let available = false;
+    await page.route('**/admin/conversations/conv_saved?local=1', route => {
+      if (available) return route.fulfill({ json: { item: {
+        id: 'conv_saved', title: '恢复的会话', status: 'completed', model: 'test-model',
+        messages: [{ id: 'answer', role: 'assistant', content: '原有回答', status: 'completed' }],
+      } } });
+      if (failure === 'network') return route.abort('failed');
+      if (failure === 'gateway404') return route.fulfill({ status: 404, contentType: 'text/html', body: '<html><title>Gateway route not found</title></html>' });
+      return route.fulfill({ status: failure === 'server' ? 503 : 401, json: { detail: 'temporarily unavailable', code: 'conversation_not_found' } });
+    });
+    await page.goto('/admin');
+    await expect(page.locator('.chat-breadcrumb h1')).toHaveText('对话加载失败');
+    const draft = page.getByRole('textbox', { name: '消息', exact: true });
+    await expect(draft).toBeDisabled();
+    await expect(draft).toHaveValue(restoredDraft);
+    await expect.poll(() => page.evaluate(key => JSON.parse(localStorage.getItem(key) || '{}').conversationID, savedSessionKey)).toBe('conv_saved');
+    available = true;
+    await page.getByRole('button', { name: '重新加载', exact: true }).click();
+    await expect(page.locator('.chat-breadcrumb h1')).toHaveText('恢复的会话');
+    await expect(draft).toBeEnabled();
+    await expect(draft).toHaveValue(restoredDraft);
+    await expect(page.getByLabel('聊天记录')).toContainText('原有回答');
+    await expect(page.locator('.chat-error')).toHaveCount(0);
+  });
+}
+
+test('a late missing-conversation response does not replace a new draft', async ({ page }) => {
+  await seedSavedConversation(page, 'localStorage');
+  await mockAdmin(page);
+  let release = () => {};
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  await page.route('**/admin/conversations/conv_saved?local=1', async route => {
+    await pending;
+    await route.fulfill({ status: 404, json: { detail: 'conversation not found', code: 'conversation_not_found' } });
+  });
+  await page.goto('/admin');
+  await expect(page.locator('.chat-breadcrumb h1')).toHaveText('加载对话…');
+  await page.getByRole('button', { name: '新对话', exact: true }).click();
+  const draft = page.getByRole('textbox', { name: '消息', exact: true });
+  await draft.fill('切换后写下的新草稿');
+  const response = page.waitForResponse(url => url.url().includes('/conv_saved?local=1'));
+  release();
+  await (await response).finished();
+  await expect(draft).toHaveValue('切换后写下的新草稿');
+  await expect(page.locator('.chat-breadcrumb h1')).toHaveText('新对话');
+  await expect(page.locator('.chat-error')).toHaveCount(0);
+});
 
 test('HTML gateway errors do not claim Notion rejected the conversation', async ({ page }) => {
   await mockAdmin(page);

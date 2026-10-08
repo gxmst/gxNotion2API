@@ -12,7 +12,7 @@ import { ModelEvidence } from '@/components/admin/model-evidence';
 import { MessageMarkdown } from '@/components/admin/message-markdown';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
-import { copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
+import { ApiError, copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
 import type { AccountItem, AIUsageReport, AIUsageRateLimitWindow, ChatRunInput, ChatRunResult, ConversationDetailPayload, ConversationMessage, ConversationSummary, ModelItem, TabKey } from '@/lib/services/admin/types';
 
 const SESSION_KEY = 'notion2api-chat-session';
@@ -324,7 +324,16 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
       if (item.model && models.some((model) => model.id === item.model)) setModel(item.model);
       setRemoteRunning(item.status === 'running' || item.status === 'queued');
     } catch (cause) {
-      if (mounted.current && revision === loadRevision.current) { setLoadFailed(true); setError(cause instanceof Error ? cause.message : '会话加载失败'); }
+      if (!mounted.current || revision !== loadRevision.current) return;
+      // Only the application's explicit missing-record response invalidates a
+      // saved ID. Network/authentication/gateway failures must remain retryable.
+      if (cause instanceof ApiError && cause.status === 404 && cause.code === 'conversation_not_found') {
+        resetConversation(draft);
+        toast.info('该会话已不存在，已切换到新对话。' + (draft ? '草稿已保留。' : ''));
+      } else {
+        setTitle('对话加载失败'); setLoadFailed(true);
+        setError(cause instanceof Error ? cause.message : '会话加载失败');
+      }
     } finally { if (mounted.current && revision === loadRevision.current) setLoading(false); }
   }
 
@@ -387,7 +396,9 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   useEffect(() => {
     if (loading) return;
     const saved = JSON.stringify({ conversationID, prompt, model, useWebSearch, target });
-    try { sessionStorage.setItem(SESSION_KEY, saved); localStorage.setItem(SESSION_KEY, saved); } catch { /* Optional storage. */ }
+    // One unavailable storage must not leave the stale ID in the other store.
+    try { sessionStorage.setItem(SESSION_KEY, saved); } catch { /* Optional storage. */ }
+    try { localStorage.setItem(SESSION_KEY, saved); } catch { /* Optional storage. */ }
   }, [conversationID, prompt, model, useWebSearch, target, loading]);
 
   useEffect(() => {
@@ -425,9 +436,14 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
   }, [remoteRunning, conversationID]);
 
   function startNew() {
+    resetConversation();
+  }
+
+  function resetConversation(draft = '') {
     if (abortRef.current) return;
     loadRevision.current++;
-    setConversationID(''); setMessages([]); setOwner(''); setTitle('新对话'); setError(''); setPrompt(''); setFiles([]);
+    activeConversationRef.current = '';
+    setConversationID(''); setMessages([]); setOwner(''); setTitle('新对话'); setError(''); setPrompt(draft); setFiles([]);
     setLoading(false); setLoadFailed(false); setRemoteRunning(false); setMobileOpen(false); setQuotaOpen(false);
     setRemoteOnly(false);
     cancelRename(); cancelEdit();
@@ -869,7 +885,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
           if (historyRef.current) historyRef.current.scrollTop = historyRef.current.scrollHeight;
           setAtBottom(true);
         }}><ArrowDown size={15} />回到最新</button> : null}
-        {error ? <div className="chat-error" role="status">{error}{loadFailed ? <button onClick={() => void openConversation(conversationID)}>重新加载</button> : null}</div> : null}
+        {error ? <div className="chat-error" role="status">{error}{loadFailed ? <button onClick={() => void openConversation(conversationID, prompt)}>重新加载</button> : null}</div> : null}
         {remoteRunning ? <div className="chat-remote"><LoaderCircle size={14} className="animate-spin" />此对话正在生成，完成后会自动更新。</div> : null}
         <form className={'chat-composer' + (dragging ? ' is-dragging' : '')}
           onSubmit={(event) => { event.preventDefault(); void performRun(); }}
