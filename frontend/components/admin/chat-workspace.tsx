@@ -3,15 +3,13 @@
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, Check, Copy, Download, FileText, BookOpen, Gauge, Globe2, ImageIcon, KeyRound, LoaderCircle, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Paperclip, Pencil, Plus, RefreshCw, Search, Settings2, Sparkles, Square, Sun, Trash2, X } from 'lucide-react';
 import { useTheme } from 'next-themes';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
 import { AdminService } from '@/lib/services/admin/admin.service';
 import { NotebookDialog } from '@/components/admin/notebook-dialog';
 import { QuotaWindows } from '@/components/admin/quota-windows';
 import { WorkspaceModelPolicy } from '@/components/admin/workspace-model-policy';
 import { ModelEvidence } from '@/components/admin/model-evidence';
-import { safeMarkdownComponents } from '@/components/admin/safe-markdown';
+import { MessageMarkdown } from '@/components/admin/message-markdown';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { copyText, readFilesAsAttachments } from '@/lib/services/core/api-client';
@@ -837,10 +835,7 @@ export function ChatWorkspace({ models, defaultModel, defaultWebSearch, initialC
             </div> : <div className="chat-message-content">
               {isUser
                 ? (message.content ? <p className="whitespace-pre-wrap">{message.content}</p> : null)
-                : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                  ...safeMarkdownComponents,
-                  table: ({ children }) => <div className="chat-table"><table>{children}</table></div>,
-                }}>{message.content || ''}</ReactMarkdown>}
+                : <MessageMarkdown content={message.content || ''} />}
               {!message.content && message.status === 'streaming' ? <div className="chat-thinking"><span /><span /><span /><span className="sr-only">正在生成</span></div> : null}
               {message.attachments?.length ? <div className="chat-attachments">{message.attachments.map((file, i) => {
                 const label = file.name || `附件 ${i + 1}`;

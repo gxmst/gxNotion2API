@@ -18,6 +18,23 @@ const types = {
 createServer(async (request, response) => {
   try {
     const pathname = decodeURIComponent(new URL(request.url, 'http://localhost').pathname);
+    if (pathname === '/admin/__e2e/markdown-stream' && request.method === 'POST') {
+      response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '**时间点很敏感。' } }] })}\n\n`);
+      // Keep each state visible long enough to assert incomplete, then parsed
+      // emphasis while the connection is still streaming.
+      let sentClosing = false;
+      const timer = setInterval(() => {
+        if (!sentClosing) {
+          response.write(`data: ${JSON.stringify({ choices: [{ delta: { content: '**后面紧接中文。' } }] })}\n\n`);
+          sentClosing = true;
+        } else {
+          clearInterval(timer); response.end('data: [DONE]\n\n');
+        }
+      }, 1500);
+      response.on('close', () => clearInterval(timer));
+      return;
+    }
     if (pathname === '/admin/__e2e/stream' && request.method === 'POST') {
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       let paragraph = 0;

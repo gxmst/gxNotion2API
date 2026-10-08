@@ -1,6 +1,7 @@
 'use client';
 
 import { ModelEvidence } from '@/components/admin/model-evidence';
+import { MessageMarkdown } from '@/components/admin/message-markdown';
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { toast } from 'sonner';
@@ -361,8 +362,10 @@ export function ConversationsPanel({
                               {message.status || '-'} · {formatMaybeDate(message.updated_at || message.created_at)}
                             </div>
                           </div>
-                          <div className="rounded-lg border bg-background px-4 py-3 text-sm leading-7 whitespace-pre-wrap break-words">
-                            {message.content || '[无文本内容]'}
+                          <div className="min-w-0 rounded-lg border bg-background px-4 py-3 text-sm leading-7 break-words">
+                            {message.role === 'assistant'
+                              ? <MessageMarkdown content={message.content || '[无文本内容]'} />
+                              : <p className="whitespace-pre-wrap">{message.content || '[无文本内容]'}</p>}
                           </div>
                           <ModelEvidence message={message} models={models} />
                           {message.attachments?.length ? (

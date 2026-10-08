@@ -2,10 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Bot, Copy, FileImage, LoaderCircle, Paperclip, Plus, RefreshCcw, SendHorizontal, Square, User, X } from 'lucide-react';
-import ReactMarkdown from 'react-markdown';
-import remarkGfm from 'remark-gfm';
 import { toast } from 'sonner';
-import { safeMarkdownComponents } from '@/components/admin/safe-markdown';
+import { MessageMarkdown } from '@/components/admin/message-markdown';
 import { Button } from '@/components/ui/button';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
@@ -186,11 +184,8 @@ export function TesterPanel({
                 <Button size="icon" variant="ghost" className="size-7 shrink-0" title="复制消息" aria-label="复制消息" disabled={!message.content}
                   onClick={() => void copyText(message.content || '').then(() => toast.success('已复制')).catch(() => toast.error('复制失败'))}><Copy className="size-3.5" /></Button>
               </div>
-              <div className="space-y-3 break-words text-sm leading-7 [overflow-wrap:anywhere] [&_a]:text-primary [&_a]:underline [&_blockquote]:border-l-2 [&_blockquote]:pl-3 [&_h1]:text-lg [&_h2]:text-base [&_h3]:font-semibold [&_li]:ml-5 [&_ol]:list-decimal [&_ul]:list-disc [&_pre]:overflow-x-auto [&_pre]:rounded-md [&_pre]:bg-muted [&_pre]:p-3 [&_code]:font-mono [&_code]:text-xs [&_img]:max-w-full">
-                {message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content || ''}</p> : <ReactMarkdown remarkPlugins={[remarkGfm]} components={{
-                  ...safeMarkdownComponents,
-                  table: ({ children }) => <div className="overflow-x-auto"><table className="w-full border-collapse [&_td]:border [&_td]:p-2 [&_th]:border [&_th]:p-2">{children}</table></div>,
-                }}>{message.content || ''}</ReactMarkdown>}
+              <div className="space-y-3 break-words text-sm leading-7 [overflow-wrap:anywhere]">
+                {message.role === 'user' ? <p className="whitespace-pre-wrap">{message.content || ''}</p> : <MessageMarkdown content={message.content || ''} />}
                 {!message.content && message.status === 'streaming' ? <LoaderCircle className="size-4 animate-spin" aria-label="正在生成" /> : null}
                 {message.status === 'failed' ? <p className="text-xs text-muted-foreground">未完成</p> : null}
               </div>
